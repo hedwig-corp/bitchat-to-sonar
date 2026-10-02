@@ -538,6 +538,8 @@ actual object SonarCore {
                 groupIds = it.groupIds,
                 counterpartHex = it.counterpartHex,
                 name = it.name,
+                title = it.title,
+                preview = it.preview.toCommon(),
                 latestContent = it.latestContent,
                 latestSenderHex = it.latestSenderHex,
                 latestAtSecs = it.latestAtSecs.toLong(),
@@ -548,6 +550,25 @@ actual object SonarCore {
                 version = it.version.toLong(),
             )
         }
+    }
+
+    actual suspend fun rememberPeerNames(names: Map<String, String>): Unit = withContext(Dispatchers.IO) {
+        if (names.isEmpty()) return@withContext
+        node?.rememberPeerNames(names.map { (hex, name) -> uniffi.sonar_ffi.PeerNameInfo(hex, name) })
+    }
+
+    private fun uniffi.sonar_ffi.ConversationPreviewInfo.toCommon(): SonarConversationPreview = when (this) {
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Empty -> SonarConversationPreview.Empty
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Text -> SonarConversationPreview.Text(text)
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Photos -> SonarConversationPreview.Photos(count.toInt())
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Videos -> SonarConversationPreview.Videos(count.toInt())
+        is uniffi.sonar_ffi.ConversationPreviewInfo.VoiceNote -> SonarConversationPreview.VoiceNote
+        is uniffi.sonar_ffi.ConversationPreviewInfo.File -> SonarConversationPreview.File(name)
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Sticker -> SonarConversationPreview.Sticker
+        is uniffi.sonar_ffi.ConversationPreviewInfo.VoiceCall -> SonarConversationPreview.VoiceCall
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Nudge -> SonarConversationPreview.Nudge
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Payment -> SonarConversationPreview.Payment
+        is uniffi.sonar_ffi.ConversationPreviewInfo.JsonPayload -> SonarConversationPreview.JsonPayload
     }
 
     actual suspend fun updateLocalTimezone(ianaIdentifier: String): Unit = withContext(Dispatchers.IO) {

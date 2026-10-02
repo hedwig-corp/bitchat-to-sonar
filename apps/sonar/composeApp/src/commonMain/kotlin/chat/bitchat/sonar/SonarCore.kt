@@ -535,6 +535,80 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
     return chats to emptyMap()
 }
 
+/**
+ * Core's Messages-list rows as snapshot lines (`r\t…`), so Home paints them
+ * before the encrypted store opens. Message text never enters this plain
+ * preferences blob: a text or file-name preview is stored as empty, the same
+ * metadata-only rule as the chat lines above (iOS: `snSnapshotSafeRows`).
+ */
+internal fun encodeConversationRowSnapshot(rows: List<SonarConversationListRow>): String =
+    buildString {
+        rows.forEach { row ->
+            val (tag, arg) = when (val p = row.preview) {
+                is SonarConversationPreview.Photos -> "photos" to p.count.toString()
+                is SonarConversationPreview.Videos -> "videos" to p.count.toString()
+                SonarConversationPreview.VoiceNote -> "voice" to ""
+                SonarConversationPreview.Sticker -> "sticker" to ""
+                SonarConversationPreview.VoiceCall -> "call" to ""
+                SonarConversationPreview.Nudge -> "nudge" to ""
+                SonarConversationPreview.Payment -> "payment" to ""
+                SonarConversationPreview.JsonPayload -> "json" to ""
+                else -> "" to ""
+            }
+            append("r\t")
+            append(hexEnc(row.conversationId)).append('\t')
+            append(row.kind.name).append('\t')
+            append(row.groupIds.joinToString(",") { hexEnc(it) }).append('\t')
+            append(hexEnc(row.counterpartHex.orEmpty())).append('\t')
+            append(hexEnc(row.title.orEmpty())).append('\t')
+            append(tag).append('\t').append(arg).append('\t')
+            append(row.latestAtSecs).append('\t')
+            append(row.unreadCount).append('\t')
+            append(row.version).append('\t')
+            append(hexEnc(row.name))
+            append('\n')
+        }
+    }
+
+internal fun decodeConversationRowSnapshot(blob: String): List<SonarConversationListRow> =
+    blob.lineSequence().mapNotNull { line ->
+        val p = line.split('\t')
+        if (p.firstOrNull() != "r" || p.size != 12) return@mapNotNull null
+        val id = hexDec(p[1]) ?: return@mapNotNull null
+        val kind = runCatching { SonarConversationListKind.valueOf(p[2]) }.getOrNull() ?: return@mapNotNull null
+        val groups = p[3].split(",").mapNotNull { hexDec(it) }.filter { it.isNotEmpty() }
+        if (groups.isEmpty()) return@mapNotNull null
+        val count = p[7].toIntOrNull() ?: 1
+        val preview = when (p[6]) {
+            "photos" -> SonarConversationPreview.Photos(count)
+            "videos" -> SonarConversationPreview.Videos(count)
+            "voice" -> SonarConversationPreview.VoiceNote
+            "sticker" -> SonarConversationPreview.Sticker
+            "call" -> SonarConversationPreview.VoiceCall
+            "nudge" -> SonarConversationPreview.Nudge
+            "payment" -> SonarConversationPreview.Payment
+            "json" -> SonarConversationPreview.JsonPayload
+            else -> SonarConversationPreview.Empty
+        }
+        SonarConversationListRow(
+            conversationId = id,
+            kind = kind,
+            groupIds = groups,
+            counterpartHex = hexDec(p[4])?.takeIf { it.isNotEmpty() },
+            name = hexDec(p[11]).orEmpty(),
+            title = hexDec(p[5])?.takeIf { it.isNotEmpty() },
+            preview = preview,
+            latestContent = "",
+            latestSenderHex = "",
+            latestAtSecs = p[8].toLongOrNull() ?: 0L,
+            latestMine = false,
+            latestGroupId = id,
+            messageCount = 0L,
+            unreadCount = p[9].toLongOrNull() ?: 0L,
+            version = p[10].toLongOrNull() ?: 0L,
+        )
+    }.toList()
+
 /** Latest local message timestamp per chat from the metadata-only snapshot. */
 internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
     buildMap {
@@ -738,6 +812,21 @@ data class SonarConversationSummary(
 /** Kind of a core-computed Messages-list row (`conversation_list`). */
 enum class SonarConversationListKind { Direct, Group, NoteToSelf }
 
+/** A row's newest message as core classified it; the app only words it. */
+sealed interface SonarConversationPreview {
+    data object Empty : SonarConversationPreview
+    data class Text(val text: String) : SonarConversationPreview
+    data class Photos(val count: Int) : SonarConversationPreview
+    data class Videos(val count: Int) : SonarConversationPreview
+    data object VoiceNote : SonarConversationPreview
+    data class File(val name: String) : SonarConversationPreview
+    data object Sticker : SonarConversationPreview
+    data object VoiceCall : SonarConversationPreview
+    data object Nudge : SonarConversationPreview
+    data object Payment : SonarConversationPreview
+    data object JsonPayload : SonarConversationPreview
+}
+
 /**
  * One Messages-list row computed by core (`SonarNode.conversationList`): every
  * Marmot group of one conversation folded together (R-003), unread summed over
@@ -753,6 +842,10 @@ data class SonarConversationListRow(
     val groupIds: List<String>,
     val counterpartHex: String?,
     val name: String,
+    /** Core-resolved title; null = the app's localized fallback. */
+    val title: String? = null,
+    /** The newest message, ready to word. */
+    val preview: SonarConversationPreview = SonarConversationPreview.Empty,
     val latestContent: String,
     val latestSenderHex: String,
     val latestAtSecs: Long,
@@ -1088,6 +1181,9 @@ expect object SonarCore {
 
     /** Every core-computed Messages-list row, in list order (local only). */
     suspend fun conversationList(): List<SonarConversationListRow>
+
+    /** Seed core's name cache (titles the Messages list): pubkey hex → name. */
+    suspend fun rememberPeerNames(names: Map<String, String>)
 
     /** Update and privately fan out this device's current OS timezone. */
     suspend fun updateLocalTimezone(ianaIdentifier: String)

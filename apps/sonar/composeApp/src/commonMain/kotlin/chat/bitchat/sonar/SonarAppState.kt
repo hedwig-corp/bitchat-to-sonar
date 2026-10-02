@@ -458,6 +458,25 @@ data class PayableContact(
     val nearby: Boolean,
 )
 
+/**
+ * Words core's semantic preview (`conversation_list`) for a Messages row; null
+ * when the conversation has no message yet. The same words iOS uses
+ * (`SonarAppStore.previewText(_:)`), so both apps' rows read alike.
+ */
+internal fun conversationPreviewText(preview: SonarConversationPreview): String? = when (preview) {
+    SonarConversationPreview.Empty -> null
+    is SonarConversationPreview.Text -> preview.text
+    is SonarConversationPreview.Photos -> if (preview.count > 1) "${preview.count} photos" else "Photo"
+    is SonarConversationPreview.Videos -> if (preview.count > 1) "${preview.count} videos" else "Video"
+    SonarConversationPreview.VoiceNote -> "Voice note"
+    is SonarConversationPreview.File -> preview.name.ifBlank { "File" }
+    SonarConversationPreview.Sticker -> "Sticker"
+    SonarConversationPreview.VoiceCall -> "Voice call"
+    SonarConversationPreview.Nudge -> "Nudge"
+    SonarConversationPreview.Payment -> "₿ Payment"
+    SonarConversationPreview.JsonPayload -> "JSON payload"
+}
+
 internal fun messagePreview(content: String, stickerRef: SonarStickerRef? = null, media: List<SonarMedia> = emptyList()): String {
     media.firstOrNull()?.let {
         return when {
@@ -984,6 +1003,7 @@ class SonarAppState internal constructor(
         initialChats = initialChatSnapshot.first,
         initialMessagesByChat = initialChatSnapshot.second,
         initialLatestByChat = initialChatSnapshotLatest,
+        initialConversationRows = decodeConversationRowSnapshot(initialChatSnapshotBlob),
         viewingGroupIds = {
             (screen as? Screen.Chat)?.id
                 ?.let { transcriptGroupIds(it) }
@@ -5898,6 +5918,29 @@ class SonarAppState internal constructor(
         return models
     }
 
+    /** Counterparts whose cached name this process already handed to core. */
+    private val seededPeerNames = HashSet<String>()
+
+    /**
+     * Hand core the names this app already knows for 1:1s core cannot title
+     * yet, once per person: core then titles the row itself (the same title
+     * iOS shows), and its `fetchProfile` keeps it current.
+     */
+    private suspend fun seedPeerNamesIntoCore() {
+        val names = buildMap {
+            for (row in chatList.conversationRows) {
+                if (row.kind != SonarConversationListKind.Direct || row.title != null) continue
+                val hex = row.counterpartHex ?: continue
+                if (hex in seededPeerNames) continue
+                val name = profilesByNpub[canonicalProfileKey(hex)]?.bestName?.takeIf { it.isNotBlank() } ?: continue
+                put(hex, name)
+            }
+        }
+        if (names.isEmpty()) return
+        seededPeerNames += names.keys
+        runCatching { chatListCore.rememberPeerNames(names) }
+    }
+
     private fun computeMarmotRowModels(rows: List<SonarChat>): Map<String, MarmotRowModel> {
         // Peer-key → all its chat ids, built at most ONCE, and only for chats
         // core has not folded yet: with core rows known it costs nothing
@@ -5917,20 +5960,27 @@ class SonarAppState internal constructor(
         return rows.associate { chat ->
             val pending = isPendingSecureChat(chat.id)
             val ids = if (pending) listOf(chat.id) else groupedIds(chat)
-            val newest = if (pending) null else ids
+            // Core's screen model titles and previews the row (the same row
+            // iOS renders); the app's own projection below stays only for
+            // pending chats core does not know yet, and as the title fallback
+            // when core has no name for the person.
+            val coreRow = if (pending) null else chatList.rowByGroup[chat.id]
+            val newest = if (pending || coreRow != null) null else ids
                 .mapNotNull { visibleMessagesForChat(it, chatSnapshotMessagesByChat[it].orEmpty()).lastOrNull() }
                 .maxByOrNull { it.tsSecs }
             chat.id to MarmotRowModel(
                 id = chat.id,
-                title = chatTitle(chat),
+                title = coreRow?.title ?: chatTitle(chat),
                 sub = when {
                     pending -> "Setting up secure chat…"
+                    coreRow != null -> conversationPreviewText(coreRow.preview) ?: "Tap to open"
                     newest != null -> messagePreview(newest.content, newest.stickerRef, newest.media)
                     else -> "Tap to open"
                 },
                 // Pending rows use creation time so recency merge does not sink
                 // a freshly-started chat under older history (iOS dmRows parity).
-                tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
+                tsSecs = coreRow?.latestAtSecs?.takeIf { it > 0 }
+                    ?: newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
                 verified = ids.any { it in verifiedChatIds },
                 groupIds = ids,
                 pending = pending && !isNoteToSelfChat(chat, noteToSelfGroupId),
@@ -13132,7 +13182,8 @@ class SonarAppState internal constructor(
     private fun persistChatSnapshot() {
         SonarCore.saveBlob(
             CHAT_SNAPSHOT_BLOB_KEY,
-            encodeChatSnapshot(chats, chatSnapshotMessagesByChat, chatSnapshotLatestByChat),
+            encodeChatSnapshot(chats, chatSnapshotMessagesByChat, chatSnapshotLatestByChat) +
+                encodeConversationRowSnapshot(chatList.conversationRows),
         )
     }
 
@@ -13169,6 +13220,7 @@ class SonarAppState internal constructor(
         }
         val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
         chatList.publishLocal(localChats, previousOrder)
+        seedPeerNamesIntoCore()
         persistChatSnapshot()
         chatList.refreshUnread()
         for (c in chats) {

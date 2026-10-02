@@ -205,6 +205,26 @@ class ChatListAppStateTest {
         assertEquals(1, s.visibleChats.count { it.id == giulia.id || it.id == giuliaAgain.id })
     }
 
+    /** Home shows core's title for a 1:1, not the app's own resolution: the
+     *  same title iOS shows, from the same row. */
+    @Test
+    fun aOneToOneRowIsTitledByCore() = runTest {
+        val core = FakeChatListCore().apply {
+            chats = listOf(giulia)
+            summaries = listOf(summary(giulia.id, 900, content = "ciao"))
+            rememberedNames["npub1giulia"] = "Giulia R."
+        }
+        val s = state(core)
+        s.chatList.refresh()
+
+        moleculeFlow(RecompositionMode.Immediate) { s.chatListPresenterForTest().present(MutableSharedFlow()) }.test {
+            val row = expectMostRecentItem().rows.single { !isNoteToSelfPlaceholder(it.key) }
+            assertEquals("Giulia R.", row.title)
+            assertEquals("ciao", row.preview)
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+
     /** The phone presenter, on a Home the test marks hydrated. */
     private fun SonarAppState.chatListPresenterForTest(): ChatListPresenter {
         markHomeHydratedForTest()

@@ -3225,13 +3225,63 @@ impl SonarClient {
     /// instead of a raw npub.
     pub async fn fetch_profile(&self, author: PublicKey) -> Result<Option<Profile>> {
         let metadata = self.nostr.fetch_metadata(author, FETCH_TIMEOUT).await?;
-        Ok(metadata.map(|m| Profile {
+        let profile = metadata.map(|m| Profile {
             name: m.name,
             display_name: m.display_name,
             about: m.about,
             picture: m.picture,
             nip05: m.nip05,
-        }))
+        });
+        if let Some(name) = profile.as_ref().and_then(|p| p.best_name()) {
+            self.remember_peer_names(&[(author.to_hex(), name.to_string())]);
+        }
+        Ok(profile)
+    }
+
+    /// Record display names (pubkey hex, name) for titling the Messages list,
+    /// and notify the conversations whose title changed, so hosts repaint just
+    /// those rows. Hosts seed it from their own profile caches once; after
+    /// that `fetch_profile` keeps it current. Bounded per call.
+    pub fn remember_peer_names(&self, names: &[(String, String)]) -> usize {
+        const MAX_NAMES_PER_CALL: usize = 500;
+        let Some(ref idx) = self.conversation_index else {
+            return 0;
+        };
+        let now = Timestamp::now().as_secs();
+        let mut changed_peers = HashSet::new();
+        {
+            let idx = idx.lock().unwrap();
+            for (pubkey_hex, name) in names.iter().take(MAX_NAMES_PER_CALL) {
+                match idx.set_peer_name(&pubkey_hex.to_lowercase(), name, now) {
+                    Ok(true) => {
+                        changed_peers.insert(pubkey_hex.to_lowercase());
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(%e, "peer name write failed"),
+                }
+            }
+        }
+        if changed_peers.is_empty() {
+            return 0;
+        }
+        // Only the 1:1s with those people show the new title.
+        let groups: Vec<String> = self
+            .conversation_shapes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|(_, shape)| {
+                shape
+                    .counterpart_hex
+                    .as_ref()
+                    .is_some_and(|peer| changed_peers.contains(peer))
+            })
+            .map(|(_, shape)| shape.group_id_hex.clone())
+            .collect();
+        if !groups.is_empty() {
+            self.notify_conversations_changed(&groups.iter().cloned().collect());
+        }
+        changed_peers.len()
     }
 
     /// The claimed human-readable handle (`name@domain`), if any. Local read —
@@ -4118,14 +4168,17 @@ impl SonarClient {
         let sync_watermark_frozen = self.sync_watermark_frozen.clone();
         let marmot_db_path = self.marmot_db_path.clone();
         let event_id_hex = event_id.to_hex();
+        let change_listener = self.change_listener.clone();
         std::thread::spawn(move || {
             if let (Some(ref idx), Some((group_name, message))) = (&conversation_index, index_row) {
+                let group_id_hex_for_notify = hex::encode(message.group_id.as_slice());
                 let group_id_hex = hex::encode(message.group_id.as_slice());
                 let name = group_name.as_deref().unwrap_or("");
-                if let Err(e) = idx.lock().unwrap().upsert_summary(
+                if let Err(e) = idx.lock().unwrap().upsert_summary_with_kind(
                     &group_id_hex,
                     name,
                     &index_preview(&message),
+                    &preview_kind_for(&message),
                     &message.sender.to_string(),
                     message.created_at.as_secs(),
                     message.mine,
@@ -4134,6 +4187,15 @@ impl SonarClient {
                     message.classification.is_transcript_visible(),
                 ) {
                     tracing::warn!(%e, "deferred index upsert failed");
+                } else {
+                    // The send path notified before this deferred write, so a
+                    // host reloading on that notification could read the old
+                    // row and keep the previous preview. Notify again once the
+                    // row the Messages list renders actually holds the send.
+                    let listener = change_listener.lock().unwrap().clone();
+                    if let Some(listener) = listener {
+                        listener.on_conversation_changed(group_id_hex_for_notify);
+                    }
                 }
             }
             if let Some(ref db_path) = marmot_db_path {
@@ -7848,7 +7910,7 @@ impl SonarClient {
     }
 
     fn conversation_list_rows(&self) -> Result<Vec<crate::conversation_list::ConversationListRow>> {
-        use crate::conversation_list::{build_rows, GroupShape};
+        use crate::conversation_list::GroupShape;
         let groups = self.engine.groups()?;
         let me_hex = self.identity().public_key().to_hex();
         let note_to_self = self.find_note_to_self_group()?.map(|g| hex::encode(g.as_slice()));
@@ -7892,7 +7954,16 @@ impl SonarClient {
             .into_iter()
             .map(|s| (s.group_id_hex.clone(), s))
             .collect();
-        Ok(build_rows(&shapes, &summaries))
+        let counterparts: Vec<&str> = shapes
+            .iter()
+            .filter_map(|s| s.counterpart_hex.as_deref())
+            .collect();
+        let names = self
+            .conversation_index
+            .as_ref()
+            .and_then(|idx| idx.lock().unwrap().peer_names(&counterparts).ok())
+            .unwrap_or_default();
+        Ok(crate::conversation_list::build_rows_with_names(&shapes, &summaries, &names))
     }
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
@@ -8435,10 +8506,11 @@ impl SonarClient {
         if let Some(ref idx) = self.conversation_index {
             let group_id_hex = hex::encode(message.group_id.as_slice());
             let name = group_name.unwrap_or("");
-            if let Err(e) = idx.lock().unwrap().upsert_summary(
+            if let Err(e) = idx.lock().unwrap().upsert_summary_with_kind(
                 &group_id_hex,
                 name,
                 &index_preview(message),
+                &preview_kind_for(message),
                 &message.sender.to_string(),
                 message.created_at.as_secs(),
                 message.mine,
@@ -9237,6 +9309,39 @@ fn blossom_upload_timeout(len: usize) -> Duration {
 /// Preview label for machine-sent JSON payloads (agents/bots, interop control).
 /// Shared with conversation_index::sanitize_preview_label — keep in sync.
 pub(crate) const JSON_PAYLOAD_PREVIEW_LABEL: &str = "JSON payload";
+
+/// What [`index_preview`] stored, as a machine-readable kind for the Messages
+/// list (`conversation_list::preview_for` decodes it): `text`, `json`,
+/// `sticker`, `photo:N`, `video:N`, `voice`, `file`. Call, payment and nudge
+/// lines are `text`; the list classifies their content with the same decoder
+/// notifications use.
+pub(crate) fn preview_kind_for(message: &ChatMessage) -> String {
+    if !message.content.is_empty() {
+        return if looks_like_json_payload(&message.content) { "json" } else { "text" }.to_owned();
+    }
+    if message.sticker_ref.is_some() {
+        return "sticker".to_owned();
+    }
+    let media = &message.media;
+    let Some(first) = media.first() else {
+        return String::new();
+    };
+    if media.iter().all(|m| m.mime_type.starts_with("image/")) {
+        return format!("photo:{}", media.len());
+    }
+    if media.iter().all(|m| m.mime_type.starts_with("video/")) {
+        return format!("video:{}", media.len());
+    }
+    if first.mime_type.starts_with("audio/") {
+        "voice".to_owned()
+    } else if first.mime_type.starts_with("image/") {
+        "photo:1".to_owned()
+    } else if first.mime_type.starts_with("video/") {
+        "video:1".to_owned()
+    } else {
+        "file".to_owned()
+    }
+}
 
 pub(crate) fn index_preview(message: &ChatMessage) -> String {
     if !message.content.is_empty() {
@@ -13295,6 +13400,45 @@ mod tests {
         let rows = bob.conversation_list(0, None).unwrap();
         assert_eq!(rows[0].unread_count, 0);
         assert_eq!(rows[1].unread_count, 1, "Luca's badge is untouched");
+    }
+
+    /// The Messages list is titled and previewed in core: a 1:1 takes the
+    /// counterpart's remembered name, a changed name notifies only that chat,
+    /// and the preview is a semantic kind (here a photo) for hosts to word.
+    #[tokio::test]
+    async fn conversation_list_titles_and_previews_rows_in_core() {
+        let sara = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        bob.set_conversation_change_listener(Some(listener.clone()));
+        let group = join_group_from(&sara, &bob, "").await;
+        receive_text(&sara, &bob, &group, "hi bob").await;
+        let gid = hex::encode(group.as_slice());
+
+        let rows = bob.conversation_list(0, None).unwrap();
+        assert_eq!(rows[0].title, None, "no name known yet");
+        assert_eq!(
+            rows[0].preview,
+            crate::conversation_list::ConversationPreview::Text("hi bob".into())
+        );
+
+        listener.changed.lock().unwrap().clear();
+        let sara_hex = sara.identity().public_key().to_hex();
+        assert_eq!(bob.remember_peer_names(&[(sara_hex.clone(), "Sara".into())]), 1);
+        assert_eq!(listener.changed.lock().unwrap().as_slice(), [gid.as_str()]);
+        assert_eq!(bob.conversation_list(0, None).unwrap()[0].title.as_deref(), Some("Sara"));
+
+        // The same name again is not a change: no repaint.
+        listener.changed.lock().unwrap().clear();
+        assert_eq!(bob.remember_peer_names(&[(sara_hex, "Sara".into())]), 0);
+        assert!(listener.changed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

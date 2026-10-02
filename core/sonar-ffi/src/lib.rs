@@ -893,6 +893,11 @@ pub struct ConversationListRowInfo {
     pub counterpart_hex: Option<String>,
     /// MLS group name, empty for most 1:1s.
     pub name: String,
+    /// The title to show; `None` = the host's localized fallback
+    /// ("Note to Self", "Group chat", or the counterpart's short npub).
+    pub title: Option<String>,
+    /// The newest message, ready to localize.
+    pub preview: ConversationPreviewInfo,
     pub latest_content: String,
     /// Pubkey hex of the newest message's sender.
     pub latest_sender_hex: String,
@@ -905,6 +910,50 @@ pub struct ConversationListRowInfo {
     pub unread_count: u64,
     /// Equal versions mean an unchanged row (cache key).
     pub version: u64,
+}
+
+/// What a Messages-list row's newest message is. Hosts only localize it;
+/// classification happens once, in core, for both apps.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum ConversationPreviewInfo {
+    Empty,
+    Text { text: String },
+    Photos { count: u32 },
+    Videos { count: u32 },
+    VoiceNote,
+    /// `name` is empty when the sender gave none.
+    File { name: String },
+    Sticker,
+    VoiceCall,
+    Nudge,
+    Payment,
+    JsonPayload,
+}
+
+fn conversation_preview_info(
+    preview: sonar_core::conversation_list::ConversationPreview,
+) -> ConversationPreviewInfo {
+    use sonar_core::conversation_list::ConversationPreview as P;
+    match preview {
+        P::Empty => ConversationPreviewInfo::Empty,
+        P::Text(text) => ConversationPreviewInfo::Text { text },
+        P::Photos(count) => ConversationPreviewInfo::Photos { count },
+        P::Videos(count) => ConversationPreviewInfo::Videos { count },
+        P::VoiceNote => ConversationPreviewInfo::VoiceNote,
+        P::File(name) => ConversationPreviewInfo::File { name },
+        P::Sticker => ConversationPreviewInfo::Sticker,
+        P::VoiceCall => ConversationPreviewInfo::VoiceCall,
+        P::Nudge => ConversationPreviewInfo::Nudge,
+        P::Payment => ConversationPreviewInfo::Payment,
+        P::JsonPayload => ConversationPreviewInfo::JsonPayload,
+    }
+}
+
+/// A display name to remember for titling the Messages list.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct PeerNameInfo {
+    pub pubkey_hex: String,
+    pub name: String,
 }
 
 /// Where the next page starts: the last row of the previous page.
@@ -935,6 +984,8 @@ fn conversation_list_row_info(
         group_ids: row.group_ids,
         counterpart_hex: row.counterpart_hex,
         name: row.name,
+        title: row.title,
+        preview: conversation_preview_info(row.preview),
         latest_content: row.latest_content,
         latest_sender_hex: row.latest_sender_hex,
         latest_at_secs: row.latest_at_secs,
@@ -2006,6 +2057,15 @@ impl SonarNode {
 
     pub fn mark_conversation_read(&self, group_id_hex: String) {
         self.client.mark_conversation_read(&group_id_hex);
+    }
+
+    /// Remember display names for titling the Messages list (hosts seed it
+    /// from their profile caches once; `fetch_profile` keeps it current).
+    /// Returns how many changed; their conversations are notified.
+    pub fn remember_peer_names(&self, names: Vec<PeerNameInfo>) -> u32 {
+        let pairs: Vec<(String, String)> =
+            names.into_iter().map(|n| (n.pubkey_hex, n.name)).collect();
+        self.client.remember_peer_names(&pairs) as u32
     }
 
     /// The Marmot half of the Messages list, folded and ordered by core:

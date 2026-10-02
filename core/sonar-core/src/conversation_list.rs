@@ -15,9 +15,11 @@
 //! - rows are ordered newest first with a stable tie-break and paged by a
 //!   cursor, so a host can paint a bounded window.
 //!
-//! What stays in the hosts, because core does not own it: kind-0 display
-//! names, mute, verification, pending "setting up" rows, blocked senders, and
-//! the Bluetooth fold (mesh state lives in the Swift/Kotlin engines). Hosts
+//! Each row is a screen model, not raw data: a resolved title (the
+//! counterpart's cached kind-0 name for a 1:1) and a semantic preview the
+//! hosts only localize. What stays in the hosts, because core does not own
+//! it: mute, verification, pending "setting up" rows, blocked senders, and the
+//! Bluetooth fold (mesh state lives in the Swift/Kotlin engines). Hosts
 //! overlay those on these rows.
 //!
 //! Everything here is local: the summary index and the MLS group table. No
@@ -28,6 +30,77 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::conversation_index::ConversationSummary;
+use crate::notification::{classify_content, NotificationKind};
+
+/// What a row's newest message is, for the hosts to word in their language.
+/// The one decoder for chat-list previews on both apps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationPreview {
+    /// No message yet.
+    Empty,
+    /// Plain text, shown as is.
+    Text(String),
+    /// One or more photos (a caption, if any, arrives as `Text`).
+    Photos(u32),
+    Videos(u32),
+    VoiceNote,
+    /// A file attachment; the name when the sender gave one.
+    File(String),
+    Sticker,
+    VoiceCall,
+    Nudge,
+    Payment,
+    /// Machine JSON (bots, interop control); never shown raw.
+    JsonPayload,
+}
+
+/// Decode a stored `(latest_kind, latest_content)` pair. Rows written before
+/// `latest_kind` existed carry an empty kind and an English label from
+/// `index_preview`; those labels are mapped back so old chats keep a
+/// localizable preview.
+pub fn preview_for(kind: &str, content: &str) -> ConversationPreview {
+    let count = |rest: &str| rest.parse::<u32>().unwrap_or(1).max(1);
+    match kind {
+        "sticker" => return ConversationPreview::Sticker,
+        "voice" => return ConversationPreview::VoiceNote,
+        "json" => return ConversationPreview::JsonPayload,
+        "file" => {
+            let name = if content == "File" { String::new() } else { content.to_string() };
+            return ConversationPreview::File(name);
+        }
+        k if k.starts_with("photo:") => return ConversationPreview::Photos(count(&k[6..])),
+        k if k.starts_with("video:") => return ConversationPreview::Videos(count(&k[6..])),
+        _ => {}
+    }
+    if content.is_empty() {
+        return ConversationPreview::Empty;
+    }
+    match classify_content(content) {
+        NotificationKind::Call => return ConversationPreview::VoiceCall,
+        NotificationKind::Payment => return ConversationPreview::Payment,
+        NotificationKind::Trill => return ConversationPreview::Nudge,
+        _ => {}
+    }
+    if kind.is_empty() {
+        // Legacy row: undo index_preview's English labels.
+        match content {
+            "Sticker" => return ConversationPreview::Sticker,
+            "Photo" => return ConversationPreview::Photos(1),
+            "Video" => return ConversationPreview::Videos(1),
+            "Voice note" => return ConversationPreview::VoiceNote,
+            "File" => return ConversationPreview::File(String::new()),
+            "JSON payload" => return ConversationPreview::JsonPayload,
+            _ => {}
+        }
+        if let Some(n) = content.strip_suffix(" photos").and_then(|n| n.parse::<u32>().ok()) {
+            return ConversationPreview::Photos(n);
+        }
+        if let Some(n) = content.strip_suffix(" videos").and_then(|n| n.parse::<u32>().ok()) {
+            return ConversationPreview::Videos(n);
+        }
+    }
+    ConversationPreview::Text(content.to_string())
+}
 
 /// What kind of conversation a row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,8 +172,15 @@ pub struct ConversationListRow {
     pub group_ids: Vec<String>,
     /// The other member's pubkey hex for a direct chat.
     pub counterpart_hex: Option<String>,
-    /// The group's MLS name (empty for most 1:1s). Hosts overlay kind-0 names.
+    /// The group's MLS name (empty for most 1:1s).
     pub name: String,
+    /// The title to show: the counterpart's cached display name for a 1:1,
+    /// else the group name. `None` means the host shows its localized
+    /// fallback ("Note to Self", "Group chat", or the short npub of
+    /// `counterpart_hex`).
+    pub title: Option<String>,
+    /// The newest message, ready to localize.
+    pub preview: ConversationPreview,
     /// Preview of the newest message across the set (already classified and
     /// labelled by the index, see `index_preview`).
     pub latest_content: String,
@@ -172,6 +252,15 @@ pub fn build_rows(
     shapes: &[GroupShape],
     summaries: &HashMap<String, ConversationSummary>,
 ) -> Vec<ConversationListRow> {
+    build_rows_with_names(shapes, summaries, &HashMap::new())
+}
+
+/// [`build_rows`] with display names (pubkey hex → name) for titling 1:1s.
+pub fn build_rows_with_names(
+    shapes: &[GroupShape],
+    summaries: &HashMap<String, ConversationSummary>,
+    names: &HashMap<String, String>,
+) -> Vec<ConversationListRow> {
     // Direct groups bucket by counterpart; everything else is its own row.
     let mut buckets: Vec<Vec<&GroupShape>> = Vec::new();
     let mut by_counterpart: HashMap<&str, usize> = HashMap::new();
@@ -207,6 +296,8 @@ pub fn build_rows(
                 group_ids: set.iter().map(|s| s.group_id_hex.clone()).collect(),
                 counterpart_hex: head.counterpart_hex.clone(),
                 name: head.name.clone(),
+                title: None,
+                preview: ConversationPreview::Empty,
                 latest_content: String::new(),
                 latest_sender_hex: String::new(),
                 latest_at_secs: 0,
@@ -239,6 +330,7 @@ pub fn build_rows(
                     && row.latest_at_secs == 0
                     && summary.latest_at_secs > 0
                 {
+                    row.preview = preview_for(&summary.latest_kind, &summary.latest_content);
                     row.latest_content = summary.latest_content.clone();
                     row.latest_sender_hex = summary.latest_sender.clone();
                     row.latest_at_secs = summary.latest_at_secs;
@@ -246,6 +338,16 @@ pub fn build_rows(
                     row.latest_group_id = summary.group_id_hex.clone();
                 }
             }
+            row.title = match row.kind {
+                ConversationListKind::NoteToSelf => None,
+                ConversationListKind::Direct => row
+                    .counterpart_hex
+                    .as_ref()
+                    .and_then(|peer| names.get(peer))
+                    .cloned()
+                    .or_else(|| (!row.name.is_empty()).then(|| row.name.clone())),
+                ConversationListKind::Group => (!row.name.is_empty()).then(|| row.name.clone()),
+            };
             row
         })
         .collect();
@@ -305,6 +407,7 @@ mod tests {
             message_count: 1,
             unread_count: unread,
             version,
+            latest_kind: "text".into(),
         }
     }
 
@@ -416,5 +519,45 @@ mod tests {
         }
         assert_eq!(walked, all);
         assert_eq!(page(all.clone(), 0, None).len(), 8);
+    }
+
+    #[test]
+    fn previews_are_semantic_for_new_and_legacy_rows() {
+        use ConversationPreview as P;
+        assert_eq!(preview_for("text", "hello"), P::Text("hello".into()));
+        assert_eq!(preview_for("photo:3", "3 photos"), P::Photos(3));
+        assert_eq!(preview_for("video:1", "Video"), P::Videos(1));
+        assert_eq!(preview_for("voice", "Voice note"), P::VoiceNote);
+        assert_eq!(preview_for("file", "report.pdf"), P::File("report.pdf".into()));
+        assert_eq!(preview_for("sticker", "Sticker"), P::Sticker);
+        assert_eq!(preview_for("json", "JSON payload"), P::JsonPayload);
+        assert_eq!(preview_for("text", "⚡TRILL|1|abc123"), P::Nudge);
+        assert_eq!(preview_for("", ""), P::Empty);
+        // Legacy rows (no kind): English labels map back.
+        assert_eq!(preview_for("", "2 photos"), P::Photos(2));
+        assert_eq!(preview_for("", "Voice note"), P::VoiceNote);
+        // But a NEW row whose text happens to be "Photo" stays text.
+        assert_eq!(preview_for("text", "Photo"), P::Text("Photo".into()));
+    }
+
+    #[test]
+    fn titles_come_from_the_counterparts_name_then_the_group_name() {
+        let nts = GroupShape::classify("g0", "Note to Self", &[ME.into()], ME, true);
+        let shapes = [
+            shape("g1", "", &[ME, SARA]),
+            shape("g2", "old name", &[ME, LUCA]),
+            shape("g3", "Team", &[ME, SARA, LUCA]),
+            shape("g4", "", &[ME, "dd"]),
+            nts,
+        ];
+        let names: HashMap<String, String> =
+            [(SARA.to_string(), "Sara".to_string()), (LUCA.to_string(), "Luca".to_string())].into();
+        let rows = build_rows_with_names(&shapes, &HashMap::new(), &names);
+        let title = |gid: &str| rows.iter().find(|r| r.conversation_id == gid).unwrap().title.clone();
+        assert_eq!(title("g1").as_deref(), Some("Sara"));
+        assert_eq!(title("g2").as_deref(), Some("Luca"), "the live name beats a frozen group name");
+        assert_eq!(title("g3").as_deref(), Some("Team"));
+        assert_eq!(title("g4"), None, "no name known: the host shows the short npub");
+        assert_eq!(title("g0"), None, "Note to Self is localized by the host");
     }
 }

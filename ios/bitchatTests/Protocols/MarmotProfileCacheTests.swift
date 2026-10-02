@@ -195,10 +195,11 @@ struct MarmotProfileCacheTests {
         let second = MarmotService.MarmotGroup(id: "group-b", name: "", memberNpubs: [ownNpub, peerNpub])
         let room = MarmotService.MarmotGroup(id: "room", name: "", memberNpubs: [ownNpub, peerNpub, "npub1third"])
 
-        let grouped = snCanonicalDirectMarmotGroups([first, second, room], ownNpub: ownNpub)
-
+        // Hex and bech32 members resolve to the same peer key (core then folds
+        // the duplicates: `conversation_list.rs::duplicate_direct_groups_fold…`).
         #expect(snDirectMarmotPeerKey(for: first, ownNpub: ownNpub) == peerNpub)
-        #expect(grouped[peerNpub]?.map(\.id) == ["group-a", "group-b"])
+        #expect(snDirectMarmotPeerKey(for: second, ownNpub: ownNpub) == peerNpub)
+        #expect(snDirectMarmotPeerKey(for: room, ownNpub: ownNpub) == nil)
     }
 
     @Test

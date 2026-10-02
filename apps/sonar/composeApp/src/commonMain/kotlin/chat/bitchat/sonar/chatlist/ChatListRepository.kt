@@ -56,6 +56,8 @@ internal class ChatListRepository(
     initialChats: List<SonarChat>,
     initialMessagesByChat: Map<String, List<SonarMsg>>,
     initialLatestByChat: Map<String, Long>,
+    /** Core rows restored from the startup snapshot (text-free). */
+    initialConversationRows: List<SonarConversationListRow> = emptyList(),
     /** Group ids the user is looking at right now. Suppressed from [unreadByChat]
      *  for this refresh only, never stored (see [applyUnread]). */
     private val viewingGroupIds: () -> Set<String>,
@@ -98,6 +100,14 @@ internal class ChatListRepository(
      *  for the list, open, mark-read and mute (R-003, R-052). */
     var groupIdsByGroup: Map<String, List<String>> = emptyMap()
         private set
+
+    /** Each group id → the core row it belongs to (title, preview, time). */
+    var rowByGroup: Map<String, SonarConversationListRow> = emptyMap()
+        private set
+
+    init {
+        if (initialConversationRows.isNotEmpty()) applyConversationRows(initialConversationRows)
+    }
 
     /** Unread count per Marmot group id. A mesh route id is never a key. */
     var unreadByChat by mutableStateOf<Map<String, Long>>(emptyMap())
@@ -171,6 +181,9 @@ internal class ChatListRepository(
         conversationRows = rows
         groupIdsByGroup = buildMap {
             for (row in rows) for (gid in row.groupIds) put(gid, row.groupIds)
+        }
+        rowByGroup = buildMap {
+            for (row in rows) for (gid in row.groupIds) put(gid, row)
         }
         conversationRowsVersion++
     }

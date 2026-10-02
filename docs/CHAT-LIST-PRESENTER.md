@@ -240,6 +240,31 @@ exports it. Both apps render the fold from it.
   choice on a verified tie (iOS prefers a verified group).
 - **Guards:** R-003 and R-052 in `docs/REGRESSIONS.md`, and QA-144.
 
+## Shipped: Home rows are a core screen model
+
+`conversation_list` rows are now complete Home rows, not raw data:
+
+- **Title.** The counterpart's cached kind-0 name for a 1:1, else the group
+  name, else none (the app shows "Note to Self", "Group chat" or the short
+  npub). Names live in core's `peer_name` table: `fetch_profile` writes it
+  and notifies only the chats whose title moved, and each app seeds it once
+  from its own profile cache (`remember_peer_names`).
+- **Preview.** A semantic kind (`ConversationPreview`: text, photos, videos,
+  voice note, file, sticker, call, nudge, payment, JSON) stored as
+  `latest_kind` in the summary index, decoded with the same classifier
+  notifications use. The apps only word it, identically.
+- **Time, unread, order, fold** as before.
+
+Both apps render these rows: iOS `buildHomeDMRows` iterates
+`MarmotChatModel.conversationRows`, Compose `computeMarmotRowModels` reads
+`ChatListRepository.rowByGroup`. The startup snapshots on both apps store the
+rows without message text, so Home paints titles, times and badges before the
+encrypted store opens. Deleted on iOS: the local 1:1 fold
+(`snCanonicalDirectMarmotGroups`), its title rule
+(`snFoldedDirectMarmotHomeTitle`), `latestMarmotMessage` and
+`hasUnreadMarmotMessage`. Still per app: the Bluetooth fold, blocking, mute,
+verification, pending rows and the capability hold.
+
 ## Next steps
 
 1. Move the remaining projection inputs to snapshot state (fold maps, version

@@ -34,6 +34,9 @@ internal interface ChatListCore {
      *  row's groups, Note to Self first. The same rows iOS renders. */
     suspend fun conversationList(): List<SonarConversationListRow>
 
+    /** Seed core's display-name cache (pubkey hex → name), which titles rows. */
+    suspend fun rememberPeerNames(names: Map<String, String>)
+
     /** Bounded newest-message windows for the [groupLimit] most recent chats. */
     suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage>
 
@@ -53,6 +56,9 @@ internal object SonarCoreChatListCore : ChatListCore {
 
     override suspend fun conversationList(): List<SonarConversationListRow> =
         SonarCore.conversationList()
+
+    override suspend fun rememberPeerNames(names: Map<String, String>) =
+        SonarCore.rememberPeerNames(names)
 
     override suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
         SonarCore.recentMessagePages(groupLimit, pageLimit)

@@ -126,9 +126,11 @@ Marmot 1:1 fold is decided once in `core/sonar-core/src/conversation_list.rs`
 folded sets: iOS `MarmotChatModel.conversationGroupIdsByGroup` →
 `buildHomeDMRows` / `directMarmotGroups(matching:)`; Compose
 `ChatListRepository.groupIdsByGroup` → `dedupeByConversationRows` /
-`duplicateDirectMarmotChats` / `computeMarmotRowModels`. The local peer-key
-folds stay only as the fallback for groups core has not listed yet (a restored
-snapshot before the store opens).
+`duplicateDirectMarmotChats` / `computeMarmotRowModels`. Since Home rows became
+a core screen model, iOS `buildHomeDMRows` iterates core rows directly and its
+local fold (`snCanonicalDirectMarmotGroups`) is deleted; the startup snapshot
+carries core rows so first paint needs no local fold either. Compose keeps its
+peer-key fold only as the fallback for chats core has not listed yet.
 
 **Guarded by:** `ConversationRegressionSmokeTest.duplicateSaraGroupsKeepOneNewestTranscript`
 

@@ -284,15 +284,30 @@ final class MarmotService: @unchecked Sendable {
     }
 
     /// Kind of a core-computed Messages-list row (`conversationList`).
-    enum ConversationListKind: Sendable, Equatable {
+    enum ConversationListKind: String, Sendable, Equatable, Codable {
         case direct, group, noteToSelf
+    }
+
+    /// A row's newest message as core classified it; the app only words it.
+    enum ConversationPreview: Sendable, Equatable, Codable {
+        case empty
+        case text(String)
+        case photos(Int)
+        case videos(Int)
+        case voiceNote
+        case file(String)
+        case sticker
+        case voiceCall
+        case nudge
+        case payment
+        case jsonPayload
     }
 
     /// One Messages-list row computed by core: every Marmot group of one
     /// conversation folded together (R-003), unread summed over `groupIds`
     /// (R-052), Note to Self first. Compose renders the same rows, so the fold
     /// is decided once for both apps.
-    struct ConversationListRow: Sendable, Equatable {
+    struct ConversationListRow: Sendable, Equatable, Codable {
         /// The group the row opens: newest in the set, lowest id on a tie.
         let conversationId: String
         let kind: ConversationListKind
@@ -300,6 +315,9 @@ final class MarmotService: @unchecked Sendable {
         let groupIds: [String]
         let counterpartHex: String?
         let name: String
+        /// Core-resolved title; nil = the app's localized fallback.
+        let title: String?
+        let preview: ConversationPreview
         let latestContent: String
         let latestSenderHex: String
         let latestAt: Date
@@ -2396,6 +2414,8 @@ final class MarmotService: @unchecked Sendable {
                     groupIds: row.groupIds,
                     counterpartHex: row.counterpartHex,
                     name: row.name,
+                    title: row.title,
+                    preview: Self.conversationPreview(row.preview),
                     latestContent: row.latestContent,
                     latestSenderHex: row.latestSenderHex,
                     latestAt: Date(timeIntervalSince1970: TimeInterval(row.latestAtSecs)),
@@ -2407,6 +2427,34 @@ final class MarmotService: @unchecked Sendable {
                 )
             }
         }, default: nil)
+    }
+
+    nonisolated static func conversationPreview(_ info: ConversationPreviewInfo) -> ConversationPreview {
+        switch info {
+        case .empty: return .empty
+        case .text(let text): return .text(text)
+        case .photos(let count): return .photos(Int(count))
+        case .videos(let count): return .videos(Int(count))
+        case .voiceNote: return .voiceNote
+        case .file(let name): return .file(name)
+        case .sticker: return .sticker
+        case .voiceCall: return .voiceCall
+        case .nudge: return .nudge
+        case .payment: return .payment
+        case .jsonPayload: return .jsonPayload
+        }
+    }
+
+    /// Seed core's name cache (titles the Messages list) from the app's
+    /// profile cache. Keys are canonical npubs or hex pubkeys.
+    func rememberPeerNames(_ names: [(pubkeyHex: String, name: String)]) async {
+        guard !names.isEmpty else { return }
+        await runNonThrowing { service in
+            _ = service.node?.rememberPeerNames(
+                names: names.map { PeerNameInfo(pubkeyHex: $0.pubkeyHex, name: $0.name) }
+            )
+            return ()
+        }
     }
 
     func markConversationRead(groupId: String) async {

@@ -8,6 +8,7 @@ import chat.bitchat.sonar.MeshDmRow
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarConversationListKind
 import chat.bitchat.sonar.SonarConversationListRow
+import chat.bitchat.sonar.SonarConversationPreview
 import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.directMarmotPeerKey
 import chat.bitchat.sonar.SonarGroupInvite
@@ -64,7 +65,12 @@ internal class FakeChatListCore : ChatListCore {
     override suspend fun conversationList(): List<SonarConversationListRow> {
         listCalls++
         if (failList) error("conversation list read failed")
-        return listRows ?: coreLikeConversationRows(chats, summaries, ownNpub, noteToSelfId)
+        return listRows ?: coreLikeConversationRows(chats, summaries, ownNpub, noteToSelfId, rememberedNames)
+    }
+
+    val rememberedNames = mutableMapOf<String, String>()
+    override suspend fun rememberPeerNames(names: Map<String, String>) {
+        rememberedNames += names
     }
 
     override suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
@@ -162,6 +168,7 @@ internal fun coreLikeConversationRows(
     summaries: List<SonarConversationSummary>,
     ownNpub: String,
     noteToSelfId: String?,
+    names: Map<String, String> = emptyMap(),
 ): List<SonarConversationListRow> {
     val byId = summaries.associateBy { it.groupIdHex }
     val latest = { gid: String -> byId[gid]?.latestAtSecs ?: 0L }
@@ -184,8 +191,17 @@ internal fun coreLikeConversationRows(
                 else -> SonarConversationListKind.Group
             },
             groupIds = sorted.map { it.id },
-            counterpartHex = null,
+            counterpartHex = directMarmotPeerKey(head, ownNpub),
             name = sorted.firstOrNull { it.name.isNotEmpty() }?.name ?: "",
+            title = when {
+                nts -> null
+                directMarmotPeerKey(head, ownNpub) != null ->
+                    names[directMarmotPeerKey(head, ownNpub)]
+                        ?: sorted.firstOrNull { it.name.isNotEmpty() }?.name
+                else -> sorted.firstOrNull { it.name.isNotEmpty() }?.name
+            },
+            preview = newest?.latestContent?.let { SonarConversationPreview.Text(it) }
+                ?: SonarConversationPreview.Empty,
             latestContent = newest?.latestContent ?: "",
             latestSenderHex = newest?.latestSenderNpub ?: "",
             latestAtSecs = newest?.latestAtSecs ?: 0L,

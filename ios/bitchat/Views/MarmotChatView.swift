@@ -277,6 +277,39 @@ func snDirectMarmotPeerKey(for group: MarmotService.MarmotGroup, ownNpub: String
     return others.count == 1 ? others.first : nil
 }
 
+/// Rows safe to keep in plain UserDefaults: no message text. A text preview
+/// becomes `.empty` and `latestContent` is dropped; media kinds, titles, times
+/// and badges stay (the old snapshot kept group names and ids, the same class
+/// of metadata).
+func snSnapshotSafeRows(
+    _ rows: [MarmotService.ConversationListRow]
+) -> [MarmotService.ConversationListRow] {
+    rows.map { row in
+        var preview = row.preview
+        switch preview {
+        case .text, .file: preview = .empty
+        default: break
+        }
+        return MarmotService.ConversationListRow(
+            conversationId: row.conversationId,
+            kind: row.kind,
+            groupIds: row.groupIds,
+            counterpartHex: row.counterpartHex,
+            name: row.name,
+            title: row.title,
+            preview: preview,
+            latestContent: "",
+            latestSenderHex: row.latestSenderHex,
+            latestAt: row.latestAt,
+            latestMine: row.latestMine,
+            latestGroupId: row.latestGroupId,
+            messageCount: row.messageCount,
+            unreadCount: row.unreadCount,
+            version: row.version
+        )
+    }
+}
+
 /// Core's rows as a lookup: each group id → its row's folded set, row group
 /// first (the `conversationGroupIdsByGroup` shape).
 func snConversationGroupIdsByGroup(
@@ -303,6 +336,36 @@ func snDroppingConversationGroup(
     return next
 }
 
+/// `rows` with `groupId` gone: its row loses that group, and a row left with
+/// no group disappears (Delete/Leave paints before core answers again).
+func snDroppingConversationRowGroup(
+    _ groupId: String,
+    from rows: [MarmotService.ConversationListRow]
+) -> [MarmotService.ConversationListRow] {
+    rows.compactMap { row in
+        guard row.groupIds.contains(groupId) else { return row }
+        let remaining = row.groupIds.filter { $0 != groupId }
+        guard let head = remaining.first else { return nil }
+        return MarmotService.ConversationListRow(
+            conversationId: row.conversationId == groupId ? head : row.conversationId,
+            kind: row.kind,
+            groupIds: remaining,
+            counterpartHex: row.counterpartHex,
+            name: row.name,
+            title: row.title,
+            preview: row.preview,
+            latestContent: row.latestContent,
+            latestSenderHex: row.latestSenderHex,
+            latestAt: row.latestAt,
+            latestMine: row.latestMine,
+            latestGroupId: row.latestGroupId,
+            messageCount: row.messageCount,
+            unreadCount: row.unreadCount,
+            version: row.version
+        )
+    }
+}
+
 /// The groups of `groupId`'s core row that are still in `groupsById`, in the
 /// row's order. nil when core has not listed `groupId` (fall back to the local
 /// fold) or none of its set is active.
@@ -314,16 +377,6 @@ func snCoreFoldedGroups(
     guard let set = sets[groupId] else { return nil }
     let groups = set.compactMap { groupsById[$0] }
     return groups.isEmpty ? nil : groups
-}
-
-func snCanonicalDirectMarmotGroups(
-    _ groups: [MarmotService.MarmotGroup],
-    ownNpub: String?
-) -> [String: [MarmotService.MarmotGroup]] {
-    groups.reduce(into: [:]) { result, group in
-        guard let key = snDirectMarmotPeerKey(for: group, ownNpub: ownNpub) else { return }
-        result[key, default: []].append(group)
-    }
 }
 
 func snResolvedMarmotAuthorName(
@@ -373,25 +426,52 @@ enum SNMarmotChatSnapshotCache {
 
     private struct Snapshot: Codable {
         let groups: [MarmotService.MarmotGroup]
+        /// Core's Messages-list rows, so Home paints before the store opens.
+        /// Message text is stripped (see `snSnapshotSafeRows`): this cache is
+        /// plain UserDefaults, outside the encrypted chat database.
+        var rows: [MarmotService.ConversationListRow]?
     }
 
     static func load(from defaults: UserDefaults) -> ([MarmotService.MarmotGroup], [String: [MarmotService.MarmotMessage]]) {
+        let (groups, _) = loadWithRows(from: defaults)
+        return (groups, [:])
+    }
+
+    static func loadWithRows(
+        from defaults: UserDefaults
+    ) -> ([MarmotService.MarmotGroup], [MarmotService.ConversationListRow]) {
         guard let data = defaults.data(forKey: defaultsKey),
               let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
-        else { return ([], [:]) }
+        else { return ([], []) }
         // Rewrite older snapshots that included message bodies/media outside the
         // encrypted chat database. The startup cache is row metadata only.
-        save(groups: snapshot.groups, messagesByGroup: [:], to: defaults)
-        return (snapshot.groups, [:])
+        let rows = snSnapshotSafeRows(snapshot.rows ?? [])
+        save(groups: snapshot.groups, rows: rows, to: defaults)
+        return (snapshot.groups, rows)
     }
 
     static func save(
         groups: [MarmotService.MarmotGroup],
         messagesByGroup: [String: [MarmotService.MarmotMessage]],
+        rows: [MarmotService.ConversationListRow]? = nil,
         to defaults: UserDefaults
     ) {
         _ = messagesByGroup
-        let snapshot = Snapshot(groups: groups)
+        save(groups: groups, rows: rows, to: defaults)
+    }
+
+    private static func save(
+        groups: [MarmotService.MarmotGroup],
+        rows: [MarmotService.ConversationListRow]?,
+        to defaults: UserDefaults
+    ) {
+        var snapshot = Snapshot(groups: groups)
+        if let rows {
+            snapshot.rows = snSnapshotSafeRows(rows)
+        } else if let data = defaults.data(forKey: defaultsKey),
+                  let previous = try? JSONDecoder().decode(Snapshot.self, from: data) {
+            snapshot.rows = previous.rows
+        }
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         defaults.set(data, forKey: defaultsKey)
     }
@@ -509,8 +589,14 @@ final class MarmotChatModel: ObservableObject {
     /// of its Messages-list row, row group first. The one answer to "which
     /// groups are this 1:1" for Home, open, mark-read and mute, shared with
     /// Compose (R-003, R-052). Empty until the store answers once; callers
-    /// then fall back to the local `snCanonicalDirectMarmotGroups` fold.
+    /// then fall back to the local `snDirectMarmotPeerKey` fold.
     @Published private(set) var conversationGroupIdsByGroup: [String: [String]] = [:]
+    /// Core's Messages-list screen model (`conversationList`): one row per
+    /// Marmot conversation, titled, previewed, badged and ordered by core.
+    /// Home renders these; it no longer folds, titles or previews groups.
+    @Published private(set) var conversationRows: [MarmotService.ConversationListRow] = []
+    /// Names already handed to core this process (seeded once, then on change).
+    private var seededPeerNameKeys = Set<String>()
     @Published var busy = false
     /// Serializes Settings → Backup chats so a second tap cannot seal while the
     /// first has already reopened SQLCipher (Compose joins jobs before FFI).
@@ -789,9 +875,11 @@ final class MarmotChatModel: ObservableObject {
         self.defaults = defaults
         self.profilesByNpub = SNMarmotProfileCache.load(from: defaults)
         self.sonarDescriptorsByNpub = SNMarmotDescriptorCache.load(from: defaults)
-        let cached = SNMarmotChatSnapshotCache.load(from: defaults)
+        let cached = SNMarmotChatSnapshotCache.loadWithRows(from: defaults)
         self.groups = cached.0
-        self.messagesByGroup = cached.1
+        self.messagesByGroup = [:]
+        self.conversationRows = cached.1
+        self.conversationGroupIdsByGroup = snConversationGroupIdsByGroup(cached.1)
         self.conversationChangeSub = service.conversationChanged
             .receive(on: DispatchQueue.main)
             .collect(.byTimeOrCount(DispatchQueue.main, .milliseconds(50), 128))
@@ -3323,6 +3411,37 @@ final class MarmotChatModel: ObservableObject {
         guard let rows else { return }
         let folded = snConversationGroupIdsByGroup(rows)
         if folded != conversationGroupIdsByGroup { conversationGroupIdsByGroup = folded }
+        if rows != conversationRows {
+            conversationRows = rows
+            SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: [:], rows: rows, to: defaults)
+        }
+        seedPeerNamesIfNeeded(for: rows)
+    }
+
+    /// Hand core the names this app already knows for the people in `rows`
+    /// that core has no title for, once per name: core then titles the rows
+    /// itself, and `fetchProfile` keeps them current.
+    private func seedPeerNamesIfNeeded(for rows: [MarmotService.ConversationListRow]) {
+        var names: [(pubkeyHex: String, name: String)] = []
+        for row in rows where row.kind == .direct && row.title == nil {
+            guard let hex = row.counterpartHex, !seededPeerNameKeys.contains(hex) else { continue }
+            let npub = SNMarmotProfileCache.canonicalKey(hex)
+            if let name = displayName(forNpub: npub) {
+                names.append((hex, name))
+                seededPeerNameKeys.insert(hex)
+            } else {
+                ensureProfile(npub)
+            }
+        }
+        guard !names.isEmpty else { return }
+        Task { await service.rememberPeerNames(names) }
+    }
+
+    /// Whether any of `groupIds` has its badge held off right now: a mark-read
+    /// still in flight, or the chat is on screen. Home applies this to core's
+    /// row unread so a badge clears the moment the chat opens.
+    func isUnreadSuppressed(groupIds: [String]) -> Bool {
+        groupIds.contains { unreadSuppressGroupIds.contains($0) || viewingUnreadGroupIds.contains($0) }
     }
 
     private func publishUnread(from summaries: [MarmotService.ConversationSummary]) {
@@ -5277,6 +5396,8 @@ final class MarmotChatModel: ObservableObject {
         conversationSummariesByGroup[groupId] = nil
         let folded = snDroppingConversationGroup(groupId, from: conversationGroupIdsByGroup)
         if folded != conversationGroupIdsByGroup { conversationGroupIdsByGroup = folded }
+        let rows = snDroppingConversationRowGroup(groupId, from: conversationRows)
+        if rows != conversationRows { conversationRows = rows }
         discardOptimistic(for: groupId)
         localTranscriptCursorByGroup[groupId] = nil
         localTranscriptHasOlderByGroup[groupId] = nil
@@ -5433,6 +5554,8 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup = [:]
         conversationSummariesByGroup = [:]
         conversationGroupIdsByGroup = [:]
+        conversationRows = []
+        seededPeerNameKeys = []
         unreadByGroup = [:]
         unreadSuppressGroupIds = []
         viewingUnreadGroupIds = []

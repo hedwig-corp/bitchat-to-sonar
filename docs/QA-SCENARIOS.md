@@ -506,6 +506,29 @@ nothing by design.
   The two apps each folded duplicate groups themselves, with two copies of
   the rule that had already drifted once (R-052).
 
+### QA-155 — Both apps title and word a chat row the same way
+- **Platforms:** both. Titles and previews come from core (`conversation_list`
+  rows: `title`, `preview`); the apps only word the preview.
+- **Steps:** a peer with a kind-0 name starts a 1:1 and sends a photo, then a
+  text; another peer with no profile sends a text; the app is backgrounded
+  and relaunched (cold start).
+- **Expect:** the named peer's row is titled with that name and reads "Photo",
+  then the text, on both apps; the unnamed peer's row shows the short npub;
+  after the cold start the rows paint before the store opens with the same
+  titles, times and badges, and no message text appears in the startup
+  snapshot (iOS `marmot.chatSnapshot.v1`, Compose `chats.snapshot.v1`).
+- **How:** automated in core and at the app call sites. On devices the
+  Messaging smoke (QA-001…005) exercises it.
+- **Guard:** `client.rs::conversation_list_titles_and_previews_rows_in_core`,
+  `conversation_list.rs::previews_are_semantic_for_new_and_legacy_rows`,
+  `ChatListAppStateTest.aOneToOneRowIsTitledByCore`,
+  `CoreHomeRowsTest.theSnapshotKeepsRowsButNeverMessageText`,
+  `SonarCoreConversationFoldTests.theStartupSnapshotKeepsRowsButNeverMessageText`
+- **Origin:** core screen models for Home. The apps titled 1:1s and worded
+  previews separately and had drifted: Compose said "Image" where iOS said
+  "Photo", and showed a photo's media label over its caption where iOS showed
+  the caption.
+
 ## Note to Self (#339)
 
 Note to Self is a solo Marmot group marked `sonar.note-to-self.v1`: it is
