@@ -22,7 +22,8 @@
 #     worktree's QA simulator (extra args after `--` go to it).
 #  3. The store replaces the app's (App Group `sonar-marmot/`), per-chat
 #     local-time overrides are written the way a toggle stores them (group ids
-#     AND the peer's npub, the alias key behind R-055), and the app launches
+#     AND the peer's npub, the alias key behind R-055), one chat is muted (so
+#     every row's mute lookup runs, R-057), and the app launches
 #     with the DEBUG bench hooks: SONAR_BENCH_NSEC (identity + DB key),
 #     SONAR_BENCH_RELAYS (the local relay), SONAR_BENCH_APNS_TOKEN (so the
 #     push-token share path runs).
@@ -114,12 +115,24 @@ print("\n".join(args))
 PY
 OVERRIDES=()
 while IFS= read -r line; do [[ -n "$line" ]] && OVERRIDES+=("$line"); done < "$FIX/overrides.args"
+# By path, not by bundle id: `defaults write sh.hedwig.sonar` from simctl
+# spawn lands in the simulator's global preferences, which the app never
+# reads. Going through `defaults` (not editing the plist) keeps cfprefsd's
+# cache coherent.
+PREFS="$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data)/Library/Preferences/$BUNDLE"
+# One muted chat, stored the way SonarChatMuteStore stores it (JSON
+# [key: Date], Date as seconds since 2001; distantFuture = until turned back
+# on). With nothing muted, isChatMuted returns early and the per-row mute
+# lookups behind R-057 never run.
+MUTE_HEX="$(python3 - "$MANIFEST" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+first = next(g for g in m["groups"] if g["kind"] == "dm")
+print(json.dumps({"marmot:" + first["mls_group_id"]: 63113904000.0}).encode().hex())
+PY
+)"
+xcrun simctl spawn "$UDID" defaults write "$PREFS" sonar.chat.mutes.v1 -data "$MUTE_HEX"
 if (( ${#OVERRIDES[@]} )); then
-  # By path, not by bundle id: `defaults write sh.hedwig.sonar` from simctl
-  # spawn lands in the simulator's global preferences, which the app never
-  # reads. Going through `defaults` (not editing the plist) keeps cfprefsd's
-  # cache coherent.
-  PREFS="$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data)/Library/Preferences/$BUNDLE"
   xcrun simctl spawn "$UDID" defaults write "$PREFS" sonar.privacy.shareLocalTimeByChat \
     -dict-add "${OVERRIDES[@]}"
   N_SET="$(xcrun simctl spawn "$UDID" defaults read "$PREFS" sonar.privacy.shareLocalTimeByChat \
@@ -127,7 +140,7 @@ if (( ${#OVERRIDES[@]} )); then
   (( N_SET * 3 >= ${#OVERRIDES[@]} )) \
     || { echo "local-time overrides did not reach the app container ($N_SET set)" >&2; exit 1; }
 fi
-echo ">> local-time overrides: $(( ${#OVERRIDES[@]} / 3 )) keys in the app's defaults" >&2
+echo ">> local-time overrides: $(( ${#OVERRIDES[@]} / 3 )) keys in the app's defaults; 1 chat muted" >&2
 
 # 4. Measured run: launch, then background/foreground rounds.
 START="$(date -u +%Y-%m-%dT%H:%M:%S)"

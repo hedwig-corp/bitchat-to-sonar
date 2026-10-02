@@ -746,7 +746,8 @@ share a zone with the app and report the zone the app shared with it.
   `-- --build-core` for `ios-setup.sh`). It seeds the account on a local relay
   (400 1:1 chats, 40 replying peers, 20 duplicate 1:1 groups, 5 team groups),
   installs it in this worktree's QA simulator with per-chat local-time
-  overrides stored like a real toggle (group ids and the peer npub), registers
+  overrides stored like a real toggle (group ids and the peer npub) and one
+  muted chat (so every row's mute lookup runs, QA-161), registers
   a push token through the DEBUG hook, then runs background/foreground rounds.
 - **Expect:** `stall-gate.sh` passes: no `main thread stalled` line, no
   instrumented main-thread section of 250 ms or more (the probe alone only
