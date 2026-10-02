@@ -258,7 +258,7 @@ actual object SonarCore {
     actual suspend fun requestJoinViaLink(token: String) =
         withContext(Dispatchers.IO) { requireNode().requestJoinViaLink(token) }
 
-    actual suspend fun send(chatId: String, text: String) = withContext(Dispatchers.IO) {
+    actual suspend fun send(chatId: String, text: String): String = withContext(Dispatchers.IO) {
         requireNode().sendText(chatId, text)
     }
 
@@ -268,7 +268,7 @@ actual object SonarCore {
         replyToHex: String,
         replyToNpub: String,
         preview: String?,
-    ) = withContext(Dispatchers.IO) {
+    ): String = withContext(Dispatchers.IO) {
         requireNode().sendTextReply(chatId, text, replyToHex, replyToNpub, preview)
     }
 
@@ -385,7 +385,7 @@ actual object SonarCore {
         packCoordinate: String,
         shortcode: String,
         plaintextSha256: String,
-    ) = withContext(Dispatchers.IO) {
+    ): String = withContext(Dispatchers.IO) {
         stickerOperationLock.read {
             requireNode().sendSticker(chatId, packCoordinate, shortcode, plaintextSha256)
         }

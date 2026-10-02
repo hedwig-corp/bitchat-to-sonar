@@ -747,6 +747,11 @@ final class MarmotChatModel: ObservableObject {
     /// Canonical rows that predate each optimistic echo in the local transcript.
     /// They must not be mistaken for the relay copy of a later identical send.
     private var preexistingCanonicalMessageIDsByOptimisticID: [String: Set<String>] = [:]
+    /// Optimistic echo id → the id of the row core stored for that send (core
+    /// returns it from `sendText`/`sendSticker`). Known → the echo resolves to
+    /// exactly that row; the content/time match below is only for the moment
+    /// before the send returns, and for media.
+    private var canonicalIDByOptimisticID: [String: String] = [:]
     private var stickerPacksByCoordinate: [String: StickerPackInfo] = [:]
     private var stickerPackLRU: [String] = []
     private var stickerImagesBySHA256: [String: Data] = [:]
@@ -3998,10 +4003,12 @@ final class MarmotChatModel: ObservableObject {
                 source: byGroup[groupId] ?? [],
                 pending: pending,
                 exclusionsByOptimisticID: preexistingCanonicalMessageIDsByOptimisticID,
-                freshCanonical: freshRowsByGroup[groupId] ?? []
+                freshCanonical: freshRowsByGroup[groupId] ?? [],
+                canonicalIDByOptimisticID: canonicalIDByOptimisticID
             )
             for echo in pending where !reconciliation.survivors.contains(where: { $0.id == echo.id }) {
                 preexistingCanonicalMessageIDsByOptimisticID[echo.id] = nil
+                canonicalIDByOptimisticID[echo.id] = nil
             }
             if reconciliation.survivors.isEmpty {
                 pendingOptimistic[groupId] = nil
@@ -4068,7 +4075,8 @@ final class MarmotChatModel: ObservableObject {
         source: [MarmotService.MarmotMessage],
         pending: [MarmotService.MarmotMessage],
         exclusionsByOptimisticID: [String: Set<String>] = [:],
-        freshCanonical: [MarmotService.MarmotMessage] = []
+        freshCanonical: [MarmotService.MarmotMessage] = [],
+        canonicalIDByOptimisticID: [String: String] = [:]
     ) -> OptimisticReconciliation {
         let canonical = source.filter { !isLocalTranscriptEcho($0) }
         let windowedIDs = Set(canonical.map(\.id))
@@ -4079,13 +4087,22 @@ final class MarmotChatModel: ObservableObject {
         var survivors: [MarmotService.MarmotMessage] = []
         var admitted: [MarmotService.MarmotMessage] = []
         for optimistic in pending {
-            if let match = unmatchedCanonical.firstIndex(where: {
-                serverMessage(
-                    $0,
-                    matchesOptimistic: optimistic,
-                    excludingServerIDs: exclusionsByOptimisticID[optimistic.id] ?? []
-                )
-            }) {
+            let match: Int?
+            if let canonicalID = canonicalIDByOptimisticID[optimistic.id] {
+                // Exact: core told us which row this send wrote. Until that row
+                // is read back the echo stays "Sending"; an identical older
+                // row can never consume it.
+                match = unmatchedCanonical.firstIndex { $0.id.caseInsensitiveCompare(canonicalID) == .orderedSame }
+            } else {
+                match = unmatchedCanonical.firstIndex(where: {
+                    serverMessage(
+                        $0,
+                        matchesOptimistic: optimistic,
+                        excludingServerIDs: exclusionsByOptimisticID[optimistic.id] ?? []
+                    )
+                })
+            }
+            if let match {
                 let fulfilled = unmatchedCanonical.remove(at: match)
                 if !windowedIDs.contains(fulfilled.id) {
                     admitted.append(fulfilled)
@@ -4115,6 +4132,7 @@ final class MarmotChatModel: ObservableObject {
 
     private func discardOptimistic(id: String, from groupId: String) {
         preexistingCanonicalMessageIDsByOptimisticID[id] = nil
+        canonicalIDByOptimisticID[id] = nil
         pendingOptimistic[groupId]?.removeAll { $0.id == id }
         messagesByGroup[groupId, default: []].removeAll { $0.id == id }
     }
@@ -4122,6 +4140,7 @@ final class MarmotChatModel: ObservableObject {
     private func discardOptimistic(for groupId: String) {
         pendingOptimistic[groupId]?.forEach {
             preexistingCanonicalMessageIDsByOptimisticID[$0.id] = nil
+            canonicalIDByOptimisticID[$0.id] = nil
         }
         pendingOptimistic[groupId] = nil
     }
@@ -4233,7 +4252,11 @@ final class MarmotChatModel: ObservableObject {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await self.publishText(trimmed, to: groupId, reply: reply)
+                let storedID = try await self.publishText(trimmed, to: groupId, reply: reply)
+                self.canonicalIDByOptimisticID[echo.id] = storedID
+                // The row is already in the store: reconcile now so the echo
+                // resolves even when no further change arrives.
+                self.messagesByGroup = self.reconcileOptimistic(into: self.messagesByGroup)
             } catch {
                 self.discardOptimistic(id: echo.id, from: groupId)
                 onFailure?()
@@ -4252,12 +4275,12 @@ final class MarmotChatModel: ObservableObject {
         _ text: String,
         to groupId: String,
         reply: MarmotService.MarmotReplyRef?
-    ) async throws {
+    ) async throws -> String {
         if let reply,
            snCanEmitNipC7(parentId: reply.parentId, parentNpub: reply.parentNpub),
            let npub = reply.parentNpub
         {
-            try await service.sendTextReply(
+            return try await service.sendTextReply(
                 groupId: groupId,
                 text: text,
                 replyToHex: reply.parentId,
@@ -4265,7 +4288,7 @@ final class MarmotChatModel: ObservableObject {
                 preview: reply.preview
             )
         } else {
-            try await service.sendText(groupId: groupId, text: text)
+            return try await service.sendText(groupId: groupId, text: text)
         }
     }
 
@@ -4759,12 +4782,14 @@ final class MarmotChatModel: ObservableObject {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await self.service.sendSticker(
+                let storedID = try await self.service.sendSticker(
                     groupId: groupId,
                     packCoordinate: packCoordinate,
                     shortcode: shortcode,
                     plaintextSha256: plaintextSha256
                 )
+                self.canonicalIDByOptimisticID[echo.id] = storedID
+                self.messagesByGroup = self.reconcileOptimistic(into: self.messagesByGroup)
                 onComplete?()
             } catch {
                 self.pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
@@ -4818,7 +4843,7 @@ final class MarmotChatModel: ObservableObject {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await self.service.sendSticker(
+                _ = try await self.service.sendSticker(
                     groupId: groupId,
                     packCoordinate: packCoordinate,
                     shortcode: shortcode,
@@ -5561,6 +5586,7 @@ final class MarmotChatModel: ObservableObject {
         viewingUnreadGroupIds = []
         pendingOptimistic = [:]
         preexistingCanonicalMessageIDsByOptimisticID = [:]
+        canonicalIDByOptimisticID = [:]
         localTranscriptCursorByGroup = [:]
         localTranscriptHasOlderByGroup = [:]
         localTranscriptLoadingGroups = []

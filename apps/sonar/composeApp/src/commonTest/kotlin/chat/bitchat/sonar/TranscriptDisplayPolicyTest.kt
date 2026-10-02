@@ -527,6 +527,32 @@ class TranscriptDisplayPolicyTest {
         assertFalse(sendEchoAwaitsCanonicalRow(echo.copy(state = "Couldn't send")))
     }
 
+    /** Core returns the id of the row a send stored. Known, it is the only row
+     *  that fulfils the echo: an older identical own row (R-002) never
+     *  consumes it, and it stays "Sending" until that row is read back. */
+    @Test
+    fun aKnownStoredIdIsTheOnlyRowThatFulfilsTheEcho() {
+        val echo = message("echo-1", 100, "ok", mine = true, viaInternet = true, state = "Sending")
+        val older = message("aa11", 100, "ok", mine = true, viaInternet = true)
+        val stored = message("BB22", 101, "ok", mine = true, viaInternet = true)
+
+        val notYet = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = listOf(older),
+            freshCanonical = emptyList(),
+            canonicalIdByEcho = mapOf("echo-1" to "bb22"),
+        )
+        assertTrue(notYet.fulfilledEchoIds.isEmpty(), "the older identical row does not consume it")
+
+        val landed = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = listOf(older, stored),
+            freshCanonical = emptyList(),
+            canonicalIdByEcho = mapOf("echo-1" to "bb22"),
+        )
+        assertEquals(setOf("echo-1"), landed.fulfilledEchoIds)
+    }
+
     // ── Out-of-window canonical rows (the duplicate-bubble regression) ──
     // A pinned/full render window admits no new rows, so the canonical copy of
     // an outgoing send never reaches the matcher via `published` alone. Before

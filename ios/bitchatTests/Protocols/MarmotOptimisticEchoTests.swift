@@ -199,4 +199,31 @@ struct MarmotOptimisticEchoTests {
         // The excluded row is not admitted: it did not fulfill anything.
         #expect(reconciliation.visible.map(\.id) == [echo.id])
     }
+
+    /// Core returns the id of the row a send stored. Known, it is the only row
+    /// that can fulfil the echo: an older identical own row (R-002) never
+    /// consumes it, and the echo stays "Sending" until that row is read back.
+    @Test
+    func aKnownStoredIdIsTheOnlyRowThatFulfilsTheEcho() {
+        let t = Date(timeIntervalSince1970: 100)
+        let echo = message(id: "optimistic-1", createdAt: t, content: "ok")
+        let older = message(id: "aa11", createdAt: t, content: "ok")
+        let stored = message(id: "BB22", createdAt: t.addingTimeInterval(1), content: "ok")
+
+        let notYet = MarmotChatModel.reconciledOptimisticMessages(
+            source: [older],
+            pending: [echo],
+            canonicalIDByOptimisticID: [echo.id: "bb22"]
+        )
+        #expect(notYet.survivors.map(\.id) == ["optimistic-1"], "the older identical row does not consume it")
+        #expect(notYet.visible.map(\.id).contains("optimistic-1"))
+
+        let landed = MarmotChatModel.reconciledOptimisticMessages(
+            source: [older, stored],
+            pending: [echo],
+            canonicalIDByOptimisticID: [echo.id: "bb22"]
+        )
+        #expect(landed.survivors.isEmpty)
+        #expect(landed.visible.map(\.id) == ["aa11", "BB22"], "both rows stay, the echo is gone")
+    }
 }

@@ -327,12 +327,14 @@ internal fun planSendEchoDisplay(
     // dropping this argument is the exact regression #290 fixed, and no
     // helper-level test can catch it. Make the compiler catch it instead.
     freshCanonical: List<SonarMsg>,
+    canonicalIdByEcho: Map<String, String> = emptyMap(),
 ): SendEchoDisplayPlan {
     val reconciliation = reconcileSendEchoes(
         echoes,
         published,
         excludedPublishedIdsByEcho,
         freshCanonical,
+        canonicalIdByEcho,
     )
     val fulfilled = reconciliation.fulfilledEchoIds
     return SendEchoDisplayPlan(
@@ -1500,6 +1502,7 @@ class SonarAppState internal constructor(
         // fulfil or retire it.
         pendingSendEchoes.clear()
         previouslyPublishedMessageIdsByEcho.clear()
+        canonicalIdByEcho.clear()
     }
 
     /** Optimistically clear badges and ask core to zero unread for [groupIds]. */
@@ -8039,7 +8042,7 @@ class SonarAppState internal constructor(
         }
     }
 
-    private suspend fun sendMarmotTextOrdered(chatId: String, text: String, reply: SonarReplyRef? = null) {
+    private suspend fun sendMarmotTextOrdered(chatId: String, text: String, reply: SonarReplyRef? = null): String =
         runMarmotAccountOperation {
             if (reply != null && sonarCanEmitNipC7(reply.parentId, reply.parentNpub)) {
                 SonarCore.sendReply(
@@ -8053,18 +8056,16 @@ class SonarAppState internal constructor(
                 SonarCore.send(chatId, text)
             }
         }
-    }
 
     private suspend fun sendMarmotStickerOrdered(
         chatId: String,
         packCoordinate: String,
         shortcode: String,
         plaintextSha256: String,
-    ) {
+    ): String =
         runMarmotAccountOperation {
             SonarCore.sendSticker(chatId, packCoordinate, shortcode, plaintextSha256)
         }
-    }
 
     /** Serialize every plaintext-publishing Marmot operation with account
      * mutation. Capturing the generation before waiting prevents a send that
@@ -8409,7 +8410,7 @@ class SonarAppState internal constructor(
         messages = (messages + echo).sortedBy { it.tsSecs }
         scope.launch {
             runMarmotSendWithBestEffortReconciliation(
-                send = { sendMarmotTextOrdered(chatId, t, reply) },
+                send = { canonicalIdByEcho[echo.id] = sendMarmotTextOrdered(chatId, t, reply) },
                 onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                 reconcile = {
                     val refreshGeneration = transcriptGeneration
@@ -8753,6 +8754,7 @@ class SonarAppState internal constructor(
 
     private fun clearSendEcho(chatId: String, echoId: String) {
         previouslyPublishedMessageIdsByEcho.remove(echoId)
+        canonicalIdByEcho.remove(echoId)
         pendingSendEchoes[chatId]?.removeAll { it.id == echoId }
         if (pendingSendEchoes[chatId].isNullOrEmpty()) pendingSendEchoes.remove(chatId)
         if ((screen as? Screen.Chat)?.id == chatId) {
@@ -8779,11 +8781,18 @@ class SonarAppState internal constructor(
         succeededEcho: SonarMsg,
         published: List<SonarMsg>,
     ): Boolean {
-        val canonicalIds = eligibleCanonicalRowsForSendEcho(
-            echo = succeededEcho,
-            published = published,
-            excludedPublishedIds = previouslyPublishedMessageIdsByEcho[succeededEcho.id].orEmpty(),
-        ).mapTo(mutableSetOf()) { it.id }
+        // Core told us which row this send stored: that row, and only that
+        // row, is this echo's canonical copy.
+        val storedId = canonicalIdByEcho[succeededEcho.id]
+        val canonicalIds = if (storedId != null) {
+            published.filter { it.id.equals(storedId, ignoreCase = true) }.mapTo(mutableSetOf()) { it.id }
+        } else {
+            eligibleCanonicalRowsForSendEcho(
+                echo = succeededEcho,
+                published = published,
+                excludedPublishedIds = previouslyPublishedMessageIdsByEcho[succeededEcho.id].orEmpty(),
+            ).mapTo(mutableSetOf()) { it.id }
+        }
         if (canonicalIds.isEmpty()) return false
 
         pendingSendEchoes[chatId].orEmpty()
@@ -8801,8 +8810,12 @@ class SonarAppState internal constructor(
         return true
     }
 
+    /** Echo id → the id of the row core stored for that send. */
+    private val canonicalIdByEcho = mutableMapOf<String, String>()
+
     private fun failSendEcho(chatId: String, echoId: String) {
         previouslyPublishedMessageIdsByEcho.remove(echoId)
+        canonicalIdByEcho.remove(echoId)
         val list = pendingSendEchoes[chatId] ?: return
         val idx = list.indexOfFirst { it.id == echoId }
         if (idx >= 0) list[idx] = list[idx].copy(state = "Couldn't send")
@@ -8822,10 +8835,12 @@ class SonarAppState internal constructor(
             published,
             previouslyPublishedMessageIdsByEcho,
             freshCanonicalForChat(chatId),
+            canonicalIdByEcho,
         )
         if (plan.terminalAcceptedEchoIds.isNotEmpty()) {
             echoes.removeAll { it.id in plan.terminalAcceptedEchoIds }
             plan.terminalAcceptedEchoIds.forEach(previouslyPublishedMessageIdsByEcho::remove)
+            plan.terminalAcceptedEchoIds.forEach(canonicalIdByEcho::remove)
             if (echoes.isEmpty()) pendingSendEchoes.remove(chatId)
         }
         // A canonical row can suppress a duplicate bubble before the send
@@ -11002,7 +11017,7 @@ class SonarAppState internal constructor(
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
                 runMarmotSendWithBestEffortReconciliation(
-                    send = { sendMarmotTextOrdered(group.id, text, reply) },
+                    send = { canonicalIdByEcho[echo.id] = sendMarmotTextOrdered(group.id, text, reply) },
                     onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                     reconcile = { reconcileMeshMarmotSendEcho(peerId, chatId, echo) },
                     onSendFailure = { error ->

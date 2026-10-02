@@ -1047,8 +1047,9 @@ expect object SonarCore {
     /** Request to join a group via an invite link token. */
     suspend fun requestJoinViaLink(token: String)
 
-    /** Send an encrypted text message to a chat. */
-    suspend fun send(chatId: String, text: String)
+    /** Send an encrypted text message to a chat. Returns the id of the row
+     *  core stored, which keys the "Sending" echo (R-001, R-002). */
+    suspend fun send(chatId: String, text: String): String
 
     /** Like [send], attaching a NIP-C7 reply pointer. */
     suspend fun sendReply(
@@ -1057,7 +1058,7 @@ expect object SonarCore {
         replyToHex: String,
         replyToNpub: String,
         preview: String?,
-    )
+    ): String
 
     /** Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message. */
     suspend fun sendReaction(
@@ -1125,13 +1126,13 @@ expect object SonarCore {
     /** Cooperative cancel for quiet resume / in-flight Blossom work. */
     suspend fun cancelAllMediaUploads()
 
-    /** Send a sticker message to a chat. */
+    /** Send a sticker message to a chat; returns the stored row's id. */
     suspend fun sendSticker(
         chatId: String,
         packCoordinate: String,
         shortcode: String,
         plaintextSha256: String,
-    )
+    ): String
 
     /** Fetch a sticker pack from relays by author + identifier. */
     suspend fun fetchStickerPack(

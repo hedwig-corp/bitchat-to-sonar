@@ -1052,8 +1052,10 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().requestJoinViaLink(inviteToken: token) }
     }
 
-    /// Encrypt and publish a text message to the group.
-    func sendText(groupId: String, text: String) async throws {
+    /// Encrypt and publish a text message to the group. Returns the stored
+    /// row's id, which keys the "Sending" bubble (R-001, R-002).
+    @discardableResult
+    func sendText(groupId: String, text: String) async throws -> String {
         try await sendLane { try $0.sendText(groupIdHex: groupId, text: text) }
     }
 
@@ -1063,7 +1065,7 @@ final class MarmotService: @unchecked Sendable {
         replyToHex: String,
         replyToNpub: String,
         preview: String?
-    ) async throws {
+    ) async throws -> String {
         try await sendLane {
             try $0.sendTextReply(
                 groupIdHex: groupId,
@@ -1226,7 +1228,7 @@ final class MarmotService: @unchecked Sendable {
         packCoordinate: String,
         shortcode: String,
         plaintextSha256: String
-    ) async throws {
+    ) async throws -> String {
         try await sendLane {
             try $0.sendSticker(
                 groupIdHex: groupId,

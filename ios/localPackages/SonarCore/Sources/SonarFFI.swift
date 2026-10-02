@@ -2384,17 +2384,20 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     /**
      * Encrypt + publish a sticker message to the group.
      */
-    func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws
+    func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws  -> String
 
     /**
      * Encrypt + publish a text message to the group.
+     * Send `text`; returns the stored message's id (hex). The row is written
+     * locally before this returns: hosts key their "Sending" bubble by this
+     * id and match the transcript row exactly (R-001, R-002).
      */
-    func sendText(groupIdHex: String, text: String) throws
+    func sendText(groupIdHex: String, text: String) throws  -> String
 
     /**
      * Like `send_text`, attaching a NIP-C7 reply pointer.
      */
-    func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?) throws
+    func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?) throws  -> String
 
     func setConversationChangeListener(listener: ConversationChangeListener)
 
@@ -3640,7 +3643,8 @@ open func sendReaction(groupIdHex: String, targetIdHex: String, targetNpub: Stri
     /**
      * Encrypt + publish a sticker message to the group.
      */
-open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_send_sticker(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
@@ -3648,25 +3652,30 @@ open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: Str
         FfiConverterString.lower(shortcode),
         FfiConverterString.lower(plaintextSha256),$0
     )
-}
+})
 }
 
     /**
      * Encrypt + publish a text message to the group.
+     * Send `text`; returns the stored message's id (hex). The row is written
+     * locally before this returns: hosts key their "Sending" bubble by this
+     * id and match the transcript row exactly (R-001, R-002).
      */
-open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func sendText(groupIdHex: String, text: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_send_text(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
         FfiConverterString.lower(text),$0
     )
-}
+})
 }
 
     /**
      * Like `send_text`, attaching a NIP-C7 reply pointer.
      */
-open func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_send_text_reply(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
@@ -3675,7 +3684,7 @@ open func sendTextReply(groupIdHex: String, text: String, replyToHex: String, re
         FfiConverterString.lower(replyToNpub),
         FfiConverterOptionString.lower(preview),$0
     )
-}
+})
 }
 
 open func setConversationChangeListener(listener: ConversationChangeListener)  {try! rustCall() {
@@ -12138,13 +12147,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_reaction() != 5002) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 28650) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 49605) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23698) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text_reply() != 3890) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text_reply() != 61366) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 62940) {
