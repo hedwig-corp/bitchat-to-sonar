@@ -3055,11 +3055,32 @@ coroutine launched on `scope` and builds its list with
 sink, and no freeze was reported there. Not changed here. The same per-chat
 cost would show as `visibleChats` jank, not a frozen UI.
 
-**Guarded by:** `TimezoneShareGroupIdsTests.noOverridesFollowsTheGlobalSwitch`,
-`TimezoneShareGroupIdsTests.aDirectOverrideWinsWithoutAnyAliasWalk` (alias
-lookups are counted and must be zero when the map holds only group keys),
+**Guarded by:** `TimezoneShareGroupIdsTests.thePeerKeyIsComputedOncePerGroup`
+(400 groups, alias overrides present: exactly one peer-key computation per
+group), `TimezoneShareGroupIdsTests.aLaterDuplicateGroupInheritsItsSiblingsOverride`,
+`TimezoneShareGroupIdsTests.anOverrideStoredOnlyUnderThePeerKeyReachesTheirGroups`,
+`TimezoneShareGroupIdsTests.groupChatsNeverInheritAPeerOverride`,
+`TimezoneShareGroupIdsTests.noOverridesFollowsTheGlobalSwitch`,
+`TimezoneShareGroupIdsTests.aDirectOverrideWinsOverTheAliasAndTheGlobalSwitch`,
 `TimezoneShareGroupIdsTests.eitherKeyFormSharingIsEnough`,
-`TimezoneShareGroupIdsTests.anAliasOverrideIsConsultedOnlyWhenAliasKeysExist`.
+`TimezoneShareGroupIdsTests.anAliasOverrideAppliesOnlyWithoutADirectEntry`.
+
+**Reopened 2026-10-02 (1.15.3/48):** the first fix skipped the alias walk only
+when the override map held nothing but group ids. Toggling local time in any
+chat stores the override under every key of that chat (mesh ids, npub, hex),
+so on a real account the walk still ran: `muteKeys` per group, each
+re-scanning all 400 groups (`directMarmotGroups`), about 160,000 peer-key
+canonicalizations. It ran on the `$groups` sink (`home.groupsSink` ~1,020 ms)
+and, unwrapped, in `setForeground` via `shareLocalTimeIfEnabled()`: two
+unattributed stalls of 0.65–1.1 s on every app activation, which the user saw
+as the UI freezing when the app comes back online. Now
+`snTimezoneAliasOverridesByGroup` buckets 1:1 groups by peer once and
+resolves each group's inherited override from its sibling groups and the
+peer's npub/hex, the only aliases a toggle can leave a group without. Same
+device and account: before, 8 activations with 2 stalls each; after, 2
+activations with none, and `fg.timezoneShare` stays under the 48 ms section
+threshold. `setForeground` steps and the `$relayConnected` sink are probe
+sections now (`fg.*`, `relay.connectedSink`).
 
 **Not guarded:** the publish-only-on-change guards and the single snapshot
 walk need a constructible `MarmotChatModel` / `SonarAppStore` (see
