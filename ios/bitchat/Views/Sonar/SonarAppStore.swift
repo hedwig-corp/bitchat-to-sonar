@@ -2521,13 +2521,15 @@ final class SonarAppStore: ObservableObject {
                 // (hydrate own profile first). Publishing here after nsec restore
                 // can emit metadata without `nip05` and replace the durable
                 // kind-0 on relays.
-                self.adoptClaimedHandleIfNeeded()
-                self.ensureCallStarted()
-                self.publishPaymentMetadataIfNeeded(force: true)
-                self.drainPendingInviteLinks()
-                guard !self.refreshedKnownDescriptorsForRelaySession else { return }
-                self.refreshedKnownDescriptorsForRelaySession = true
-                self.refreshKnownContactDescriptors(clearMisses: true)
+                SNMainThreadStallProbe.measure("relay.connectedSink") {
+                    self.adoptClaimedHandleIfNeeded()
+                    self.ensureCallStarted()
+                    self.publishPaymentMetadataIfNeeded(force: true)
+                    self.drainPendingInviteLinks()
+                    guard !self.refreshedKnownDescriptorsForRelaySession else { return }
+                    self.refreshedKnownDescriptorsForRelaySession = true
+                    self.refreshKnownContactDescriptors(clearMisses: true)
+                }
             }
             .store(in: &cancellables)
         // Messages typed to an out-of-range Sonar peer before their White
@@ -3159,16 +3161,29 @@ final class SonarAppStore: ObservableObject {
         // walked `muteKeys` across every group: about a second on the main
         // thread per `$groups` publish on a 400-group account (R-055).
         let overrides = shareLocalTimeByChat
+        let ownNpub = marmot.npub
+        let aliases = snTimezoneAliasOverridesByGroup(
+            groups: marmot.groups,
+            marmotIDPrefix: Self.marmotIDPrefix,
+            overrides: overrides,
+            directPeerKey: { snDirectMarmotPeerKey(for: $0, ownNpub: ownNpub) },
+            peerKeyForms: { group in
+                // The same encodings `muteKeys` stores for a direct peer.
+                guard let other = group.memberNpubs.first(where: { $0 != ownNpub }) else { return [] }
+                var forms = [other]
+                if let data = Self.nostrPubkeyData(other) {
+                    forms.append(data.hexEncodedString())
+                }
+                return forms
+            }
+        )
         return snTimezoneShareGroupIds(
             groupIds: marmot.groups.map(\.id),
             mappedGroupIds: Array(marmotGroupIdsByConversationId.values),
             marmotIDPrefix: Self.marmotIDPrefix,
             overrides: overrides,
             global: shareLocalTime,
-            aliasOverride: { [weak self] chatId in
-                guard let self else { return nil }
-                return self.timezoneShareKeys(forChatId: chatId).compactMap { overrides[$0] }.first
-            }
+            aliasOverrideByGroup: aliases
         )
     }
 
@@ -3751,7 +3766,7 @@ final class SonarAppStore: ObservableObject {
         isForeground = foreground
         // Cashu: connect + sync on foreground, disconnect on background (never
         // under a send in flight). Idempotent, so it is driven on every signal.
-        wallet.setForeground(foreground)
+        SNMainThreadStallProbe.measure("fg.wallet") { wallet.setForeground(foreground) }
         if foreground {
             moneyDisplay.startRefreshing()
         } else {
@@ -3769,10 +3784,12 @@ final class SonarAppStore: ObservableObject {
         // the resume and the node (deferred at launch) would never come up.
         // suspend/resume are idempotent (guarded on node state / `suspendedForBackground`).
         if let walletService = legacyWallet?.walletService {
-            if foreground {
-                walletService.resumeFromBackground()
-            } else {
-                walletService.suspendForBackground()
+            SNMainThreadStallProbe.measure("fg.legacyWallet") {
+                if foreground {
+                    walletService.resumeFromBackground()
+                } else {
+                    walletService.suspendForBackground()
+                }
             }
         }
         // Mirror Breez: release the Marmot SQLCipher handle + App Group flock so
@@ -3792,7 +3809,7 @@ final class SonarAppStore: ObservableObject {
             marmot.refreshAfterForeground()
         }
         #endif
-        updateNearbyScanning()
+        SNMainThreadStallProbe.measure("fg.nearbyScanning") { updateNearbyScanning() }
         guard changed else { return }
         // Ask the policy rather than inlining the decision, so the Compose
         // mirror (SonarAppState.onProcessBackgrounded) and this call site stay
@@ -3803,16 +3820,16 @@ final class SonarAppStore: ObservableObject {
         if wentToBackground, RelayConnectionPolicy.shouldInvalidateOnBackground() {
             marmot.invalidateRelayConnection()
         }
-        updateReceiverAdvertising()
+        SNMainThreadStallProbe.measure("fg.receiverAdvertising") { updateReceiverAdvertising() }
         if cameToForeground {
             // Reconcile timezone even if Darwin coalesced the change
             // notification while this process was suspended.
-            shareLocalTimeIfEnabled()
-            refreshKnownContactDescriptors()
+            SNMainThreadStallProbe.measure("fg.timezoneShare") { shareLocalTimeIfEnabled() }
+            SNMainThreadStallProbe.measure("fg.descriptors") { refreshKnownContactDescriptors() }
             publishedCallDescriptor = false
             publishedBolt12Offer = nil
-            publishPaymentMetadataIfNeeded(force: true)
-            marmot.refreshAfterForeground()
+            SNMainThreadStallProbe.measure("fg.paymentMetadata") { publishPaymentMetadataIfNeeded(force: true) }
+            SNMainThreadStallProbe.measure("fg.marmotRefresh") { marmot.refreshAfterForeground() }
         }
     }
 
@@ -12036,44 +12053,89 @@ final class SonarAppStore: ObservableObject {
 
 /// The groups whose members receive our local time: the global switch plus
 /// the per-chat overrides, read once. For each group the override is looked
-/// up under both `marmot:<id>` and the bare id, and either one sharing is
-/// enough (the chat row and the transcript address the same group by the two
-/// forms). `aliasOverride` resolves an override stored under a chat alias (a
-/// folded mesh id, an alert key); it is consulted only for groups with no
-/// direct entry, and only when the map holds keys that are not group ids, so
-/// the common cases never walk aliases. Pure so the main-thread cost stays
-/// testable (R-055).
+/// up under both `marmot:<id>` and the bare id, and either one answers for
+/// both forms (the chat row and the transcript address the same group by the
+/// two forms). A group with no entry of its own falls back to
+/// `aliasOverrideByGroup` (see `snTimezoneAliasOverridesByGroup`), then to the
+/// global switch. Pure so the main-thread cost stays testable (R-055).
 func snTimezoneShareGroupIds(
     groupIds: [String],
     mappedGroupIds: [String],
     marmotIDPrefix: String,
     overrides: [String: Bool],
     global: Bool,
-    aliasOverride: (String) -> Bool?
+    aliasOverrideByGroup: [String: Bool]
 ) -> [String] {
     let known = Set(groupIds).union(mappedGroupIds)
     if overrides.isEmpty {
         return global ? known.sorted() : []
     }
-    func bare(_ key: String) -> String {
-        key.hasPrefix(marmotIDPrefix) ? String(key.dropFirst(marmotIDPrefix.count)) : key
-    }
-    let hasAliasKeys = overrides.keys.contains { !known.contains(bare($0)) }
-    // An override under either key form answers for both forms: the store's
-    // alias walk maps `marmot:<id>` to `<id>` and back. Only an override under
-    // some other alias needs `aliasOverride`.
-    func shares(chatId: String, otherForm: String) -> Bool {
+    func shares(bare id: String, chatId: String, otherForm: String) -> Bool {
         if let direct = overrides[chatId] ?? overrides[otherForm] { return direct }
-        if hasAliasKeys, let alias = aliasOverride(chatId) { return alias }
+        if let alias = aliasOverrideByGroup[id] { return alias }
         return global
     }
     let groupIdSet = Set(groupIds)
     return known.filter { id in
         let prefixed = marmotIDPrefix + id
-        if groupIdSet.contains(id), shares(chatId: prefixed, otherForm: id) {
+        if groupIdSet.contains(id), shares(bare: id, chatId: prefixed, otherForm: id) {
             return true
         }
-        return shares(chatId: id, otherForm: prefixed)
+        return shares(bare: id, chatId: id, otherForm: prefixed)
     }
     .sorted()
+}
+
+/// The override each direct group inherits from the rest of its conversation,
+/// built in one pass (R-055). Toggling a chat stores the override under every
+/// key of that chat: all its folded group ids and the peer's npub/hex. A group
+/// therefore only needs an alias when it joined the conversation after the
+/// toggle (a second 1:1 group with the same peer): it inherits from a sibling
+/// group of the same peer, else from the peer's own key. Group chats never
+/// inherit; they have no peer.
+///
+/// The store used to answer this per group by rebuilding the chat's key set,
+/// which re-scanned every group (`muteKeys` → `directMarmotGroups`): O(groups²),
+/// about a second on the main thread with 400 groups, on every foreground and
+/// every `$groups` publish. Here each group's peer key is computed once.
+///
+/// - `directPeerKey`: the canonical peer key of a 1:1 group, nil otherwise.
+/// - `peerKeyForms`: the encodings an override may be stored under for that
+///   peer (bech32 npub as listed in the group, its 64-hex form).
+func snTimezoneAliasOverridesByGroup(
+    groups: [MarmotService.MarmotGroup],
+    marmotIDPrefix: String,
+    overrides: [String: Bool],
+    directPeerKey: (MarmotService.MarmotGroup) -> String?,
+    peerKeyForms: (MarmotService.MarmotGroup) -> [String]
+) -> [String: Bool] {
+    guard !overrides.isEmpty else { return [:] }
+    var groupsByPeer: [String: [MarmotService.MarmotGroup]] = [:]
+    for group in groups {
+        guard let peer = directPeerKey(group) else { continue }
+        groupsByPeer[peer, default: []].append(group)
+    }
+    var result: [String: Bool] = [:]
+    for (peer, siblings) in groupsByPeer {
+        let ordered = siblings.sorted { $0.id < $1.id }
+        // One answer per peer: the first sibling group with its own entry,
+        // else the peer's own key. Toggles write one value to every key, so
+        // the order only matters for hand-edited or legacy maps.
+        var inherited: Bool?
+        for sibling in ordered {
+            if let value = overrides[marmotIDPrefix + sibling.id] ?? overrides[sibling.id] {
+                inherited = value
+                break
+            }
+        }
+        if inherited == nil, let first = ordered.first {
+            inherited = peerKeyForms(first).lazy.compactMap { overrides[$0] }.first
+                ?? overrides[peer]
+        }
+        guard let inherited else { continue }
+        for sibling in ordered {
+            result[sibling.id] = inherited
+        }
+    }
+    return result
 }
