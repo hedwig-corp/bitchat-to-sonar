@@ -432,6 +432,15 @@ final class MarmotService: @unchecked Sendable {
     /// media and drain their own lanes.
     private let publishQueue = DispatchQueue(label: "chat.bitchat.marmot-publish", qos: .utility)
 
+    /// Serial lane for relay-only lookups: kind-0 profiles, Sonar
+    /// descriptors, wallet offer backups. They touch no MLS state, but each can
+    /// wait up to the core's fetch timeout. On `workQueue` a foreground member
+    /// sweep (a profile and a descriptor per stale member) queued in front of
+    /// `syncForce`, so the gap fetch never ran in a short visit (R-056).
+    /// Serial so a large sweep is one relay request at a time, not a parked
+    /// thread per lookup starving `readQueue`.
+    private let lookupQueue = DispatchQueue(label: "chat.bitchat.marmot-lookup", qos: .utility)
+
     /// Membership approvals can include a bounded relay fetch plus commit and
     /// Welcome publication. Keep that network wait off `workQueue` so sync,
     /// reconnect, and unrelated group operations remain responsive. The Rust
@@ -803,8 +812,8 @@ final class MarmotService: @unchecked Sendable {
     }
 
     func fetchProfile(npub: String) async throws -> Profile? {
-        try await run {
-            try $0.requireNode().fetchProfile(npub: npub).map {
+        try await lookupLane {
+            try $0.fetchProfile(npub: npub).map {
                 Profile(name: $0.name, displayName: $0.displayName, about: $0.about, picture: $0.picture, nip05: $0.nip05)
             }
         }
@@ -865,9 +874,11 @@ final class MarmotService: @unchecked Sendable {
 
     /// Publish the public Sonar descriptor for this app build. Keep the route
     /// list honest: account-level internet call signaling currently uses Marmot.
+    /// Relay publish on the identity publish lane: it waits for relay OKs and
+    /// touches no MLS state, so it must not hold `workQueue` (R-056).
     func publishSonarDescriptor(callsEnabled: Bool = true, bolt12Offer: String? = nil) async throws {
-        try await run {
-            try $0.requireNode().publishSonarDescriptor(
+        try await publishLane {
+            try $0.publishSonarDescriptor(
                 callsEnabled: callsEnabled,
                 signaling: ["marmot"],
                 bolt12Offer: bolt12Offer
@@ -875,21 +886,21 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    /// Fetch a peer's public Sonar descriptor. nil means not confirmed Sonar,
-    /// not necessarily White Noise-only.
     /// Back up the wallet's offer pointer to our relays, sealed to our own key.
     func publishWalletOfferBackup(_ backup: String) async throws {
-        try await run { try $0.requireNode().publishWalletOfferBackup(backup: backup) }
+        try await publishLane { try $0.publishWalletOfferBackup(backup: backup) }
     }
 
     /// Every wallet offer backup we published; throws when no relay answered.
     func fetchWalletOfferBackups() async throws -> [String] {
-        try await run { try $0.requireNode().fetchWalletOfferBackups() }
+        try await lookupLane { try $0.fetchWalletOfferBackups() }
     }
 
+    /// Fetch a peer's public Sonar descriptor. nil means not confirmed Sonar,
+    /// not necessarily White Noise-only.
     func fetchSonarDescriptor(npub: String) async throws -> SonarDescriptor? {
-        try await run {
-            try $0.requireNode().fetchSonarDescriptor(npub: npub).map {
+        try await lookupLane {
+            try $0.fetchSonarDescriptor(npub: npub).map {
                 SonarDescriptor(
                     schema: $0.schema,
                     calls: $0.calls,
@@ -2405,10 +2416,37 @@ final class MarmotService: @unchecked Sendable {
         return node
     }
 
+    /// Work-queue ops slower than this, waiting or running, are logged with the
+    /// calling function's name. The queue is serial, so one slow op delays
+    /// every op behind it; this is how a foreground's `syncForce` is seen
+    /// waiting behind relay lookups.
+    private static let workQueueSlowThreshold: CFAbsoluteTime = 1.0
+
+    private static func logSlowWorkQueueOp(
+        _ label: String,
+        enqueued: CFAbsoluteTime,
+        started: CFAbsoluteTime
+    ) {
+        let ended = CFAbsoluteTimeGetCurrent()
+        let waited = started - enqueued
+        let ran = ended - started
+        guard waited > workQueueSlowThreshold || ran > workQueueSlowThreshold else { return }
+        SecureLogger.info(
+            "marmot workQueue op=\(label) waited_ms=\(Int((waited * 1000).rounded())) ran_ms=\(Int((ran * 1000).rounded()))",
+            category: .session
+        )
+    }
+
     /// Hop onto the work queue, run the blocking body, map Rust errors.
-    private func run<T: Sendable>(_ body: @escaping @Sendable (MarmotService) throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
+    private func run<T: Sendable>(
+        _ label: String = #function,
+        _ body: @escaping @Sendable (MarmotService) throws -> T
+    ) async throws -> T {
+        let enqueued = CFAbsoluteTimeGetCurrent()
+        return try await withCheckedThrowingContinuation { continuation in
             workQueue.async { [self] in
+                let started = CFAbsoluteTimeGetCurrent()
+                defer { Self.logSlowWorkQueueOp(label, enqueued: enqueued, started: started) }
                 do {
                     continuation.resume(returning: try body(self))
                 } catch let error as SonarFfiError {
@@ -2425,9 +2463,15 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    private func runNonThrowing<T: Sendable>(_ body: @escaping @Sendable (MarmotService) -> T) async -> T {
-        await withCheckedContinuation { continuation in
+    private func runNonThrowing<T: Sendable>(
+        _ label: String = #function,
+        _ body: @escaping @Sendable (MarmotService) -> T
+    ) async -> T {
+        let enqueued = CFAbsoluteTimeGetCurrent()
+        return await withCheckedContinuation { continuation in
             workQueue.async { [self] in
+                let started = CFAbsoluteTimeGetCurrent()
+                defer { Self.logSlowWorkQueueOp(label, enqueued: enqueued, started: started) }
                 continuation.resume(returning: body(self))
             }
         }
@@ -2565,6 +2609,20 @@ final class MarmotService: @unchecked Sendable {
     private func publishLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: publishQueue, body)
     }
+
+    /// Relay-only lookups. Off `workQueue` so they never sit in front of
+    /// `syncForce` (see `lookupQueue`).
+    private func lookupLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        try await leasedNodeOperation(on: lookupQueue, body)
+    }
+
+    #if DEBUG
+    /// Test seam: park `workQueue` for `seconds`, as a slow sync does, so a
+    /// test can prove an operation does not wait behind it (R-056).
+    func occupyWorkQueueForTesting(seconds: TimeInterval) {
+        workQueue.async { Thread.sleep(forTimeInterval: seconds) }
+    }
+    #endif
 
     /// MLS membership changes on their own lane. The Rust core serializes these
     /// against sends and competing membership commits.
