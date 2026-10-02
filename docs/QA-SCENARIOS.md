@@ -410,6 +410,24 @@ nothing by design.
   in group-id order and rebuilt on every foreground, so short visits never
   reached the chat. R-054.
 
+### QA-159 — Coming back to the app runs the gap sync, and chat opens don't wait behind it
+- **Platforms:** iOS (manual, log markers). The push-token part is core and
+  covers Compose too.
+- **Steps:** on an account with hundreds of chats, background the app for a
+  few minutes, bring it back, and open a chat within 10 seconds. Pull
+  `sonar-ios.log` and `sonar-core.log`.
+- **Expect:** `foreground refresh: gap recovery requested at …` within a few
+  seconds of activation, and `gap recovery finished at …` within a few
+  seconds after it. No `marmot workQueue op=syncOnce() waited_ms=…` (or
+  `markConversationRead`, `preferCatchupGroup`) above a couple of seconds. The
+  core log shows `push token shared with group members sent=N` with N ≤ 16,
+  and 0 on later passes.
+- **How:** manual on a device; `push_token_share_dms_each_member_once_across_passes`
+  and `MarmotLookupLaneTests` guard the two causes.
+- **Origin:** 2026-10-02, the syncForce follow-up to R-054: `syncForce` never
+  ran (behind relay lookups), then ran 35 s (behind ~400 push-token DMs).
+  R-056.
+
 ### QA-154 — The UI stays responsive while relays sync
 - **Platforms:** iOS (manual, measured by the stall probe). Compose has no
   sink of this shape; if a report comes in there, look at `visibleChats` jank.
