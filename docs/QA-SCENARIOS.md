@@ -31,8 +31,16 @@ is the build under test on a dedicated QA emulator/simulator.
   type → Send.
 - **Expect:** bubble reaches "Sent · internet"; the peer receives it within
   60 s; **the keyboard stays up** after the first send.
-- **How:** `android-smoke.sh` QA-001 · Guard: `ChatTranscriptBodyComposerFocusUiTest`
-- **Origin:** A10 (#616)
+- **How:** `android-smoke.sh` QA-001 · Guard: `ChatTranscriptBodyComposerFocusUiTest`,
+  `SNComposerFirstSendFocusTests.theFirstSendWithTheKeyboardUpRefocusesTheRebuiltComposer` (iOS).
+  iOS by hand or `ios-drive.sh`: run type and send in ONE driver session and
+  check the `Keyboard` element in the tree after the send. A new driver
+  session attaching drops the keyboard by itself, which looks like this bug.
+- **Origin:** A10 (#616). iOS failed it too (found 2026-09-29, core-owned
+  chat list QA; main had the same behaviour): the first message moves the
+  composer from the empty state into the transcript host, SwiftUI rebuilds it
+  there and its focus was lost. The screen now re-focuses the rebuilt
+  composer once, only when the field had focus at the send.
 
 ### QA-002 — Reply arrives in the open chat
 - **Platforms:** both (Android automated)
@@ -371,6 +379,25 @@ nothing by design.
 - **Expect:** a notification within ~10 s; the body respects the preview
   setting (off by default: "Open Sonar to read it."); the tap opens that chat
   with the divider per QA-005.
+- **Harness notes (2026-09-29, core-owned chat list QA):**
+  - Android freezes the app about 3 s after HOME and cuts its network, so only
+    a Transponder wake can deliver. The peer must hold the app's push token
+    (`<peer home>/marmot/marmot.sqlite.sonar-push-tokens.json` lists it) and
+    publish its kind-446 wake where the Transponder reads: its kind-10050
+    inbox relays (`nak req -k 10050 -a <transponder npub> wss://purplepag.es`;
+    nos.lol, nostr.relay.hedwig.sh, relay.damus.io that day).
+  - A shared QA Mac can be banned by relay.damus.io ("too many rate-limit
+    violations") and PoW-gated by nos.lol. The default `sonar-cli` relays then
+    land the wake only on relay.primal.net, which the Transponder does not
+    read. Run with `RUST_LOG=sonar_core=debug` and read the `OK` lines for the
+    wake's event id before blaming the app.
+  - Even with the wake on the Transponder's own relay, no FCM message reached
+    the emulator (no `SonarFCM` line), on this branch and on main alike.
+  - iOS simulator: `xcrun simctl push <udid> sh.hedwig.sonar <file>` with
+    `{"aps":{"alert":{…},"mutable-content":1},"source":"transponder"}` is
+    delivered and presented (SpringBoard log), but the notification service
+    extension does not run (no `sonar.nse.lastDiagnostic`), so decoration
+    needs a device.
 
 ### QA-021 — No banner for the chat you are reading
 - **Platforms:** iOS (manual, #615)
@@ -440,6 +467,126 @@ nothing by design.
 - **Platforms:** both (manual)
 - **Expect:** no row whose only effect is a "coming soon" toast.
 - **Origin:** A17 (#616)
+
+### QA-143 — A mesh-folded chat shows the unread dot of its White Noise messages
+- **Platforms:** both (manual: needs a Sonar peer met over Bluetooth, i.e. a
+  second emulator or phone with Bluetooth on; iOS already passes)
+- **Steps:** meet a Sonar peer over Bluetooth and exchange a message; take the
+  peer out of range (or turn its Bluetooth off) so the next message travels
+  over White Noise; with the app on the chat list, the peer sends a message.
+- **Expect:** the peer's one Home row shows the new preview **and** the unread
+  dot (announced "Unread"); opening it clears the dot; no second row for the
+  same person appears (R-003).
+- **Guard:** `ChatListAppStateTest.aMeshFoldedPersonsWhiteNoiseUnreadBadgesTheirBluetoothRow`,
+  `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs` (R-052)
+- **Origin:** chat-list presenter pilot. Compose mesh rows never passed
+  `unread` or `verified`, so Android and desktop showed no dot where iOS did.
+
+### QA-144 — Both apps fold a person's duplicate 1:1 groups the same way
+- **Platforms:** both. The fold is computed once in core
+  (`conversation_list`); iOS and Compose render its rows.
+- **How:** automated. Core drives two real 1:1 groups from the same peer
+  through the welcome and receive path and asserts one row, the summed
+  badge, and that marking the row's set clears it. The host tests pin that
+  each app renders core's row group and marks core's whole set read. On
+  devices, every Home row now comes from this path, so the Messaging smoke
+  (QA-001…008) exercises it; `sonar-cli` cannot create a second 1:1 group, so
+  the duplicate case itself is not driven on a device.
+- **Steps (manual, when two devices are available):** start a chat with the
+  same person from both sides at the same time, so two 1:1 groups exist; the
+  peer sends a message in each group.
+- **Expect:** one Home row for that person on both apps, badged; opening it
+  clears the badge for good (it does not come back on the next refresh); the
+  transcript holds both groups' messages (R-003).
+- **Guard:** `client.rs::conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row`,
+  `ChatListAppStateTest.theCoreFoldDecidesWhichGroupRendersAndWhatOpeningMarksRead`,
+  `ChatListAppStateTest.aFailedCoreListReadKeepsTheLastFold`,
+  `SonarCoreConversationFoldTests.coreSetResolvesInRowOrderAndSkipsGroupsThatAreGone`
+- **Origin:** core-owned chat list (follow-up to the #645 presenter pilot).
+  The two apps each folded duplicate groups themselves, with two copies of
+  the rule that had already drifted once (R-052).
+
+### QA-155 — Both apps title and word a chat row the same way
+- **Platforms:** both. Titles and previews come from core (`conversation_list`
+  rows: `title`, `preview`); the apps only word the preview.
+- **Steps:** a peer with a kind-0 name starts a 1:1 and sends a photo, then a
+  text; another peer with no profile sends a text; the app is backgrounded
+  and relaunched (cold start).
+- **Expect:** the named peer's row is titled with that name and reads "Photo",
+  then the text, on both apps; the unnamed peer's row shows the short npub;
+  after the cold start the rows paint before the store opens with the same
+  titles, times and badges, and no message text appears in the startup
+  snapshot (iOS `marmot.chatSnapshot.v1`, Compose `chats.snapshot.v1`).
+- **How:** automated in core and at the app call sites. On devices the
+  Messaging smoke (QA-001…005) exercises it.
+- **Guard:** `client.rs::conversation_list_titles_and_previews_rows_in_core`,
+  `conversation_list.rs::previews_are_semantic_for_new_and_legacy_rows`,
+  `ChatListAppStateTest.aOneToOneRowIsTitledByCore`,
+  `CoreHomeRowsTest.theSnapshotKeepsRowsButNeverMessageText`,
+  `SonarCoreConversationFoldTests.theStartupSnapshotKeepsRowsButNeverMessageText`
+- **Origin:** core screen models for Home. The apps titled 1:1s and worded
+  previews separately and had drifted: Compose said "Image" where iOS said
+  "Photo", and showed a photo's media label over its caption where iOS showed
+  the caption.
+
+### QA-156 — A reply quoting the other leg of a folded chat shows its quote
+- **Platforms:** both. Quote chips come from core (`ReplyRefInfo.chip`,
+  `parent_mine`), resolved across the conversation's folded groups.
+- **Steps:** a peer and you end up with two 1:1 groups that fold into one chat. The peer sends a text in the older
+  group and a photo in the newer one. You reply to the text, then to the
+  photo, then to one of your own messages, and scroll so the parents are off
+  screen. Then quote a nudge.
+- **Expect:** every chip shows its parent: the text, "Photo", and your own
+  text with the author "You". The peer's quotes name the peer, never a blank
+  author. The nudge quote reads "Message", never the raw `⚡TRILL|…` line.
+  Both apps word each chip identically.
+- **How:** automated in core and at the app call sites. On devices it needs
+  two folded groups. `sonar-cli` has no command that opens a second 1:1, so
+  have the app and the peer each start a chat with the other before either
+  welcome lands. That leaves two direct groups, which fold.
+- **Guard:** `client.rs::a_reply_quoting_the_twin_group_gets_its_chip_from_core`,
+  `reply.rs::the_chip_prefers_a_typed_parent_then_the_snapshot_then_the_parent_text`,
+  `MarmotReplyChipTests.aChipFromCoreRendersWithoutTheParentInThisGroup`,
+  `SonarReplyTest.aCoreChipIsWordedWithTheLocalizedTypedLabels`
+- **Origin:** core transcript rows. iOS only looked for a quote's parent in
+  the reply's own group, so after a fold the chip lost its author and fell
+  back to "Message". Compose scanned the whole transcript for every row.
+  Neither app knew a nudge, so a quoted nudge showed its wire line.
+
+### QA-157 — Scrolling up from an unread open reaches the first message
+- **Platforms:** both. On each, the bug had its own cause.
+- **Steps:** a fresh peer sends more than one page of numbered texts (iOS 35,
+  Android 40 to 70) while the app is on Messages. Open the chat, which opens
+  at the unread divider, then scroll to the top.
+- **Expect:** the chat opens at the divider. Older pages load until message
+  01 is on screen, in order, with no gap.
+- **How:** Android is scripted as `qa157` in `scripts/qa/android-smoke.sh`.
+  On iOS, drive it with `scripts/qa/ios-drive.sh`
+  (`tapc:<last text>;swipedown×5;tree:top`) and read the labels in the tree.
+- **Guard:** `ConversationTranscriptWindowTests.aPageRestoringRowsAConcurrentReloadTrimmedStillCountsAsGrowth`
+  pins the iOS growth measurement, and `client.rs::open_conversation_anchors_at_the_oldest_unread_across_folded_groups`
+  pins the read-only anchor. The Compose fixes are in `ChatScreen` effects
+  with no unit seam; `qa157` is their guard.
+- **Origin:** device QA of the core screen models (#652).
+  - **iOS (regression from #652):** opening through core `open_conversation`
+    ran its mark read after the anchor scan. The mark and the reload it
+    triggers landed after the host had placed the divider, so the chat opened
+    at the tail. The reload also trimmed the group's window from 35 rows to
+    30 while the first older page was in flight, and `loadOlderDM` measured
+    that page's growth as a set difference against the untrimmed window,
+    which read 0. The view never grew its source limit, so scrolling stopped
+    at message 05.
+    - Fix: mark read at once, as before. Ask core only for the anchor
+      (`conversation_unread_anchor`). Count what the page added at merge
+      time.
+  - **Android (on main before this work):** the initial-scroll effect left
+    `didInitialScroll` unset until the divider resolved, and was not keyed on
+    the anchor, so the top-edge pager it gates never fired. With that keyed,
+    the pager's first call landed while the windows were still settling and
+    returned false. The trigger only fires on arriving at the top, so it never
+    retried.
+    - Fix: key the effect on `unreadAnchorId`. Retry a failed top-edge load
+      a few times while the reader is still at the top.
 
 ## Note to Self (#339)
 

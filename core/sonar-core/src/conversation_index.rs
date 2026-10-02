@@ -26,6 +26,12 @@ pub struct ConversationSummary {
     /// mutation (new message, read-state change, rename). Hosts use it as a
     /// cheap cache key to skip rebuilding render state for unchanged chats.
     pub version: u64,
+    /// What the latest message is (see [`preview_kind_for`]): `text`,
+    /// `photo:N`, `video:N`, `voice`, `file`, `sticker`, `json`, or empty for
+    /// rows written before the column existed. Read with `latest_content` by
+    /// `conversation_list::preview_for`, so hosts get a semantic preview to
+    /// localize instead of an English label.
+    pub latest_kind: String,
 }
 
 pub trait ConversationChangeListener: Send + Sync {
@@ -247,6 +253,26 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index add version column: {e}")))?;
         }
 
+        if !Self::has_column(db, "conversation_summary", "latest_kind")? {
+            db.execute_batch(
+                "ALTER TABLE conversation_summary
+                    ADD COLUMN latest_kind TEXT NOT NULL DEFAULT '';",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index add latest_kind column: {e}")))?;
+        }
+
+        // Display names of the people we chat with (kind-0 best name), so the
+        // Messages list is titled in core. Written by `fetch_profile`, read by
+        // `conversation_list`; hosts render, they no longer resolve titles.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS peer_name (
+                pubkey_hex      TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                updated_at_secs INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .map_err(|e| crate::Error::Storage(format!("index create peer_name: {e}")))?;
+
         // The zone this device last shared into each MLS group and the epoch
         // it was encrypted at. Without it every process start (and every iOS
         // store reopen) re-encrypted a kind-449 into every allowed group.
@@ -310,13 +336,39 @@ impl ConversationIndex {
         mine: bool,
         counts_unread: bool,
     ) -> Result<()> {
+        self.upsert_summary_with_kind(
+            group_id_hex,
+            name,
+            content,
+            "",
+            sender,
+            at_secs,
+            mine,
+            counts_unread,
+        )
+    }
+
+    /// [`Self::upsert_summary`] with the latest message's preview kind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_summary_with_kind(
+        &self,
+        group_id_hex: &str,
+        name: &str,
+        content: &str,
+        kind: &str,
+        sender: &str,
+        at_secs: u64,
+        mine: bool,
+        counts_unread: bool,
+    ) -> Result<()> {
         self.db
             .execute(
                 "INSERT INTO conversation_summary
-                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs, latest_mine, message_count, unread_count, version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 1)
+                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs, latest_mine, message_count, unread_count, version, latest_kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 1, ?8)
                  ON CONFLICT(group_id_hex) DO UPDATE SET
                     name = CASE WHEN ?2 != '' THEN ?2 ELSE name END,
+                    latest_kind = CASE WHEN ?5 >= latest_at_secs THEN ?8 ELSE latest_kind END,
                     latest_content = CASE WHEN ?5 >= latest_at_secs THEN ?3 ELSE latest_content END,
                     latest_sender = CASE WHEN ?5 >= latest_at_secs THEN ?4 ELSE latest_sender END,
                     latest_at_secs = CASE WHEN ?5 >= latest_at_secs THEN ?5 ELSE latest_at_secs END,
@@ -332,6 +384,7 @@ impl ConversationIndex {
                     at_secs as i64,
                     mine as i32,
                     if !mine && counts_unread { 1i32 } else { 0i32 },
+                    kind,
                 ],
             )
             .map_err(|e| crate::Error::Storage(format!("index upsert: {e}")))?;
@@ -386,12 +439,56 @@ impl ConversationIndex {
         Ok(())
     }
 
+    /// Remember `name` as the display name of `pubkey_hex`. Returns whether it
+    /// changed, so callers notify only the chats whose title moved. Blank
+    /// names are ignored: a profile without a name must not erase a known one.
+    pub fn set_peer_name(&self, pubkey_hex: &str, name: &str, now_secs: u64) -> Result<bool> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(false);
+        }
+        let changed = self
+            .db
+            .execute(
+                "INSERT INTO peer_name (pubkey_hex, name, updated_at_secs) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(pubkey_hex) DO UPDATE SET name = ?2, updated_at_secs = ?3
+                 WHERE peer_name.name != ?2",
+                params![pubkey_hex, name, now_secs as i64],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index set peer name: {e}")))?;
+        Ok(changed > 0)
+    }
+
+    /// Display names for `pubkeys_hex` that are known. One query.
+    pub fn peer_names(&self, pubkeys_hex: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::new();
+        if pubkeys_hex.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self
+            .db
+            .prepare("SELECT pubkey_hex, name FROM peer_name")
+            .map_err(|e| crate::Error::Storage(format!("index peer names prepare: {e}")))?;
+        let wanted: std::collections::HashSet<&str> = pubkeys_hex.iter().copied().collect();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| crate::Error::Storage(format!("index peer names query: {e}")))?;
+        for row in rows {
+            let (key, name) =
+                row.map_err(|e| crate::Error::Storage(format!("index peer names row: {e}")))?;
+            if wanted.contains(key.as_str()) {
+                out.insert(key, name);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn summaries_ordered(&self) -> Result<Vec<ConversationSummary>> {
         let mut stmt = self
             .db
             .prepare(
                 "SELECT group_id_hex, name, latest_content, latest_sender,
-                        latest_at_secs, latest_mine, message_count, unread_count, version
+                        latest_at_secs, latest_mine, message_count, unread_count, version, latest_kind
                  FROM conversation_summary
                  ORDER BY latest_at_secs DESC",
             )
@@ -409,6 +506,7 @@ impl ConversationIndex {
                     message_count: row.get::<_, i64>(6)? as u64,
                     unread_count: row.get::<_, i64>(7)? as u64,
                     version: row.get::<_, i64>(8)? as u64,
+                    latest_kind: row.get(9)?,
                 })
             })
             .map_err(|e| crate::Error::Storage(format!("index summaries query: {e}")))?;
@@ -421,7 +519,7 @@ impl ConversationIndex {
         self.db
             .query_row(
                 "SELECT group_id_hex, name, latest_content, latest_sender,
-                        latest_at_secs, latest_mine, message_count, unread_count, version
+                        latest_at_secs, latest_mine, message_count, unread_count, version, latest_kind
                  FROM conversation_summary
                  WHERE group_id_hex = ?1",
                 params![group_id_hex],
@@ -436,6 +534,7 @@ impl ConversationIndex {
                         message_count: row.get::<_, i64>(6)? as u64,
                         unread_count: row.get::<_, i64>(7)? as u64,
                         version: row.get::<_, i64>(8)? as u64,
+                        latest_kind: row.get(9)?,
                     })
                 },
             )

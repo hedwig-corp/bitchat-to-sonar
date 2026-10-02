@@ -2012,7 +2012,21 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func collectNotificationsAfterWake(maxWaitMs: UInt64) throws  -> [DrainNotificationInfo]
 
+    /**
+     * The Marmot half of the Messages list, folded and ordered by core:
+     * Note to Self first, then newest first. `after` continues from the
+     * previous page's last row; `limit` 0 returns every row. Local only.
+     */
+    func conversationList(limit: UInt32, after: ConversationListCursorInfo?) throws  -> [ConversationListRowInfo]
+
     func conversationSummaries()  -> [ConversationSummaryInfo]
+
+    /**
+     * The unread divider's row for `unread_count` across `group_id_hexes`,
+     * without marking anything read. iOS captures the count at push and marks
+     * read itself; this is core's anchor for that count (hex), or nil.
+     */
+    func conversationUnreadAnchor(groupIdHexes: [String], unreadCount: UInt64) throws  -> String?
 
     func createInviteLink(groupIdHex: String, groupName: String) throws  -> String
 
@@ -2170,6 +2184,15 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
 
     /**
+     * Open the conversation containing `group_id_hex`: capture the unread
+     * count and anchor (oldest unread across every folded group, own sends
+     * and hidden control lines skipped), then mark the whole set read, in one
+     * step. Hosts call this instead of reading unread and marking read
+     * themselves, so the two can never race. Local only.
+     */
+    func openConversation(groupIdHex: String) throws  -> ConversationOpenInfo
+
+    /**
      * Local-only batch read of the zones members shared into these MLS
      * groups (hex). Look a zone up by the chat's own group: a person can
      * share in one chat and not another.
@@ -2262,6 +2285,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * `server_npub`: the transponder's npub (bech32 or hex).
      */
     func registerPushToken(platform: String, token: Data, serverNpub: String) throws
+
+    /**
+     * Remember display names for titling the Messages list (hosts seed it
+     * from their profile caches once; `fetch_profile` keeps it current).
+     * Returns how many changed; their conversations are notified.
+     */
+    func rememberPeerNames(names: [PeerNameInfo])  -> UInt32
 
     /**
      * Remove members from an existing group.
@@ -2370,17 +2400,20 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     /**
      * Encrypt + publish a sticker message to the group.
      */
-    func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws
+    func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws  -> String
 
     /**
      * Encrypt + publish a text message to the group.
+     * Send `text`; returns the stored message's id (hex). The row is written
+     * locally before this returns: hosts key their "Sending" bubble by this
+     * id and match the transcript row exactly (R-001, R-002).
      */
-    func sendText(groupIdHex: String, text: String) throws
+    func sendText(groupIdHex: String, text: String) throws  -> String
 
     /**
      * Like `send_text`, attaching a NIP-C7 reply pointer.
      */
-    func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?) throws
+    func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?) throws  -> String
 
     func setConversationChangeListener(listener: ConversationChangeListener)
 
@@ -2811,10 +2844,40 @@ open func collectNotificationsAfterWake(maxWaitMs: UInt64)throws  -> [DrainNotif
 })
 }
 
+    /**
+     * The Marmot half of the Messages list, folded and ordered by core:
+     * Note to Self first, then newest first. `after` continues from the
+     * previous page's last row; `limit` 0 returns every row. Local only.
+     */
+open func conversationList(limit: UInt32, after: ConversationListCursorInfo?)throws  -> [ConversationListRowInfo]  {
+    return try  FfiConverterSequenceTypeConversationListRowInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_conversation_list(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterOptionTypeConversationListCursorInfo.lower(after),$0
+    )
+})
+}
+
 open func conversationSummaries() -> [ConversationSummaryInfo]  {
     return try!  FfiConverterSequenceTypeConversationSummaryInfo.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_conversation_summaries(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * The unread divider's row for `unread_count` across `group_id_hexes`,
+     * without marking anything read. iOS captures the count at push and marks
+     * read itself; this is core's anchor for that count (hex), or nil.
+     */
+open func conversationUnreadAnchor(groupIdHexes: [String], unreadCount: UInt64)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_conversation_unread_anchor(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(groupIdHexes),
+        FfiConverterUInt64.lower(unreadCount),$0
     )
 })
 }
@@ -3164,6 +3227,22 @@ open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws 
 }
 
     /**
+     * Open the conversation containing `group_id_hex`: capture the unread
+     * count and anchor (oldest unread across every folded group, own sends
+     * and hidden control lines skipped), then mark the whole set read, in one
+     * step. Hosts call this instead of reading unread and marking read
+     * themselves, so the two can never race. Local only.
+     */
+open func openConversation(groupIdHex: String)throws  -> ConversationOpenInfo  {
+    return try  FfiConverterTypeConversationOpenInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_open_conversation(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+})
+}
+
+    /**
      * Local-only batch read of the zones members shared into these MLS
      * groups (hex). Look a zone up by the chat's own group: a person can
      * share in one chat and not another.
@@ -3351,6 +3430,20 @@ open func registerPushToken(platform: String, token: Data, serverNpub: String)th
         FfiConverterString.lower(serverNpub),$0
     )
 }
+}
+
+    /**
+     * Remember display names for titling the Messages list (hosts seed it
+     * from their profile caches once; `fetch_profile` keeps it current).
+     * Returns how many changed; their conversations are notified.
+     */
+open func rememberPeerNames(names: [PeerNameInfo]) -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_remember_peer_names(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypePeerNameInfo.lower(names),$0
+    )
+})
 }
 
     /**
@@ -3597,7 +3690,8 @@ open func sendReaction(groupIdHex: String, targetIdHex: String, targetNpub: Stri
     /**
      * Encrypt + publish a sticker message to the group.
      */
-open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_send_sticker(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
@@ -3605,25 +3699,30 @@ open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: Str
         FfiConverterString.lower(shortcode),
         FfiConverterString.lower(plaintextSha256),$0
     )
-}
+})
 }
 
     /**
      * Encrypt + publish a text message to the group.
+     * Send `text`; returns the stored message's id (hex). The row is written
+     * locally before this returns: hosts key their "Sending" bubble by this
+     * id and match the transcript row exactly (R-001, R-002).
      */
-open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func sendText(groupIdHex: String, text: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_send_text(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
         FfiConverterString.lower(text),$0
     )
-}
+})
 }
 
     /**
      * Like `send_text`, attaching a NIP-C7 reply pointer.
      */
-open func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_send_text_reply(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
@@ -3632,7 +3731,7 @@ open func sendTextReply(groupIdHex: String, text: String, replyToHex: String, re
         FfiConverterString.lower(replyToNpub),
         FfiConverterOptionString.lower(preview),$0
     )
-}
+})
 }
 
 open func setConversationChangeListener(listener: ConversationChangeListener)  {try! rustCall() {
@@ -4605,6 +4704,335 @@ public func FfiConverterTypeCallEventInfo_lift(_ buf: RustBuffer) throws -> Call
 #endif
 public func FfiConverterTypeCallEventInfo_lower(_ value: CallEventInfo) -> RustBuffer {
     return FfiConverterTypeCallEventInfo.lower(value)
+}
+
+
+/**
+ * Where the next page starts: the last row of the previous page.
+ */
+public struct ConversationListCursorInfo: Equatable, Hashable {
+    public var latestAtSecs: UInt64
+    public var conversationId: String
+    public var pinned: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(latestAtSecs: UInt64, conversationId: String, pinned: Bool) {
+        self.latestAtSecs = latestAtSecs
+        self.conversationId = conversationId
+        self.pinned = pinned
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConversationListCursorInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConversationListCursorInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationListCursorInfo {
+        return
+            try ConversationListCursorInfo(
+                latestAtSecs: FfiConverterUInt64.read(from: &buf),
+                conversationId: FfiConverterString.read(from: &buf),
+                pinned: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConversationListCursorInfo, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.latestAtSecs, into: &buf)
+        FfiConverterString.write(value.conversationId, into: &buf)
+        FfiConverterBool.write(value.pinned, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationListCursorInfo_lift(_ buf: RustBuffer) throws -> ConversationListCursorInfo {
+    return try FfiConverterTypeConversationListCursorInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationListCursorInfo_lower(_ value: ConversationListCursorInfo) -> RustBuffer {
+    return FfiConverterTypeConversationListCursorInfo.lower(value)
+}
+
+
+/**
+ * One Messages-list row computed by core: every group of one conversation
+ * folded together. Both apps render these instead of folding groups
+ * themselves. Hosts overlay what core does not own: kind-0 names, mute,
+ * verification, pending setup rows and the Bluetooth fold.
+ */
+public struct ConversationListRowInfo: Equatable, Hashable {
+    /**
+     * The group the row opens: the newest in the set, lowest id on a tie.
+     */
+    public var conversationId: String
+    public var kind: ConversationListKindInfo
+    /**
+     * Every folded group, `conversation_id` first. Unread is summed over
+     * it, and opening the row marks all of it read.
+     */
+    public var groupIds: [String]
+    /**
+     * The other member's pubkey hex for a 1:1.
+     */
+    public var counterpartHex: String?
+    /**
+     * MLS group name, empty for most 1:1s.
+     */
+    public var name: String
+    /**
+     * The title to show; `None` = the host's localized fallback
+     * ("Note to Self", "Group chat", or the counterpart's short npub).
+     */
+    public var title: String?
+    /**
+     * The newest message, ready to localize.
+     */
+    public var preview: ConversationPreviewInfo
+    public var latestContent: String
+    /**
+     * Pubkey hex of the newest message's sender.
+     */
+    public var latestSenderHex: String
+    public var latestAtSecs: UInt64
+    public var latestMine: Bool
+    /**
+     * The group holding the newest message.
+     */
+    public var latestGroupId: String
+    public var messageCount: UInt64
+    /**
+     * Sum over `group_ids`; always 0 for Note to Self.
+     */
+    public var unreadCount: UInt64
+    /**
+     * Equal versions mean an unchanged row (cache key).
+     */
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The group the row opens: the newest in the set, lowest id on a tie.
+         */conversationId: String, kind: ConversationListKindInfo,
+        /**
+         * Every folded group, `conversation_id` first. Unread is summed over
+         * it, and opening the row marks all of it read.
+         */groupIds: [String],
+        /**
+         * The other member's pubkey hex for a 1:1.
+         */counterpartHex: String?,
+        /**
+         * MLS group name, empty for most 1:1s.
+         */name: String,
+        /**
+         * The title to show; `None` = the host's localized fallback
+         * ("Note to Self", "Group chat", or the counterpart's short npub).
+         */title: String?,
+        /**
+         * The newest message, ready to localize.
+         */preview: ConversationPreviewInfo, latestContent: String,
+        /**
+         * Pubkey hex of the newest message's sender.
+         */latestSenderHex: String, latestAtSecs: UInt64, latestMine: Bool,
+        /**
+         * The group holding the newest message.
+         */latestGroupId: String, messageCount: UInt64,
+        /**
+         * Sum over `group_ids`; always 0 for Note to Self.
+         */unreadCount: UInt64,
+        /**
+         * Equal versions mean an unchanged row (cache key).
+         */version: UInt64) {
+        self.conversationId = conversationId
+        self.kind = kind
+        self.groupIds = groupIds
+        self.counterpartHex = counterpartHex
+        self.name = name
+        self.title = title
+        self.preview = preview
+        self.latestContent = latestContent
+        self.latestSenderHex = latestSenderHex
+        self.latestAtSecs = latestAtSecs
+        self.latestMine = latestMine
+        self.latestGroupId = latestGroupId
+        self.messageCount = messageCount
+        self.unreadCount = unreadCount
+        self.version = version
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConversationListRowInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConversationListRowInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationListRowInfo {
+        return
+            try ConversationListRowInfo(
+                conversationId: FfiConverterString.read(from: &buf),
+                kind: FfiConverterTypeConversationListKindInfo.read(from: &buf),
+                groupIds: FfiConverterSequenceString.read(from: &buf),
+                counterpartHex: FfiConverterOptionString.read(from: &buf),
+                name: FfiConverterString.read(from: &buf),
+                title: FfiConverterOptionString.read(from: &buf),
+                preview: FfiConverterTypeConversationPreviewInfo.read(from: &buf),
+                latestContent: FfiConverterString.read(from: &buf),
+                latestSenderHex: FfiConverterString.read(from: &buf),
+                latestAtSecs: FfiConverterUInt64.read(from: &buf),
+                latestMine: FfiConverterBool.read(from: &buf),
+                latestGroupId: FfiConverterString.read(from: &buf),
+                messageCount: FfiConverterUInt64.read(from: &buf),
+                unreadCount: FfiConverterUInt64.read(from: &buf),
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConversationListRowInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.conversationId, into: &buf)
+        FfiConverterTypeConversationListKindInfo.write(value.kind, into: &buf)
+        FfiConverterSequenceString.write(value.groupIds, into: &buf)
+        FfiConverterOptionString.write(value.counterpartHex, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.title, into: &buf)
+        FfiConverterTypeConversationPreviewInfo.write(value.preview, into: &buf)
+        FfiConverterString.write(value.latestContent, into: &buf)
+        FfiConverterString.write(value.latestSenderHex, into: &buf)
+        FfiConverterUInt64.write(value.latestAtSecs, into: &buf)
+        FfiConverterBool.write(value.latestMine, into: &buf)
+        FfiConverterString.write(value.latestGroupId, into: &buf)
+        FfiConverterUInt64.write(value.messageCount, into: &buf)
+        FfiConverterUInt64.write(value.unreadCount, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationListRowInfo_lift(_ buf: RustBuffer) throws -> ConversationListRowInfo {
+    return try FfiConverterTypeConversationListRowInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationListRowInfo_lower(_ value: ConversationListRowInfo) -> RustBuffer {
+    return FfiConverterTypeConversationListRowInfo.lower(value)
+}
+
+
+/**
+ * What the transcript needs when a conversation opens (see
+ * `SonarNode::open_conversation`).
+ */
+public struct ConversationOpenInfo: Equatable, Hashable {
+    /**
+     * Every folded group, row group first.
+     */
+    public var groupIds: [String]
+    /**
+     * Unread at the moment of opening, before it was marked read.
+     */
+    public var unreadCount: UInt64
+    /**
+     * The oldest unread message (hex); the divider goes above it.
+     */
+    public var unreadAnchorId: String?
+    /**
+     * Newest message second across the set: the transcript is not complete
+     * until it holds a row this new.
+     */
+    public var newestAtSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Every folded group, row group first.
+         */groupIds: [String],
+        /**
+         * Unread at the moment of opening, before it was marked read.
+         */unreadCount: UInt64,
+        /**
+         * The oldest unread message (hex); the divider goes above it.
+         */unreadAnchorId: String?,
+        /**
+         * Newest message second across the set: the transcript is not complete
+         * until it holds a row this new.
+         */newestAtSecs: UInt64) {
+        self.groupIds = groupIds
+        self.unreadCount = unreadCount
+        self.unreadAnchorId = unreadAnchorId
+        self.newestAtSecs = newestAtSecs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConversationOpenInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConversationOpenInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationOpenInfo {
+        return
+            try ConversationOpenInfo(
+                groupIds: FfiConverterSequenceString.read(from: &buf),
+                unreadCount: FfiConverterUInt64.read(from: &buf),
+                unreadAnchorId: FfiConverterOptionString.read(from: &buf),
+                newestAtSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConversationOpenInfo, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.groupIds, into: &buf)
+        FfiConverterUInt64.write(value.unreadCount, into: &buf)
+        FfiConverterOptionString.write(value.unreadAnchorId, into: &buf)
+        FfiConverterUInt64.write(value.newestAtSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationOpenInfo_lift(_ buf: RustBuffer) throws -> ConversationOpenInfo {
+    return try FfiConverterTypeConversationOpenInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationOpenInfo_lower(_ value: ConversationOpenInfo) -> RustBuffer {
+    return FfiConverterTypeConversationOpenInfo.lower(value)
 }
 
 
@@ -5739,9 +6167,9 @@ public struct MessageInfo: Equatable, Hashable {
      */
     public var mine: Bool
     /**
-     * Local delivery state: received, pending, sent, or failed.
+     * The delivery footer, decided in core; hosts only localize it.
      */
-    public var deliveryState: String
+    public var delivery: DeliveryLabelInfo
     /**
      * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
      */
@@ -5770,8 +6198,8 @@ public struct MessageInfo: Equatable, Hashable {
          * True when the local identity sent it.
          */mine: Bool,
         /**
-         * Local delivery state: received, pending, sent, or failed.
-         */deliveryState: String,
+         * The delivery footer, decided in core; hosts only localize it.
+         */delivery: DeliveryLabelInfo,
         /**
          * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
          */media: [MediaInfo],
@@ -5792,7 +6220,7 @@ public struct MessageInfo: Equatable, Hashable {
         self.content = content
         self.createdAtSecs = createdAtSecs
         self.mine = mine
-        self.deliveryState = deliveryState
+        self.delivery = delivery
         self.media = media
         self.stickerRef = stickerRef
         self.classification = classification
@@ -5821,7 +6249,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
                 content: FfiConverterString.read(from: &buf),
                 createdAtSecs: FfiConverterUInt64.read(from: &buf),
                 mine: FfiConverterBool.read(from: &buf),
-                deliveryState: FfiConverterString.read(from: &buf),
+                delivery: FfiConverterTypeDeliveryLabelInfo.read(from: &buf),
                 media: FfiConverterSequenceTypeMediaInfo.read(from: &buf),
                 stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf),
                 classification: FfiConverterTypeMessageClassInfo.read(from: &buf),
@@ -5836,7 +6264,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
         FfiConverterBool.write(value.mine, into: &buf)
-        FfiConverterString.write(value.deliveryState, into: &buf)
+        FfiConverterTypeDeliveryLabelInfo.write(value.delivery, into: &buf)
         FfiConverterSequenceTypeMediaInfo.write(value.media, into: &buf)
         FfiConverterOptionTypeStickerRefInfo.write(value.stickerRef, into: &buf)
         FfiConverterTypeMessageClassInfo.write(value.classification, into: &buf)
@@ -5972,6 +6400,63 @@ public func FfiConverterTypeNoiseKeypairHex_lift(_ buf: RustBuffer) throws -> No
 #endif
 public func FfiConverterTypeNoiseKeypairHex_lower(_ value: NoiseKeypairHex) -> RustBuffer {
     return FfiConverterTypeNoiseKeypairHex.lower(value)
+}
+
+
+/**
+ * A display name to remember for titling the Messages list.
+ */
+public struct PeerNameInfo: Equatable, Hashable {
+    public var pubkeyHex: String
+    public var name: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pubkeyHex: String, name: String) {
+        self.pubkeyHex = pubkeyHex
+        self.name = name
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PeerNameInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePeerNameInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PeerNameInfo {
+        return
+            try PeerNameInfo(
+                pubkeyHex: FfiConverterString.read(from: &buf),
+                name: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PeerNameInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.pubkeyHex, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePeerNameInfo_lift(_ buf: RustBuffer) throws -> PeerNameInfo {
+    return try FfiConverterTypePeerNameInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePeerNameInfo_lower(_ value: PeerNameInfo) -> RustBuffer {
+    return FfiConverterTypePeerNameInfo.lower(value)
 }
 
 
@@ -6256,14 +6741,38 @@ public func FfiConverterTypeRecentMessagePageInfo_lower(_ value: RecentMessagePa
 public struct ReplyRefInfo: Equatable, Hashable {
     public var parentIdHex: String
     public var parentNpub: String?
+    /**
+     * The sender's quote snapshot, as received. Render `chip` instead.
+     */
     public var preview: String?
+    /**
+     * The quoted message is ours ("You").
+     */
+    public var parentMine: Bool
+    /**
+     * What the quote chip shows, resolved in core across the conversation's
+     * folded groups. `Empty`: show the "Message" fallback.
+     */
+    public var chip: ConversationPreviewInfo
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(parentIdHex: String, parentNpub: String?, preview: String?) {
+    public init(parentIdHex: String, parentNpub: String?,
+        /**
+         * The sender's quote snapshot, as received. Render `chip` instead.
+         */preview: String?,
+        /**
+         * The quoted message is ours ("You").
+         */parentMine: Bool,
+        /**
+         * What the quote chip shows, resolved in core across the conversation's
+         * folded groups. `Empty`: show the "Message" fallback.
+         */chip: ConversationPreviewInfo) {
         self.parentIdHex = parentIdHex
         self.parentNpub = parentNpub
         self.preview = preview
+        self.parentMine = parentMine
+        self.chip = chip
     }
 
 
@@ -6284,7 +6793,9 @@ public struct FfiConverterTypeReplyRefInfo: FfiConverterRustBuffer {
             try ReplyRefInfo(
                 parentIdHex: FfiConverterString.read(from: &buf),
                 parentNpub: FfiConverterOptionString.read(from: &buf),
-                preview: FfiConverterOptionString.read(from: &buf)
+                preview: FfiConverterOptionString.read(from: &buf),
+                parentMine: FfiConverterBool.read(from: &buf),
+                chip: FfiConverterTypeConversationPreviewInfo.read(from: &buf)
         )
     }
 
@@ -6292,6 +6803,8 @@ public struct FfiConverterTypeReplyRefInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.parentIdHex, into: &buf)
         FfiConverterOptionString.write(value.parentNpub, into: &buf)
         FfiConverterOptionString.write(value.preview, into: &buf)
+        FfiConverterBool.write(value.parentMine, into: &buf)
+        FfiConverterTypeConversationPreviewInfo.write(value.chip, into: &buf)
     }
 }
 
@@ -7676,6 +8189,344 @@ public func FfiConverterTypeCashuWalletEvent_lower(_ value: CashuWalletEvent) ->
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What kind of conversation a Messages-list row is.
+ */
+
+public enum ConversationListKindInfo: Equatable, Hashable {
+
+    /**
+     * A 1:1. Duplicate groups with the same counterpart are one row.
+     */
+    case direct
+    /**
+     * Any other group.
+     */
+    case group
+    /**
+     * This account's Note to Self. Never unread; sorted first.
+     */
+    case noteToSelf
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConversationListKindInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConversationListKindInfo: FfiConverterRustBuffer {
+    typealias SwiftType = ConversationListKindInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationListKindInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .direct
+
+        case 2: return .group
+
+        case 3: return .noteToSelf
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ConversationListKindInfo, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .direct:
+            writeInt(&buf, Int32(1))
+
+
+        case .group:
+            writeInt(&buf, Int32(2))
+
+
+        case .noteToSelf:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationListKindInfo_lift(_ buf: RustBuffer) throws -> ConversationListKindInfo {
+    return try FfiConverterTypeConversationListKindInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationListKindInfo_lower(_ value: ConversationListKindInfo) -> RustBuffer {
+    return FfiConverterTypeConversationListKindInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a Messages-list row's newest message is. Hosts only localize it;
+ * classification happens once, in core, for both apps.
+ */
+
+public enum ConversationPreviewInfo: Equatable, Hashable {
+
+    case empty
+    case text(text: String
+    )
+    case photos(count: UInt32
+    )
+    case videos(count: UInt32
+    )
+    case voiceNote
+    /**
+     * `name` is empty when the sender gave none.
+     */
+    case file(name: String
+    )
+    case sticker
+    case voiceCall
+    case nudge
+    case payment
+    case jsonPayload
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConversationPreviewInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConversationPreviewInfo: FfiConverterRustBuffer {
+    typealias SwiftType = ConversationPreviewInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationPreviewInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .empty
+
+        case 2: return .text(text: try FfiConverterString.read(from: &buf)
+        )
+
+        case 3: return .photos(count: try FfiConverterUInt32.read(from: &buf)
+        )
+
+        case 4: return .videos(count: try FfiConverterUInt32.read(from: &buf)
+        )
+
+        case 5: return .voiceNote
+
+        case 6: return .file(name: try FfiConverterString.read(from: &buf)
+        )
+
+        case 7: return .sticker
+
+        case 8: return .voiceCall
+
+        case 9: return .nudge
+
+        case 10: return .payment
+
+        case 11: return .jsonPayload
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ConversationPreviewInfo, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .empty:
+            writeInt(&buf, Int32(1))
+
+
+        case let .text(text):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(text, into: &buf)
+
+
+        case let .photos(count):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt32.write(count, into: &buf)
+
+
+        case let .videos(count):
+            writeInt(&buf, Int32(4))
+            FfiConverterUInt32.write(count, into: &buf)
+
+
+        case .voiceNote:
+            writeInt(&buf, Int32(5))
+
+
+        case let .file(name):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(name, into: &buf)
+
+
+        case .sticker:
+            writeInt(&buf, Int32(7))
+
+
+        case .voiceCall:
+            writeInt(&buf, Int32(8))
+
+
+        case .nudge:
+            writeInt(&buf, Int32(9))
+
+
+        case .payment:
+            writeInt(&buf, Int32(10))
+
+
+        case .jsonPayload:
+            writeInt(&buf, Int32(11))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationPreviewInfo_lift(_ buf: RustBuffer) throws -> ConversationPreviewInfo {
+    return try FfiConverterTypeConversationPreviewInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationPreviewInfo_lower(_ value: ConversationPreviewInfo) -> RustBuffer {
+    return FfiConverterTypeConversationPreviewInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a transcript row's delivery footer says.
+ */
+
+public enum DeliveryLabelInfo: Equatable, Hashable {
+
+    /**
+     * Someone else's message: no footer.
+     */
+    case received
+    /**
+     * Own send waiting on a relay ack.
+     */
+    case sending
+    /**
+     * Own send with photos waiting on a relay ack.
+     */
+    case uploading
+    case sent
+    /**
+     * The outbox gave up; offer retry.
+     */
+    case failed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension DeliveryLabelInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeliveryLabelInfo: FfiConverterRustBuffer {
+    typealias SwiftType = DeliveryLabelInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeliveryLabelInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .received
+
+        case 2: return .sending
+
+        case 3: return .uploading
+
+        case 4: return .sent
+
+        case 5: return .failed
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DeliveryLabelInfo, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .received:
+            writeInt(&buf, Int32(1))
+
+
+        case .sending:
+            writeInt(&buf, Int32(2))
+
+
+        case .uploading:
+            writeInt(&buf, Int32(3))
+
+
+        case .sent:
+            writeInt(&buf, Int32(4))
+
+
+        case .failed:
+            writeInt(&buf, Int32(5))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeliveryLabelInfo_lift(_ buf: RustBuffer) throws -> DeliveryLabelInfo {
+    return try FfiConverterTypeDeliveryLabelInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeliveryLabelInfo_lower(_ value: DeliveryLabelInfo) -> RustBuffer {
+    return FfiConverterTypeDeliveryLabelInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum MeshEngineCommand: Equatable, Hashable {
 
@@ -7997,6 +8848,11 @@ public enum MessageClassInfo: Equatable, Hashable {
      * `☎CALL|…` signaling line — hidden from the transcript.
      */
     case callControl
+    /**
+     * `⚡TRILL|1|<id>` nudge — render the nudge pill, never the raw line.
+     */
+    case trill(trillId: String
+    )
 
 
 
@@ -8028,6 +8884,9 @@ public struct FfiConverterTypeMessageClassInfo: FfiConverterRustBuffer {
 
         case 4: return .callControl
 
+        case 5: return .trill(trillId: try FfiConverterString.read(from: &buf)
+        )
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8054,6 +8913,11 @@ public struct FfiConverterTypeMessageClassInfo: FfiConverterRustBuffer {
 
         case .callControl:
             writeInt(&buf, Int32(4))
+
+
+        case let .trill(trillId):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(trillId, into: &buf)
 
         }
     }
@@ -9336,6 +10200,30 @@ fileprivate struct FfiConverterOptionTypeCallEventInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeConversationListCursorInfo: FfiConverterRustBuffer {
+    typealias SwiftType = ConversationListCursorInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeConversationListCursorInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeConversationListCursorInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeMeshAnnounceInfo: FfiConverterRustBuffer {
     typealias SwiftType = MeshAnnounceInfo?
 
@@ -9796,6 +10684,31 @@ fileprivate struct FfiConverterSequenceTypeBackupPreviewConversationInfo: FfiCon
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeConversationListRowInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [ConversationListRowInfo]
+
+    public static func write(_ value: [ConversationListRowInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeConversationListRowInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConversationListRowInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ConversationListRowInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeConversationListRowInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeConversationSummaryInfo: FfiConverterRustBuffer {
     typealias SwiftType = [ConversationSummaryInfo]
 
@@ -10088,6 +11001,31 @@ fileprivate struct FfiConverterSequenceTypeMessageReactionTallies: FfiConverterR
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeMessageReactionTallies.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePeerNameInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [PeerNameInfo]
+
+    public static func write(_ value: [PeerNameInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePeerNameInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PeerNameInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PeerNameInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePeerNameInfo.read(from: &buf))
         }
         return seq
     }
@@ -11309,7 +12247,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_collect_notifications_after_wake() != 17254) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_list() != 31021) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_summaries() != 56244) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_unread_anchor() != 2152) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_create_invite_link() != 21411) {
@@ -11393,6 +12337,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_open_conversation() != 19295) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_peer_timezones() != 64590) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11433,6 +12380,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 63602) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_remember_peer_names() != 18924) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {
@@ -11486,13 +12436,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_reaction() != 5002) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 28650) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 49605) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23698) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text_reply() != 3890) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text_reply() != 61366) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 62940) {

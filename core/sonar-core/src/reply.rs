@@ -5,6 +5,7 @@
 //! classification, echo matching, and chat-list previews all see the display
 //! body — never the wire URI.
 
+use crate::conversation_list::ConversationPreview;
 use nostr::nips::nip19::Nip19Event;
 use nostr::nips::nip21::{FromNostrUri, ToNostrUri};
 use nostr::prelude::*;
@@ -42,6 +43,12 @@ pub struct ReplyRef {
     pub parent_id: EventId,
     pub parent_pubkey: Option<PublicKey>,
     pub preview: Option<String>,
+    /// The quoted message is ours. Set when the page is read, from
+    /// `parent_pubkey`, so it holds even when the parent is not stored here.
+    pub parent_mine: bool,
+    /// What the quote chip shows, decided in core ([`reply_chip`]). `Empty`
+    /// means nothing usable is known: hosts show their "Message" fallback.
+    pub chip: ConversationPreview,
 }
 
 /// NIP-C7 / NIP-18 `q` tag: `["q", <id>, "", <pubkey>]`.
@@ -98,6 +105,8 @@ where
                 parent_id: *event_id,
                 parent_pubkey: *public_key,
                 preview: None,
+                parent_mine: false,
+                chip: ConversationPreview::Empty,
             });
         }
         let slice = tag.as_slice();
@@ -113,6 +122,8 @@ where
             parent_id,
             parent_pubkey,
             preview: None,
+            parent_mine: false,
+            chip: ConversationPreview::Empty,
         });
     }
     None
@@ -164,6 +175,79 @@ pub fn parent_content_for_preview<'a>(
         return None;
     }
     Some(t)
+}
+
+/// How a stored message reads inside a quote chip. Typed messages get their
+/// type (a photo is "Photo" even with a caption, as on both apps before this
+/// moved to core); text is truncated to the chip length.
+pub fn reply_preview_of(m: &crate::marmot::ChatMessage) -> ConversationPreview {
+    use crate::marmot::MessageClassification as C;
+    match &m.classification {
+        C::PayReceipt { .. } | C::PayDone { .. } => return ConversationPreview::Payment,
+        C::CallControl => return ConversationPreview::VoiceCall,
+        C::Trill { .. } => return ConversationPreview::Nudge,
+        C::Text => {}
+    }
+    if m.sticker_ref.is_some() {
+        return ConversationPreview::Sticker;
+    }
+    if let Some(first) = m.media.first() {
+        let all = |prefix: &str| m.media.iter().all(|x| x.mime_type.starts_with(prefix));
+        let n = u32::try_from(m.media.len()).unwrap_or(u32::MAX);
+        return if all("image/") {
+            ConversationPreview::Photos(n)
+        } else if all("video/") {
+            ConversationPreview::Videos(n)
+        } else if first.mime_type.starts_with("audio/") {
+            ConversationPreview::VoiceNote
+        } else if first.mime_type.starts_with("image/") {
+            ConversationPreview::Photos(1)
+        } else if first.mime_type.starts_with("video/") {
+            ConversationPreview::Videos(1)
+        } else {
+            ConversationPreview::File(first.filename.clone())
+        };
+    }
+    let text = m.content.trim();
+    if text.is_empty() {
+        return ConversationPreview::Empty;
+    }
+    if crate::client::looks_like_json_payload(text) {
+        return ConversationPreview::JsonPayload;
+    }
+    ConversationPreview::Text(truncate_preview(text))
+}
+
+/// A sender's quote snapshot is usable unless it is blank or a raw protocol
+/// line (`⚡PAY…`, `☎…`), which must never flash in a chip.
+fn usable_snapshot(snapshot: Option<&str>) -> Option<&str> {
+    snapshot
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with("⚡PAY") && !s.starts_with('☎'))
+}
+
+/// The quote chip for a reply. Same precedence both apps used: the parent's
+/// own type when it is a typed message, then the sender's snapshot, then the
+/// parent's text, else `Empty`.
+pub fn reply_chip(snapshot: Option<&str>, parent: Option<&ConversationPreview>) -> ConversationPreview {
+    if let Some(p) = parent {
+        if !matches!(p, ConversationPreview::Text(_) | ConversationPreview::Empty) {
+            return p.clone();
+        }
+    }
+    if let Some(s) = usable_snapshot(snapshot) {
+        return ConversationPreview::Text(truncate_preview(s));
+    }
+    match parent {
+        Some(ConversationPreview::Text(t)) => ConversationPreview::Text(t.clone()),
+        _ => ConversationPreview::Empty,
+    }
+}
+
+/// True when a reply needs its parent looked up to fill the chip: no
+/// usable snapshot to show instead.
+pub fn chip_needs_parent(reply: &ReplyRef) -> bool {
+    usable_snapshot(reply.preview.as_deref()).is_none()
 }
 
 /// Fill a missing quote snapshot from a locally stored parent body.
@@ -273,12 +357,27 @@ mod tests {
     }
 
     #[test]
+    fn the_chip_prefers_a_typed_parent_then_the_snapshot_then_the_parent_text() {
+        use ConversationPreview as P;
+        let photo = P::Photos(2);
+        let text = P::Text("parent body".into());
+        assert_eq!(reply_chip(Some("caption"), Some(&photo)), photo, "a photo stays a photo");
+        assert_eq!(reply_chip(Some(" quoted "), Some(&text)), P::Text("quoted".into()));
+        assert_eq!(reply_chip(None, Some(&text)), text);
+        assert_eq!(reply_chip(Some("⚡PAY|1|ab|21"), None), P::Empty, "never a raw protocol line");
+        assert_eq!(reply_chip(Some("☎CALL|1|END|c3a1|declined"), Some(&text)), text);
+        assert_eq!(reply_chip(Some("   "), None), P::Empty);
+    }
+
+    #[test]
     fn hydrate_fills_empty_preview_from_parent_body() {
         let (id, pk) = ids();
         let mut reply = ReplyRef {
             parent_id: id,
             parent_pubkey: Some(pk),
             preview: None,
+            parent_mine: false,
+            chip: ConversationPreview::Empty,
         };
         hydrate_reply_preview(&mut reply, Some("  parent body  "));
         assert_eq!(reply.preview.as_deref(), Some("parent body"));

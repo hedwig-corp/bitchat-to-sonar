@@ -114,6 +114,8 @@ final class MarmotService: @unchecked Sendable {
         case payDone(paymentId: String, preimageHex: String?)
         /// ☎CALL signaling — control line, hidden from the transcript.
         case callControl
+        /// ⚡TRILL nudge — the nudge pill, never the raw line.
+        case trill(trillId: String)
     }
 
     struct MarmotMessage: Sendable, Equatable, Codable {
@@ -123,7 +125,8 @@ final class MarmotService: @unchecked Sendable {
         let createdAt: Date
         /// True when the local identity sent it.
         let isMine: Bool
-        /// Core-owned local delivery state: received, pending, sent, or failed.
+        /// Core-owned delivery footer: received, pending, uploading, sent, or
+        /// failed (`MarmotService.deliveryState(_:)`); nil for local echoes.
         let deliveryState: String?
         /// Encrypted media attachments (Marmot MIP-04), empty for plain text.
         let media: [MarmotMedia]
@@ -220,6 +223,39 @@ final class MarmotService: @unchecked Sendable {
         let parentId: String
         let parentNpub: String?
         let preview: String?
+        /// The quoted message is ours; core reads it from the quote pointer.
+        let parentMine: Bool
+        /// The chip core resolved across the chat's folded groups; `.empty`
+        /// when it knows nothing (and for replies the app builds itself).
+        let chip: ConversationPreview
+
+        init(
+            parentId: String,
+            parentNpub: String?,
+            preview: String?,
+            parentMine: Bool = false,
+            chip: ConversationPreview = .empty
+        ) {
+            self.parentId = parentId
+            self.parentNpub = parentNpub
+            self.preview = preview
+            self.parentMine = parentMine
+            self.chip = chip
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case parentId, parentNpub, preview, parentMine, chip
+        }
+
+        /// Snapshots written before the chip existed decode with none.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            parentId = try c.decode(String.self, forKey: .parentId)
+            parentNpub = try c.decodeIfPresent(String.self, forKey: .parentNpub)
+            preview = try c.decodeIfPresent(String.self, forKey: .preview)
+            parentMine = try c.decodeIfPresent(Bool.self, forKey: .parentMine) ?? false
+            chip = try c.decodeIfPresent(ConversationPreview.self, forKey: .chip) ?? .empty
+        }
     }
 
     struct RecentMessagePage: Sendable, Equatable {
@@ -281,6 +317,52 @@ final class MarmotService: @unchecked Sendable {
         let packCoordinate: String
         let shortcode: String
         let plaintextSha256: String
+    }
+
+    /// Kind of a core-computed Messages-list row (`conversationList`).
+    enum ConversationListKind: String, Sendable, Equatable, Codable {
+        case direct, group, noteToSelf
+    }
+
+    /// A row's newest message as core classified it; the app only words it.
+    enum ConversationPreview: Sendable, Equatable, Codable {
+        case empty
+        case text(String)
+        case photos(Int)
+        case videos(Int)
+        case voiceNote
+        case file(String)
+        case sticker
+        case voiceCall
+        case nudge
+        case payment
+        case jsonPayload
+    }
+
+    /// One Messages-list row computed by core: every Marmot group of one
+    /// conversation folded together (R-003), unread summed over `groupIds`
+    /// (R-052), Note to Self first. Compose renders the same rows, so the fold
+    /// is decided once for both apps.
+    struct ConversationListRow: Sendable, Equatable, Codable {
+        /// The group the row opens: newest in the set, lowest id on a tie.
+        let conversationId: String
+        let kind: ConversationListKind
+        /// Every folded group, `conversationId` first. Opening marks all read.
+        let groupIds: [String]
+        let counterpartHex: String?
+        let name: String
+        /// Core-resolved title; nil = the app's localized fallback.
+        let title: String?
+        let preview: ConversationPreview
+        let latestContent: String
+        let latestSenderHex: String
+        let latestAt: Date
+        let latestMine: Bool
+        let latestGroupId: String
+        let messageCount: UInt64
+        /// Sum over `groupIds`; 0 for Note to Self.
+        let unreadCount: UInt64
+        let version: UInt64
     }
 
     struct ConversationSummary: Sendable, Equatable {
@@ -1006,8 +1088,10 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().requestJoinViaLink(inviteToken: token) }
     }
 
-    /// Encrypt and publish a text message to the group.
-    func sendText(groupId: String, text: String) async throws {
+    /// Encrypt and publish a text message to the group. Returns the stored
+    /// row's id, which keys the "Sending" bubble (R-001, R-002).
+    @discardableResult
+    func sendText(groupId: String, text: String) async throws -> String {
         try await sendLane { try $0.sendText(groupIdHex: groupId, text: text) }
     }
 
@@ -1017,7 +1101,7 @@ final class MarmotService: @unchecked Sendable {
         replyToHex: String,
         replyToNpub: String,
         preview: String?
-    ) async throws {
+    ) async throws -> String {
         try await sendLane {
             try $0.sendTextReply(
                 groupIdHex: groupId,
@@ -1180,7 +1264,7 @@ final class MarmotService: @unchecked Sendable {
         packCoordinate: String,
         shortcode: String,
         plaintextSha256: String
-    ) async throws {
+    ) async throws -> String {
         try await sendLane {
             try $0.sendSticker(
                 groupIdHex: groupId,
@@ -1453,7 +1537,7 @@ final class MarmotService: @unchecked Sendable {
             content: message.content,
             createdAt: Date(timeIntervalSince1970: TimeInterval(message.createdAtSecs)),
             isMine: message.mine,
-            deliveryState: message.deliveryState,
+            deliveryState: Self.deliveryState(message.delivery),
             media: message.media.map {
                 MarmotMedia(
                     url: $0.url,
@@ -1476,13 +1560,27 @@ final class MarmotService: @unchecked Sendable {
                 MarmotReplyRef(
                     parentId: $0.parentIdHex,
                     parentNpub: $0.parentNpub,
-                    preview: $0.preview
+                    preview: $0.preview,
+                    parentMine: $0.parentMine,
+                    chip: Self.conversationPreview($0.chip)
                 )
             },
             reactions: message.reactions.map {
                 MarmotReactionTally(emoji: $0.emoji, count: $0.count, mine: $0.mine)
             }
         )
+    }
+
+    /// Core decides the footer; the stored string keeps the values older
+    /// snapshots already hold ("pending" for a send in flight).
+    nonisolated static func deliveryState(_ label: DeliveryLabelInfo) -> String {
+        switch label {
+        case .received: return "received"
+        case .sending: return "pending"
+        case .uploading: return "uploading"
+        case .sent: return "sent"
+        case .failed: return "failed"
+        }
     }
 
     private static func marmotMessageClass(_ c: MessageClassInfo) -> MarmotMessageClass {
@@ -1495,6 +1593,8 @@ final class MarmotService: @unchecked Sendable {
             return .payDone(paymentId: paymentId, preimageHex: preimageHex)
         case .callControl:
             return .callControl
+        case .trill(let trillId):
+            return .trill(trillId: trillId)
         }
     }
 
@@ -2348,6 +2448,75 @@ final class MarmotService: @unchecked Sendable {
                 )
             }
         }, default: [])
+    }
+
+    /// Core's Messages-list rows, in list order. Local only. nil when the read
+    /// failed, so callers keep the fold they have instead of dropping it.
+    func conversationList() async -> [ConversationListRow]? {
+        await readOnlyNonThrowing({ node in
+            guard let rows = try? node.conversationList(limit: 0, after: nil) else { return nil }
+            return rows.map { row in
+                let kind: ConversationListKind
+                switch row.kind {
+                case .direct: kind = .direct
+                case .group: kind = .group
+                case .noteToSelf: kind = .noteToSelf
+                }
+                return ConversationListRow(
+                    conversationId: row.conversationId,
+                    kind: kind,
+                    groupIds: row.groupIds,
+                    counterpartHex: row.counterpartHex,
+                    name: row.name,
+                    title: row.title,
+                    preview: Self.conversationPreview(row.preview),
+                    latestContent: row.latestContent,
+                    latestSenderHex: row.latestSenderHex,
+                    latestAt: Date(timeIntervalSince1970: TimeInterval(row.latestAtSecs)),
+                    latestMine: row.latestMine,
+                    latestGroupId: row.latestGroupId,
+                    messageCount: row.messageCount,
+                    unreadCount: row.unreadCount,
+                    version: row.version
+                )
+            }
+        }, default: nil)
+    }
+
+    nonisolated static func conversationPreview(_ info: ConversationPreviewInfo) -> ConversationPreview {
+        switch info {
+        case .empty: return .empty
+        case .text(let text): return .text(text)
+        case .photos(let count): return .photos(Int(count))
+        case .videos(let count): return .videos(Int(count))
+        case .voiceNote: return .voiceNote
+        case .file(let name): return .file(name)
+        case .sticker: return .sticker
+        case .voiceCall: return .voiceCall
+        case .nudge: return .nudge
+        case .payment: return .payment
+        case .jsonPayload: return .jsonPayload
+        }
+    }
+
+    /// Seed core's name cache (titles the Messages list) from the app's
+    /// profile cache. Keys are canonical npubs or hex pubkeys.
+    func rememberPeerNames(_ names: [(pubkeyHex: String, name: String)]) async {
+        guard !names.isEmpty else { return }
+        await runNonThrowing { service in
+            _ = service.node?.rememberPeerNames(
+                names: names.map { PeerNameInfo(pubkeyHex: $0.pubkeyHex, name: $0.name) }
+            )
+            return ()
+        }
+    }
+
+    /// Core's unread anchor (hex) for `unreadCount` across `groupIds`: the
+    /// row the divider goes above. Read-only; nil when none or on failure.
+    func conversationUnreadAnchor(groupIds: [String], unreadCount: UInt64) async -> String? {
+        await runNonThrowing { service in
+            (try? service.node?.conversationUnreadAnchor(groupIdHexes: groupIds, unreadCount: unreadCount)) ?? nil
+        }
     }
 
     func markConversationRead(groupId: String) async {

@@ -1,5 +1,9 @@
 package chat.bitchat.sonar
 
+import app.cash.molecule.RecompositionMode
+import app.cash.molecule.moleculeFlow
+import chat.bitchat.sonar.chatlist.ChatListModel
+import chat.bitchat.sonar.chatlist.ChatListRow
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -8,6 +12,9 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.runTest
 
 class NoteToSelfTest {
     private val other = SonarChat(id = "giulia-group", name = "Giulia", members = listOf("npub1her", "npub1me"))
@@ -20,10 +27,14 @@ class NoteToSelfTest {
     @AfterTest
     fun restore() = DesktopEnv.useTestRoot(null)
 
+    /** The model the phone Home screen and the desktop sidebar render. */
+    private suspend fun SonarAppState.homeModel(): ChatListModel =
+        moleculeFlow(RecompositionMode.Immediate) { chatListPresenter.present(emptyFlow()) }.first()
+
     // Pins the Messages list both the phone home screen and the desktop
     // sidebar render, not only the pin helper.
     @Test
-    fun noteToSelfTopsTheMessagesListEvenWhenAnotherChatIsNewer() {
+    fun noteToSelfTopsTheMessagesListEvenWhenAnotherChatIsNewer() = runTest {
         val s = state()
         s.seedNoteToSelfForTest(
             noteId = "n0te",
@@ -35,12 +46,12 @@ class NoteToSelfTest {
         val byRecency = mergeHomeMessageRows(emptyList(), s.visibleChats) { s.marmotRow(it).tsSecs }
         assertEquals(other.id, (byRecency.first() as HomeMessageRow.Marmot).chat.id)
 
-        val rows = s.homeMessageRows(emptyList(), s.visibleChats)
-        assertEquals(listOf("n0te", other.id), rows.map { it.listKey })
+        val rows = s.homeModel().rows
+        assertEquals(listOf("n0te", other.id), rows.map { it.key })
     }
 
     @Test
-    fun noteToSelfNeverShowsUnreadWhileOtherChatsStillDo() {
+    fun noteToSelfNeverShowsUnreadWhileOtherChatsStillDo() = runTest {
         val s = state()
         s.seedNoteToSelfForTest(
             noteId = "n0te",
@@ -48,9 +59,11 @@ class NoteToSelfTest {
             unread = mapOf("n0te" to 3L, other.id to 1L),
             latestSecs = emptyMap(),
         )
-        assertFalse(s.marmotRow("n0te").unread, "your own notes are never unread")
-        assertTrue(s.marmotRow(other.id).unread, "the unread count itself still works")
-        assertEquals("Note to Self", s.marmotRow("n0te").title)
+        val rows = s.homeModel().rows.filterIsInstance<ChatListRow.Marmot>().associateBy { it.chat.id }
+        assertFalse(rows.getValue("n0te").unread, "your own notes are never unread")
+        assertTrue(rows.getValue("n0te").noteToSelf)
+        assertTrue(rows.getValue(other.id).unread, "the unread count itself still works")
+        assertEquals("Note to Self", rows.getValue("n0te").title)
     }
 
     @Test
