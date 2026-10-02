@@ -145,6 +145,8 @@ Options:
 - `--accept-invalid-signal-certs`: fetch encrypted Signal CDN blobs even when
   local TLS interception breaks certificate validation. The decrypted sticker
   data is still authenticated by Signal's pack-key HMAC before publishing.
+- `--root-cert <path>`: add a PEM root certificate when fetching Signal
+  CDN blobs. Repeat the option to trust multiple certificates.
 - `--skip-missing-signal-stickers`: publish the pack with the importable
   stickers when the Signal manifest references an unavailable asset. Skipped
   Signal ids are reported in the JSON output.
