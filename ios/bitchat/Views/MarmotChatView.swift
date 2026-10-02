@@ -806,6 +806,10 @@ final class MarmotChatModel: ObservableObject {
             return pendingOutboundStateText(hasMedia: !message.media.isEmpty, media: message.media)
         }
         if message.deliveryState == "failed" { return "Couldn't send" }
+        if message.deliveryState == "uploading" { return "Uploading" }
+        // "pending" from core is a send without photos; the media rule below
+        // only still decides for rows from snapshots written before core
+        // sent "uploading".
         if message.deliveryState == "pending" {
             return pendingOutboundStateText(hasMedia: !message.media.isEmpty, media: message.media)
         }

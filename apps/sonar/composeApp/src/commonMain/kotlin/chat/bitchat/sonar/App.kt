@@ -3207,11 +3207,21 @@ internal fun ReplyDecorated(
         val reply = m.reply
         val resolvedReply = if (sonarReplyUiEnabled() && reply != null) {
             val fallback = stringResource(Res.string.chat_reply_fallback)
-            val parent = state.messages.firstOrNull { it.id.equals(reply.parentId, ignoreCase = true) }
             val paymentLabel = stringResource(Res.string.chat_reply_payment)
             val photoLabel = stringResource(Res.string.chat_reply_photo)
             val stickerLabel = stringResource(Res.string.chat_reply_sticker)
-            val typed = parent?.let {
+            val coreChip = reply.chip != SonarConversationPreview.Empty
+            // Core resolved the chip (White Noise rows): the transcript is only
+            // scanned for a group author it cannot name. Mesh replies carry no
+            // core chip and still resolve from the loaded parent.
+            val parent = if (coreChip && (reply.parentMine || !isGroup)) {
+                null
+            } else {
+                state.messages.firstOrNull { it.id.equals(reply.parentId, ignoreCase = true) }
+            }
+            val typed = if (coreChip) {
+                sonarReplyChipLabel(reply.chip, paymentLabel, photoLabel, stickerLabel) ?: fallback
+            } else parent?.let {
                 sonarTypedReplyPreview(
                     it.classification,
                     it.stickerRef != null,
@@ -3222,8 +3232,11 @@ internal fun ReplyDecorated(
                 )
             }
             reply.copy(
-                author = reply.author ?: parent?.let {
-                    if (it.mine) youLabel else state.groupAuthorName(it, isGroup) ?: peerName
+                author = reply.author ?: when {
+                    reply.parentMine -> youLabel
+                    parent != null -> if (parent.mine) youLabel else state.groupAuthorName(parent, isGroup) ?: peerName
+                    coreChip && !isGroup -> peerName
+                    else -> null
                 },
                 preview = sonarResolvedReplyPreview(reply, parent?.content, fallback, typed),
             )

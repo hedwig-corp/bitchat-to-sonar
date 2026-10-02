@@ -539,24 +539,55 @@ enum SNSwipeReplyMetrics {
     }
 }
 
+/// `counterpartName` names the other person of a 1:1, so a quote of their
+/// message reads right even when the parent is in the other folded group.
 func snReplyRef(
     from message: MarmotService.MarmotMessage,
     parents: [MarmotService.MarmotMessage] = [],
-    parentAuthorById: [String: String] = [:]
+    parentAuthorById: [String: String] = [:],
+    counterpartName: String? = nil
 ) -> SNReplyRef? {
     guard let r = message.reply else { return nil }
+    let author = r.parentMine
+        ? String(localized: "chat.reply.you", defaultValue: "You")
+        : (parentAuthorById[r.parentId] ?? counterpartName)
+    // Core resolved the chip across the chat's groups: render its answer.
+    if let chip = snReplyChipText(r.chip) {
+        return SNReplyRef(parentId: r.parentId, parentNpub: r.parentNpub, author: author, preview: chip)
+    }
     let snapshot = (r.preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     let parent = parents.first { $0.id.caseInsensitiveCompare(r.parentId) == .orderedSame }
     return SNReplyRef(
         parentId: r.parentId,
         parentNpub: r.parentNpub,
-        author: parentAuthorById[r.parentId],
+        author: author,
         preview: snResolvedReplyPreview(
             snapshot: snapshot,
             parentText: parent?.content,
             typed: parent.flatMap(snTypedReplyPreview(from:))
         )
     )
+}
+
+/// Words a core-resolved quote chip with the labels this app localizes.
+/// `nil` for `.empty`: core knows nothing, so the caller resolves locally.
+func snReplyChipText(_ chip: MarmotService.ConversationPreview) -> String? {
+    switch chip {
+    case .empty:
+        return nil
+    case .text(let text):
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : String(trimmed.prefix(140))
+    case .photos, .videos, .file, .voiceNote:
+        return String(localized: "chat.reply.photo", defaultValue: "Photo")
+    case .sticker:
+        return String(localized: "chat.reply.sticker", defaultValue: "Sticker")
+    case .payment:
+        return String(localized: "chat.reply.payment", defaultValue: "Payment")
+    case .voiceCall, .nudge, .jsonPayload:
+        // Never the raw ☎CALL / ⚡TRILL line; no label of its own yet.
+        return String(localized: "chat.reply.fallback", defaultValue: "Message")
+    }
 }
 
 func snReplyParentAuthorsById(
@@ -606,7 +637,7 @@ func snTypedReplyPreview(from message: MarmotService.MarmotMessage) -> String? {
     switch message.classification {
     case .payReceipt, .payDone:
         return String(localized: "chat.reply.payment", defaultValue: "Payment")
-    case .callControl:
+    case .callControl, .trill:
         return nil
     case .text:
         break
@@ -6987,6 +7018,8 @@ final class SonarAppStore: ObservableObject {
         switch m.classification {
         case .callControl, .payDone:
             return .hidden
+        case .trill:
+            return .trill
         case .payReceipt(let pid, let sats):
             // `sats` is a core u64; the ledger/UI use Int64. `Int64(sats)`
             // TRAPS above Int64.max, so a peer could crash the transcript
@@ -6996,9 +7029,8 @@ final class SonarAppStore: ObservableObject {
             guard let wireSats = Int64(exactly: sats) else { return .notPay }
             return payBubble(paymentId: pid, wireSats: wireSats, fallbackVia: fallbackVia)
         case .text:
-            // Core MessageClassInfo has no trill variant (yet); ⚡TRILL lines
-            // classify as .text and are picked up by the string decode here,
-            // exactly like a just-sent optimistic ⚡PAY echo.
+            // Optimistic echoes and rows from older snapshots are `.text`; the
+            // string decode still words a just-sent ⚡PAY / ⚡TRILL line.
             if m.content.hasPrefix("\u{26A1}PAY")
                 || m.content.hasPrefix("\u{26A1}TRILL")
                 || Self.looksLikeCallControl(m.content) {
@@ -7097,6 +7129,9 @@ final class SonarAppStore: ObservableObject {
             let mentionCtx = mentionContext(forConversationId: id)
             for group in sourceGroups {
                 let groupMessages = marmot.messagesByGroup[group.id] ?? []
+                let counterpartName = marmot.isDirectGroup(group)
+                    ? directOtherNpub(in: group).flatMap { marmot.displayName(forNpub: $0) }
+                    : nil
                 let parentAuthorById = snReplyParentAuthorsById(
                     groupMessages.map {
                         (
@@ -7118,7 +7153,8 @@ final class SonarAppStore: ObservableObject {
                     let reply = snReplyRef(
                         from: m,
                         parents: groupMessages,
-                        parentAuthorById: parentAuthorById
+                        parentAuthorById: parentAuthorById,
+                        counterpartName: counterpartName
                     )
                     switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:

@@ -121,6 +121,39 @@ pub enum DeliveryState {
     Failed,
 }
 
+/// What a transcript row's delivery footer says, decided once in core so both
+/// apps word it the same way. Hosts only localize it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryLabel {
+    /// Someone else's message: no footer.
+    Received,
+    /// Own send waiting on a relay ack.
+    Sending,
+    /// Own send with photos waiting on a relay ack: the upload bar, not the
+    /// spinner (Signal shows image uploads as progress).
+    Uploading,
+    /// Own send a relay acknowledged.
+    Sent,
+    /// Own send the outbox gave up on.
+    Failed,
+}
+
+/// The footer for a stored row: own rows read their outbox state, everyone
+/// else's rows have none.
+pub fn delivery_label(mine: bool, state: DeliveryState, media: &[MediaRef]) -> DeliveryLabel {
+    if !mine {
+        return DeliveryLabel::Received;
+    }
+    match state {
+        DeliveryState::Pending if media.iter().any(|m| m.mime_type.starts_with("image/")) => {
+            DeliveryLabel::Uploading
+        }
+        DeliveryState::Pending => DeliveryLabel::Sending,
+        DeliveryState::Failed => DeliveryLabel::Failed,
+        DeliveryState::Sent | DeliveryState::Received => DeliveryLabel::Sent,
+    }
+}
+
 impl DeliveryState {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -172,6 +205,9 @@ pub enum MessageClassification {
     },
     /// `☎CALL|…` signaling line — hidden from the transcript by hosts.
     CallControl,
+    /// `⚡TRILL|1|<id>` nudge — hosts render the centered nudge pill, never the
+    /// raw line (docs/SONAR-TRILL.md).
+    Trill { trill_id: String },
 }
 
 impl MessageClassification {
@@ -196,6 +232,13 @@ impl MessageClassification {
         }
         if line.starts_with("☎CALL") && CallControl::parse(line).is_some() {
             return Self::CallControl;
+        }
+        if line.starts_with("⚡TRILL") {
+            if let Some(trill) = crate::notification::parse_trill_line(line) {
+                return Self::Trill {
+                    trill_id: trill.trill_id,
+                };
+            }
         }
         Self::Text
     }
@@ -1967,7 +2010,7 @@ impl MarmotEngine {
             mapped.push(self.to_chat_message(m));
         }
         crate::reaction::attach_tallies(&mut mapped, &reactions, self.identity.public_key());
-        hydrate_page_reply_previews(&mut mapped);
+        hydrate_page_reply_previews(&mut mapped, &self.identity.public_key());
         self.reactions.record_all(group_id, reactions);
         Ok(mapped)
     }
@@ -2027,7 +2070,7 @@ impl MarmotEngine {
             }
         }
 
-        hydrate_page_reply_previews(&mut page_messages);
+        hydrate_page_reply_previews(&mut page_messages, &self.identity.public_key());
         // Chat-list / index / recovery callers use this API. Kind-7 hydrate
         // is a newest-first raw scan; keep it off this path so list paint
         // stays Signal-local. Transcript pages use `messages_cursor_page`.
@@ -2184,7 +2227,7 @@ impl MarmotEngine {
 
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
-        hydrate_page_reply_previews(&mut candidates);
+        hydrate_page_reply_previews(&mut candidates, &self.identity.public_key());
         self.hydrate_page_reactions(group_id, &mut candidates, page_reactions)?;
         Ok(candidates)
     }
@@ -2398,6 +2441,15 @@ impl MarmotEngine {
         }
     }
 
+    /// One stored chat message by id: a quote chip whose parent is not on the
+    /// page. A single indexed read; `None` when it is not a chat row here.
+    pub fn chat_message_by_id(&self, group_id: &GroupId, id: &EventId) -> Result<Option<ChatMessage>> {
+        let found = dispatch!(&self.storage, |mdk| mdk.get_message(group_id, id))?;
+        Ok(found
+            .filter(|m| m.kind.as_u16() == CHAT_RUMOR_KIND)
+            .map(|m| self.to_chat_message(m)))
+    }
+
     fn to_chat_message(&self, m: message_types::Message) -> ChatMessage {
         let media = self.parse_media_refs(&m.mls_group_id, &m.tags);
         let sticker_ref = m
@@ -2533,9 +2585,24 @@ fn overlay_reply_preview(incoming: Incoming, reply: Option<&ReplyTo>) -> Incomin
     Incoming::Message(message)
 }
 
-/// Denormalize quote chip text from other rows in the same bounded local page.
-/// NIP-C7 does not carry a preview; never full-scan the group to fill one.
-fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
+/// Denormalize quote chip text from other rows in the same bounded local page,
+/// and decide each chip ([`crate::reply::reply_chip`]) from what the page
+/// holds. NIP-C7 does not carry a preview; never full-scan the group to fill
+/// one. Parents outside the page are filled by the client, under a lookup
+/// budget, from this conversation's groups.
+fn hydrate_page_reply_previews(msgs: &mut [ChatMessage], me: &PublicKey) {
+    let parents: HashSet<EventId> = msgs
+        .iter()
+        .filter_map(|m| m.reply.as_ref().map(|r| r.parent_id))
+        .collect();
+    if parents.is_empty() {
+        return;
+    }
+    let chips: HashMap<EventId, crate::conversation_list::ConversationPreview> = msgs
+        .iter()
+        .filter(|m| parents.contains(&m.id))
+        .map(|m| (m.id, crate::reply::reply_preview_of(m)))
+        .collect();
     let by_id: HashMap<EventId, String> = msgs
         .iter()
         .filter_map(|m| {
@@ -2553,6 +2620,8 @@ fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
             continue;
         };
         crate::reply::hydrate_reply_preview(reply, by_id.get(&reply.parent_id).map(String::as_str));
+        reply.parent_mine = reply.parent_pubkey.as_ref() == Some(me);
+        reply.chip = crate::reply::reply_chip(reply.preview.as_deref(), chips.get(&reply.parent_id));
     }
 }
 
@@ -2857,6 +2926,42 @@ mod message_cursor_tests {
 #[cfg(test)]
 mod classification_tests {
     use super::MessageClassification as C;
+
+    #[test]
+    fn trill_lines_classify_as_visible_nudges() {
+        assert_eq!(
+            C::of("⚡TRILL|1|ab12-cd"),
+            C::Trill {
+                trill_id: "ab12-cd".into()
+            }
+        );
+        assert!(C::of("⚡TRILL|1|ab12").is_transcript_visible());
+        // Same strictness as the hosts' codecs: version 1, no trailing fields.
+        assert_eq!(C::of("⚡TRILL|2|ab12"), C::Text);
+        assert_eq!(C::of("⚡TRILL|1|ab12|extra"), C::Text);
+        assert_eq!(C::of("⚡TRILL|1|not hex"), C::Text);
+    }
+
+    #[test]
+    fn delivery_label_words_own_rows_from_the_outbox_state() {
+        use super::{delivery_label, DeliveryLabel as L, DeliveryState as S, MediaRef};
+        let media = |mime: &str| MediaRef {
+            url: "u".into(),
+            mime_type: mime.into(),
+            filename: "f".into(),
+            width: None,
+            height: None,
+            duration_ms: None,
+        };
+        assert_eq!(delivery_label(false, S::Pending, &[]), L::Received);
+        assert_eq!(delivery_label(true, S::Pending, &[]), L::Sending);
+        assert_eq!(delivery_label(true, S::Pending, &[media("image/jpeg")]), L::Uploading);
+        // Voice notes and files keep the spinner, as on iOS before.
+        assert_eq!(delivery_label(true, S::Pending, &[media("audio/mp4")]), L::Sending);
+        assert_eq!(delivery_label(true, S::Failed, &[media("image/png")]), L::Failed);
+        assert_eq!(delivery_label(true, S::Sent, &[]), L::Sent);
+        assert_eq!(delivery_label(true, S::Received, &[]), L::Sent);
+    }
 
     #[test]
     fn plain_text_and_empty_classify_as_text() {

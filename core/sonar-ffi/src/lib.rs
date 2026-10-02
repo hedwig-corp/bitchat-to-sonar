@@ -597,6 +597,33 @@ pub enum MessageClassInfo {
     },
     /// `☎CALL|…` signaling line — hidden from the transcript.
     CallControl,
+    /// `⚡TRILL|1|<id>` nudge — render the nudge pill, never the raw line.
+    Trill { trill_id: String },
+}
+
+/// What a transcript row's delivery footer says.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryLabelInfo {
+    /// Someone else's message: no footer.
+    Received,
+    /// Own send waiting on a relay ack.
+    Sending,
+    /// Own send with photos waiting on a relay ack.
+    Uploading,
+    Sent,
+    /// The outbox gave up; offer retry.
+    Failed,
+}
+
+fn delivery_label_info(label: sonar_core::marmot::DeliveryLabel) -> DeliveryLabelInfo {
+    use sonar_core::marmot::DeliveryLabel as L;
+    match label {
+        L::Received => DeliveryLabelInfo::Received,
+        L::Sending => DeliveryLabelInfo::Sending,
+        L::Uploading => DeliveryLabelInfo::Uploading,
+        L::Sent => DeliveryLabelInfo::Sent,
+        L::Failed => DeliveryLabelInfo::Failed,
+    }
 }
 
 /// FFI-friendly decrypted chat message.
@@ -608,8 +635,8 @@ pub struct MessageInfo {
     pub created_at_secs: u64,
     /// True when the local identity sent it.
     pub mine: bool,
-    /// Local delivery state: received, pending, sent, or failed.
-    pub delivery_state: String,
+    /// The delivery footer, decided in core; hosts only localize it.
+    pub delivery: DeliveryLabelInfo,
     /// Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
     pub media: Vec<MediaInfo>,
     /// Sticker reference if this message is a sticker send (nil for text/media).
@@ -642,7 +669,13 @@ pub struct ReactionTallyInfo {
 pub struct ReplyRefInfo {
     pub parent_id_hex: String,
     pub parent_npub: Option<String>,
+    /// The sender's quote snapshot, as received. Render `chip` instead.
     pub preview: Option<String>,
+    /// The quoted message is ours ("You").
+    pub parent_mine: bool,
+    /// What the quote chip shows, resolved in core across the conversation's
+    /// folded groups. `Empty`: show the "Message" fallback.
+    pub chip: ConversationPreviewInfo,
 }
 
 /// FFI-friendly sticker reference carried on a chat message.
@@ -3537,6 +3570,7 @@ fn message_class_info(c: sonar_core::marmot::MessageClassification) -> MessageCl
             preimage_hex,
         },
         C::CallControl => MessageClassInfo::CallControl,
+        C::Trill { trill_id } => MessageClassInfo::Trill { trill_id },
     }
 }
 
@@ -3548,7 +3582,11 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
         content: m.content,
         created_at_secs: m.created_at.as_secs(),
         mine: m.mine,
-        delivery_state: m.delivery_state.as_str().to_string(),
+        delivery: delivery_label_info(sonar_core::marmot::delivery_label(
+            m.mine,
+            m.delivery_state,
+            &m.media,
+        )),
         media: m
             .media
             .into_iter()
@@ -3570,6 +3608,8 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
             parent_id_hex: r.parent_id.to_hex(),
             parent_npub: r.parent_pubkey.and_then(|pk| pk.to_bech32().ok()),
             preview: r.preview,
+            parent_mine: r.parent_mine,
+            chip: conversation_preview_info(r.chip),
         }),
         reactions: m
             .reactions

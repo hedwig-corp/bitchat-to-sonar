@@ -6167,9 +6167,9 @@ public struct MessageInfo: Equatable, Hashable {
      */
     public var mine: Bool
     /**
-     * Local delivery state: received, pending, sent, or failed.
+     * The delivery footer, decided in core; hosts only localize it.
      */
-    public var deliveryState: String
+    public var delivery: DeliveryLabelInfo
     /**
      * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
      */
@@ -6198,8 +6198,8 @@ public struct MessageInfo: Equatable, Hashable {
          * True when the local identity sent it.
          */mine: Bool,
         /**
-         * Local delivery state: received, pending, sent, or failed.
-         */deliveryState: String,
+         * The delivery footer, decided in core; hosts only localize it.
+         */delivery: DeliveryLabelInfo,
         /**
          * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
          */media: [MediaInfo],
@@ -6220,7 +6220,7 @@ public struct MessageInfo: Equatable, Hashable {
         self.content = content
         self.createdAtSecs = createdAtSecs
         self.mine = mine
-        self.deliveryState = deliveryState
+        self.delivery = delivery
         self.media = media
         self.stickerRef = stickerRef
         self.classification = classification
@@ -6249,7 +6249,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
                 content: FfiConverterString.read(from: &buf),
                 createdAtSecs: FfiConverterUInt64.read(from: &buf),
                 mine: FfiConverterBool.read(from: &buf),
-                deliveryState: FfiConverterString.read(from: &buf),
+                delivery: FfiConverterTypeDeliveryLabelInfo.read(from: &buf),
                 media: FfiConverterSequenceTypeMediaInfo.read(from: &buf),
                 stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf),
                 classification: FfiConverterTypeMessageClassInfo.read(from: &buf),
@@ -6264,7 +6264,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
         FfiConverterBool.write(value.mine, into: &buf)
-        FfiConverterString.write(value.deliveryState, into: &buf)
+        FfiConverterTypeDeliveryLabelInfo.write(value.delivery, into: &buf)
         FfiConverterSequenceTypeMediaInfo.write(value.media, into: &buf)
         FfiConverterOptionTypeStickerRefInfo.write(value.stickerRef, into: &buf)
         FfiConverterTypeMessageClassInfo.write(value.classification, into: &buf)
@@ -6741,14 +6741,38 @@ public func FfiConverterTypeRecentMessagePageInfo_lower(_ value: RecentMessagePa
 public struct ReplyRefInfo: Equatable, Hashable {
     public var parentIdHex: String
     public var parentNpub: String?
+    /**
+     * The sender's quote snapshot, as received. Render `chip` instead.
+     */
     public var preview: String?
+    /**
+     * The quoted message is ours ("You").
+     */
+    public var parentMine: Bool
+    /**
+     * What the quote chip shows, resolved in core across the conversation's
+     * folded groups. `Empty`: show the "Message" fallback.
+     */
+    public var chip: ConversationPreviewInfo
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(parentIdHex: String, parentNpub: String?, preview: String?) {
+    public init(parentIdHex: String, parentNpub: String?,
+        /**
+         * The sender's quote snapshot, as received. Render `chip` instead.
+         */preview: String?,
+        /**
+         * The quoted message is ours ("You").
+         */parentMine: Bool,
+        /**
+         * What the quote chip shows, resolved in core across the conversation's
+         * folded groups. `Empty`: show the "Message" fallback.
+         */chip: ConversationPreviewInfo) {
         self.parentIdHex = parentIdHex
         self.parentNpub = parentNpub
         self.preview = preview
+        self.parentMine = parentMine
+        self.chip = chip
     }
 
 
@@ -6769,7 +6793,9 @@ public struct FfiConverterTypeReplyRefInfo: FfiConverterRustBuffer {
             try ReplyRefInfo(
                 parentIdHex: FfiConverterString.read(from: &buf),
                 parentNpub: FfiConverterOptionString.read(from: &buf),
-                preview: FfiConverterOptionString.read(from: &buf)
+                preview: FfiConverterOptionString.read(from: &buf),
+                parentMine: FfiConverterBool.read(from: &buf),
+                chip: FfiConverterTypeConversationPreviewInfo.read(from: &buf)
         )
     }
 
@@ -6777,6 +6803,8 @@ public struct FfiConverterTypeReplyRefInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.parentIdHex, into: &buf)
         FfiConverterOptionString.write(value.parentNpub, into: &buf)
         FfiConverterOptionString.write(value.preview, into: &buf)
+        FfiConverterBool.write(value.parentMine, into: &buf)
+        FfiConverterTypeConversationPreviewInfo.write(value.chip, into: &buf)
     }
 }
 
@@ -8396,6 +8424,109 @@ public func FfiConverterTypeConversationPreviewInfo_lower(_ value: ConversationP
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a transcript row's delivery footer says.
+ */
+
+public enum DeliveryLabelInfo: Equatable, Hashable {
+
+    /**
+     * Someone else's message: no footer.
+     */
+    case received
+    /**
+     * Own send waiting on a relay ack.
+     */
+    case sending
+    /**
+     * Own send with photos waiting on a relay ack.
+     */
+    case uploading
+    case sent
+    /**
+     * The outbox gave up; offer retry.
+     */
+    case failed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension DeliveryLabelInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeliveryLabelInfo: FfiConverterRustBuffer {
+    typealias SwiftType = DeliveryLabelInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeliveryLabelInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .received
+
+        case 2: return .sending
+
+        case 3: return .uploading
+
+        case 4: return .sent
+
+        case 5: return .failed
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DeliveryLabelInfo, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .received:
+            writeInt(&buf, Int32(1))
+
+
+        case .sending:
+            writeInt(&buf, Int32(2))
+
+
+        case .uploading:
+            writeInt(&buf, Int32(3))
+
+
+        case .sent:
+            writeInt(&buf, Int32(4))
+
+
+        case .failed:
+            writeInt(&buf, Int32(5))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeliveryLabelInfo_lift(_ buf: RustBuffer) throws -> DeliveryLabelInfo {
+    return try FfiConverterTypeDeliveryLabelInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeliveryLabelInfo_lower(_ value: DeliveryLabelInfo) -> RustBuffer {
+    return FfiConverterTypeDeliveryLabelInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum MeshEngineCommand: Equatable, Hashable {
 
@@ -8717,6 +8848,11 @@ public enum MessageClassInfo: Equatable, Hashable {
      * `☎CALL|…` signaling line — hidden from the transcript.
      */
     case callControl
+    /**
+     * `⚡TRILL|1|<id>` nudge — render the nudge pill, never the raw line.
+     */
+    case trill(trillId: String
+    )
 
 
 
@@ -8748,6 +8884,9 @@ public struct FfiConverterTypeMessageClassInfo: FfiConverterRustBuffer {
 
         case 4: return .callControl
 
+        case 5: return .trill(trillId: try FfiConverterString.read(from: &buf)
+        )
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8774,6 +8913,11 @@ public struct FfiConverterTypeMessageClassInfo: FfiConverterRustBuffer {
 
         case .callControl:
             writeInt(&buf, Int32(4))
+
+
+        case let .trill(trillId):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(trillId, into: &buf)
 
         }
     }

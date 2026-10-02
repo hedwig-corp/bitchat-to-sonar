@@ -500,7 +500,7 @@ internal fun isTranscriptVisibleRow(
     msg.classification?.let { klass ->
         return when (klass) {
             is SonarMsgClass.PayDone, is SonarMsgClass.CallControl -> false
-            is SonarMsgClass.Text, is SonarMsgClass.PayReceipt -> true
+            is SonarMsgClass.Text, is SonarMsgClass.PayReceipt, is SonarMsgClass.Trill -> true
         }
     }
     val pay = PayLine.decode(msg.content)

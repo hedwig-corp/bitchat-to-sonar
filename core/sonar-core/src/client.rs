@@ -944,6 +944,11 @@ const GIFTWRAP_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
 /// (the hosts' retained transcript window). More unread than that anchors at
 /// the oldest row read.
 pub const OPEN_ANCHOR_SCAN_ROWS: usize = 500;
+/// Most quote-parent reads one transcript read makes outside its own page.
+/// A screen shows a few dozen rows, so this covers its replies without
+/// letting a reply-heavy page (or a startup read of many groups) turn into
+/// one database read per row.
+pub const REPLY_PARENT_LOOKUPS_PER_READ: usize = 16;
 
 /// Safety overlap subtracted from the watermark on every incremental fetch, to
 /// cover clock skew and events that landed on a relay mid-sync. Already-seen
@@ -7796,11 +7801,9 @@ impl SonarClient {
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
-        self.engine.messages(group_id).map(|msgs| {
-            msgs.into_iter()
-                .map(|m| self.with_delivery_state(m))
-                .collect()
-        })
+        let msgs = self.engine.messages(group_id)?;
+        let mut budget = REPLY_PARENT_LOOKUPS_PER_READ;
+        Ok(self.finish_rows(group_id, msgs, &mut budget))
     }
 
     pub fn messages_page(
@@ -7809,13 +7812,96 @@ impl SonarClient {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ChatMessage>> {
-        self.engine
-            .messages_page(group_id, limit, offset)
-            .map(|msgs| {
-                msgs.into_iter()
-                    .map(|m| self.with_delivery_state(m))
-                    .collect()
+        let msgs = self.engine.messages_page(group_id, limit, offset)?;
+        let mut budget = REPLY_PARENT_LOOKUPS_PER_READ;
+        Ok(self.finish_rows(group_id, msgs, &mut budget))
+    }
+
+    /// Rows as the apps render them: outbox delivery state, and quote chips
+    /// whose parent sits outside the page.
+    fn finish_rows(&self, group_id: &GroupId, msgs: Vec<ChatMessage>, budget: &mut usize) -> Vec<ChatMessage> {
+        let mut msgs: Vec<ChatMessage> = msgs.into_iter().map(|m| self.with_delivery_state(m)).collect();
+        self.fill_reply_parents(group_id, &mut msgs, budget);
+        msgs
+    }
+
+    /// Fill quote chips whose parent is not on the page: read the parent by id
+    /// from this group, then from the groups folded into the same 1:1 (a reply
+    /// sent into one twin group often quotes a message stored in the other).
+    /// Each read spends one unit of `budget`; when it runs out the chip keeps
+    /// what the page gave it, and the host shows its fallback.
+    fn fill_reply_parents(&self, group_id: &GroupId, msgs: &mut [ChatMessage], budget: &mut usize) {
+        use crate::conversation_list::ConversationPreview;
+        if *budget == 0 {
+            return;
+        }
+        let on_page: HashSet<nostr::EventId> = msgs.iter().map(|m| m.id).collect();
+        let mut wanted: Vec<nostr::EventId> = Vec::new();
+        for reply in msgs.iter().filter_map(|m| m.reply.as_ref()) {
+            if reply.chip == ConversationPreview::Empty
+                && crate::reply::chip_needs_parent(reply)
+                && !on_page.contains(&reply.parent_id)
+                && !wanted.contains(&reply.parent_id)
+            {
+                wanted.push(reply.parent_id);
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        let mut search = vec![group_id.clone()];
+        search.extend(self.folded_siblings(group_id));
+        let mut found: HashMap<nostr::EventId, ConversationPreview> = HashMap::new();
+        'parents: for id in wanted {
+            for group in &search {
+                if *budget == 0 {
+                    break 'parents;
+                }
+                *budget -= 1;
+                match self.engine.chat_message_by_id(group, &id) {
+                    Ok(Some(parent)) => {
+                        found.insert(id, crate::reply::reply_preview_of(&parent));
+                        continue 'parents;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(%e, "quote parent read failed");
+                        continue 'parents;
+                    }
+                }
+            }
+        }
+        for reply in msgs.iter_mut().filter_map(|m| m.reply.as_mut()) {
+            if let Some(parent) = found.get(&reply.parent_id) {
+                reply.chip = crate::reply::reply_chip(reply.preview.as_deref(), Some(parent));
+            }
+        }
+    }
+
+    /// The other groups folded into `group_id`'s 1:1, from the shape cache the
+    /// chat list fills. A cold cache yields none: the chip then just searches
+    /// this group.
+    fn folded_siblings(&self, group_id: &GroupId) -> Vec<GroupId> {
+        use crate::conversation_list::ConversationListKind;
+        let gid = hex::encode(group_id.as_slice());
+        let cache = self.conversation_shapes.lock().unwrap();
+        let Some(counterpart) = cache
+            .get(&gid)
+            .filter(|(_, shape)| shape.kind == ConversationListKind::Direct)
+            .and_then(|(_, shape)| shape.counterpart_hex.clone())
+        else {
+            return Vec::new();
+        };
+        cache
+            .iter()
+            .filter(|(other, (_, shape))| {
+                **other != gid
+                    && shape.kind == ConversationListKind::Direct
+                    && shape.counterpart_hex.as_deref() == Some(counterpart.as_str())
             })
+            .filter_map(|(other, _)| hex::decode(other).ok())
+            .map(|bytes| GroupId::from_slice(&bytes))
+            .collect()
     }
 
     pub fn recent_message_pages(
@@ -7823,17 +7909,17 @@ impl SonarClient {
         group_limit: usize,
         page_limit: usize,
     ) -> Result<Vec<RecentMessagePage>> {
+        // One budget across every group: a startup read of many chats must not
+        // multiply the quote-parent reads by the number of groups.
+        let mut budget = REPLY_PARENT_LOOKUPS_PER_READ;
         self.engine
             .recent_message_pages(group_limit, page_limit)
             .map(|pages| {
                 pages
                     .into_iter()
                     .map(|mut page| {
-                        page.messages = page
-                            .messages
-                            .into_iter()
-                            .map(|m| self.with_delivery_state(m))
-                            .collect();
+                        let group_id = page.group_id.clone();
+                        page.messages = self.finish_rows(&group_id, std::mem::take(&mut page.messages), &mut budget);
                         page
                     })
                     .collect()
@@ -8562,13 +8648,11 @@ impl SonarClient {
         before_id: Option<&nostr::EventId>,
         limit: usize,
     ) -> Result<Vec<ChatMessage>> {
-        self.engine
-            .messages_cursor_page(group_id, before_secs, before_id, limit)
-            .map(|msgs| {
-                msgs.into_iter()
-                    .map(|m| self.with_delivery_state(m))
-                    .collect()
-            })
+        let msgs = self
+            .engine
+            .messages_cursor_page(group_id, before_secs, before_id, limit)?;
+        let mut budget = REPLY_PARENT_LOOKUPS_PER_READ;
+        Ok(self.finish_rows(group_id, msgs, &mut budget))
     }
 
     /// Durable outbox state for a locally created rumor id: `None` once a
@@ -9471,7 +9555,7 @@ pub(crate) fn index_preview(message: &ChatMessage) -> String {
 /// ordinary chat text allocation-free; only brace-prefixed text pays the
 /// parse check. The transcript bubble still renders the full raw text; this
 /// only guards the preview/banner copy.
-fn looks_like_json_payload(content: &str) -> bool {
+pub(crate) fn looks_like_json_payload(content: &str) -> bool {
     let trimmed = content.trim_start();
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
         return false;
@@ -13647,6 +13731,68 @@ mod tests {
             1,
             "asking for the anchor marked nothing read"
         );
+    }
+
+    #[tokio::test]
+    async fn a_reply_quoting_the_twin_group_gets_its_chip_from_core() {
+        use crate::conversation_list::ConversationPreview;
+        let sara = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+        let old_leg = join_group_from(&sara, &bob, "").await;
+        let new_leg = join_group_from(&sara, &bob, "").await;
+        receive_text(&sara, &bob, &old_leg, "see you at noon").await;
+        let parent = bob
+            .messages(&old_leg)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.content == "see you at noon")
+            .unwrap();
+        // The chat list is what tells core the two legs are one chat.
+        bob.conversation_list(0, None).unwrap();
+
+        // NIP-C7 carries no preview, so only the parent row can fill the chip.
+        let quote = crate::reply::ReplyTo {
+            parent_id: parent.id,
+            parent_pubkey: parent.sender,
+            preview: None,
+        };
+        bob.send_text_with_reply(&new_leg, "works for me", Some(&quote))
+            .await
+            .unwrap();
+        let mine = bob.messages(&new_leg).unwrap();
+        let own_quote = crate::reply::ReplyTo {
+            parent_id: mine[0].id,
+            parent_pubkey: mine[0].sender,
+            preview: None,
+        };
+        bob.send_text_with_reply(&new_leg, "(that was me)", Some(&own_quote))
+            .await
+            .unwrap();
+
+        let page = bob.messages_cursor_page(&new_leg, None, None, 30).unwrap();
+        let chip_of = |text: &str| {
+            page.iter()
+                .find(|m| m.content == text)
+                .and_then(|m| m.reply.clone())
+                .unwrap()
+        };
+        let reply = chip_of("works for me");
+        assert_eq!(reply.chip, ConversationPreview::Text("see you at noon".into()), "found in the other leg");
+        assert!(!reply.parent_mine);
+        let own = chip_of("(that was me)");
+        assert_eq!(own.chip, ConversationPreview::Text("works for me".into()), "found on the page");
+        assert!(own.parent_mine);
+
+        // Out of budget: no read happens, and the chip stays empty for the host fallback.
+        let mut rows = bob.engine.messages_cursor_page(&new_leg, None, None, 1).unwrap();
+        let mut spent = 0usize;
+        bob.fill_reply_parents(&new_leg, &mut rows, &mut spent);
+        assert_eq!(rows[0].reply.as_ref().unwrap().chip, ConversationPreview::Empty);
     }
 
     #[tokio::test]

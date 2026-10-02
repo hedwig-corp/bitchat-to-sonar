@@ -650,7 +650,7 @@ actual object SonarCore {
                 durationMs = m.durationMs?.toLong(),
             )
         },
-        state = deliveryState.toUiState(mine),
+        state = delivery.toUiState(),
         stickerRef = stickerRef?.let {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         },
@@ -661,6 +661,8 @@ actual object SonarCore {
                 parentNpub = r.parentNpub,
                 // Keep blank blank — QuoteChip resolves from the local parent.
                 preview = r.preview.orEmpty(),
+                parentMine = r.parentMine,
+                chip = r.chip.toCommon(),
             )
         },
         reactions = reactions.map { t ->
@@ -682,6 +684,7 @@ actual object SonarCore {
         is uniffi.sonar_ffi.MessageClassInfo.PayDone ->
             SonarMsgClass.PayDone(paymentId, preimageHex)
         is uniffi.sonar_ffi.MessageClassInfo.CallControl -> SonarMsgClass.CallControl
+        is uniffi.sonar_ffi.MessageClassInfo.Trill -> SonarMsgClass.Trill(trillId)
     }
 
     private fun uniffi.sonar_ffi.StickerPackInfo.toCommon(): SonarStickerPack = SonarStickerPack(
@@ -703,14 +706,13 @@ actual object SonarCore {
         },
     )
 
-    private fun String.toUiState(mine: Boolean): String? {
-        if (!mine) return null
-        return when (this) {
-            "pending" -> "Sending"
-            "failed" -> "Couldn't send"
-            "sent" -> "Sent"
-            else -> "Sent"
-        }
+    /** Core decides the footer; the transcript keys its wording on these. */
+    private fun uniffi.sonar_ffi.DeliveryLabelInfo.toUiState(): String? = when (this) {
+        uniffi.sonar_ffi.DeliveryLabelInfo.RECEIVED -> null
+        uniffi.sonar_ffi.DeliveryLabelInfo.SENDING -> "Sending"
+        uniffi.sonar_ffi.DeliveryLabelInfo.UPLOADING -> "Uploading"
+        uniffi.sonar_ffi.DeliveryLabelInfo.SENT -> "Sent"
+        uniffi.sonar_ffi.DeliveryLabelInfo.FAILED -> "Couldn't send"
     }
 
     actual suspend fun publishProfile(name: String, about: String?, picture: String?) = withContext(Dispatchers.IO) {

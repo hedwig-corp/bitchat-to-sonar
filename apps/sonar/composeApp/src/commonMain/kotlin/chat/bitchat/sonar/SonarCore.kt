@@ -82,7 +82,35 @@ data class SonarReplyRef(
     /** Display-only sender snapshot used by the quote and composer chrome. */
     val author: String? = null,
     val preview: String,
+    /** The quoted message is ours. Core sets it from the quote pointer, so it
+     *  holds even when the parent is not loaded. */
+    val parentMine: Boolean = false,
+    /** What the chip shows, resolved in core across the chat's folded groups.
+     *  `Empty` for mesh replies and when core knows nothing: resolve locally. */
+    val chip: SonarConversationPreview = SonarConversationPreview.Empty,
 )
+
+/** The quote chip text for a core-resolved [SonarReplyRef.chip], with the
+ *  three typed labels both apps localize today. `null` means show the
+ *  "Message" fallback. */
+fun sonarReplyChipLabel(
+    chip: SonarConversationPreview,
+    paymentLabel: String,
+    photoLabel: String,
+    stickerLabel: String,
+): String? = when (chip) {
+    is SonarConversationPreview.Text -> chip.text.trim().ifEmpty { null }?.take(140)
+    is SonarConversationPreview.Photos,
+    is SonarConversationPreview.Videos,
+    is SonarConversationPreview.File,
+    SonarConversationPreview.VoiceNote -> photoLabel
+    SonarConversationPreview.Sticker -> stickerLabel
+    SonarConversationPreview.Payment -> paymentLabel
+    SonarConversationPreview.Empty,
+    SonarConversationPreview.VoiceCall,
+    SonarConversationPreview.Nudge,
+    SonarConversationPreview.JsonPayload -> null
+}
 
 expect fun sonarReplyUiEnabled(): Boolean
 
@@ -267,6 +295,8 @@ sealed interface SonarMsgClass {
     data class PayReceipt(val paymentId: String, val amountSats: Long) : SonarMsgClass
     data class PayDone(val paymentId: String, val preimageHex: String?) : SonarMsgClass
     data object CallControl : SonarMsgClass
+    /** `⚡TRILL|1|<id>` nudge: the nudge pill, never the raw line. */
+    data class Trill(val trillId: String) : SonarMsgClass
 }
 
 /** Account-level direct NIP-17 DM decoded from a `bitchat1:` embedded packet. */

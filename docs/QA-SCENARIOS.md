@@ -529,6 +529,30 @@ nothing by design.
   "Photo", and showed a photo's media label over its caption where iOS showed
   the caption.
 
+### QA-156 — A reply quoting the other leg of a folded chat shows its quote
+- **Platforms:** both. Quote chips come from core (`ReplyRefInfo.chip`,
+  `parent_mine`), resolved across the conversation's folded groups.
+- **Steps:** a peer and you end up with two 1:1 groups that fold into one chat. The peer sends a text in the older
+  group and a photo in the newer one. You reply to the text, then to the
+  photo, then to one of your own messages, and scroll so the parents are off
+  screen. Then quote a nudge.
+- **Expect:** every chip shows its parent: the text, "Photo", and your own
+  text with the author "You". The peer's quotes name the peer, never a blank
+  author. The nudge quote reads "Message", never the raw `⚡TRILL|…` line.
+  Both apps word each chip identically.
+- **How:** automated in core and at the app call sites. On devices it needs
+  two folded groups. `sonar-cli` has no command that opens a second 1:1, so
+  have the app and the peer each start a chat with the other before either
+  welcome lands. That leaves two direct groups, which fold.
+- **Guard:** `client.rs::a_reply_quoting_the_twin_group_gets_its_chip_from_core`,
+  `reply.rs::the_chip_prefers_a_typed_parent_then_the_snapshot_then_the_parent_text`,
+  `MarmotReplyChipTests.aChipFromCoreRendersWithoutTheParentInThisGroup`,
+  `SonarReplyTest.aCoreChipIsWordedWithTheLocalizedTypedLabels`
+- **Origin:** core transcript rows. iOS only looked for a quote's parent in
+  the reply's own group, so after a fold the chip lost its author and fell
+  back to "Message". Compose scanned the whole transcript for every row.
+  Neither app knew a nudge, so a quoted nudge showed its wire line.
+
 ### QA-157 — Scrolling up from an unread open reaches the first message
 - **Platforms:** both. On each, the bug had its own cause.
 - **Steps:** a fresh peer sends more than one page of numbered texts (iOS 35,
