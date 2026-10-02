@@ -734,6 +734,37 @@ share a zone with the app and report the zone the app shared with it.
   finding when a `main` build on the same emulator/account measures lower.
 - **How:** `android-smoke.sh` QA-050
 
+### QA-160 — A ~400-group account stays responsive and catches up
+- **Platforms:** iOS simulator (automated). **Android: not covered yet.** Its
+  Marmot DB key lives in the Android Keystore, so a store seeded on the host
+  cannot be dropped into the emulator the way iOS's DEBUG bench path allows
+  (`SONAR_BENCH_NSEC` derives the key). Follow-up path: an Android DEBUG
+  bench-identity hook mirroring iOS, or seeding through account backup +
+  "Restore account" (`examples/backup_roundtrip_driver.rs`), then the same
+  `stall-gate.sh` thresholds over logcat-captured lines.
+- **How:** `scripts/qa/large-account.sh` (add `-- --trust-core` or
+  `-- --build-core` for `ios-setup.sh`). It seeds the account on a local relay
+  (400 1:1 chats, 40 replying peers, 20 duplicate 1:1 groups, 5 team groups),
+  installs it in this worktree's QA simulator with per-chat local-time
+  overrides stored like a real toggle (group ids and the peer npub), registers
+  a push token through the DEBUG hook, then runs background/foreground rounds.
+- **Expect:** `stall-gate.sh` passes: no `main thread stalled` line, no
+  instrumented main-thread section of 250 ms or more (the probe alone only
+  sees stalls of about 500 ms and up), no `marmot workQueue` wait over 2 s,
+  and every round's `gap recovery finished` under 15 s (those two lines come
+  with R-056, #657). The core log shows `push token shared with group
+  members sent=N` with N at most 16. The script also prints the relay REQs
+  answered since launch; it is reported, not gated.
+- **Last run (2026-10-02, iPhone 17 Pro sim, 425 groups, 3 rounds):** `main`
+  FAILs on 15 `home.rows` builds of 357–418 ms and a 388 ms `home.groupsSink`.
+  With #656 + #657 the groups sink is gone and gap recovery finishes in
+  1.5–4.1 s, but 19 `home.rows` builds of about 370 ms remain, so it still
+  FAILs. Both runs answer about 1,250 relay REQs per foreground.
+- **Origin:** 2026-10-02. QA and bench accounts held a handful of groups, and
+  R-054, R-055 and R-056 shipped through them: O(groups²) main-thread walks
+  and per-member relay fan-out are invisible at five groups. Run it on any
+  change to sync, catch-up, the chat list, foreground handling or push.
+
 ### QA-051 — Cold start paints local state first
 - **Platforms:** iOS (`scripts/bench/provision-and-bench.sh`), Android
   (`scripts/bench/android-chat-open-bench.sh`)

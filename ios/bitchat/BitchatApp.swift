@@ -294,6 +294,19 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
             Self.pushLog.warning("GoogleService-Info.plist missing; Breez NDS offline receive disabled")
         }
         application.registerForRemoteNotifications()
+        #if DEBUG
+        // Large-account fixture (scripts/qa/large-account.sh): a simulator may
+        // get no APNs token, which skips the push-token share path entirely —
+        // the path R-056 found sending ~400 DMs per sync. A hex token in
+        // SONAR_BENCH_APNS_TOKEN goes through the same entry point a real
+        // token does. Gated like every bench hook on SONAR_BENCH_NSEC.
+        let benchEnv = ProcessInfo.processInfo.environment
+        if let nsec = benchEnv["SONAR_BENCH_NSEC"], !nsec.isEmpty,
+           let hex = benchEnv["SONAR_BENCH_APNS_TOKEN"],
+           let token = Data(hexString: hex), !token.isEmpty {
+            SonarPushRegistration.shared.didRegisterForRemoteNotifications(deviceToken: token)
+        }
+        #endif
         AutoBackupBackgroundScheduler.shared.register()
         return true
     }

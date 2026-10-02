@@ -375,6 +375,24 @@ final class MarmotService: @unchecked Sendable {
         "wss://nostr.relay.hedwig.sh",
     ]
 
+    /// The relays a default `MarmotService()` uses. A DEBUG build launched by
+    /// the large-account fixture (`scripts/qa/large-account.sh`) with
+    /// `SONAR_BENCH_NSEC` and `SONAR_BENCH_RELAYS` (comma-separated) uses the
+    /// fixture's local relay instead, so a 400-group account never sends its
+    /// traffic to public relays. Release builds always use the defaults.
+    static var launchRelayUrls: [String] {
+        #if DEBUG
+        let env = ProcessInfo.processInfo.environment
+        if let nsec = env["SONAR_BENCH_NSEC"], !nsec.isEmpty, let raw = env["SONAR_BENCH_RELAYS"] {
+            let urls = raw.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if !urls.isEmpty { return urls }
+        }
+        #endif
+        return defaultRelayUrls
+    }
+
     private let relayUrls: [String]
 
     /// Serial queue: serializes engine maintenance (connect, sync,
@@ -477,7 +495,7 @@ final class MarmotService: @unchecked Sendable {
     private var storeLock: MarmotStoreLock?
     #endif
 
-    init(relayUrls: [String] = MarmotService.defaultRelayUrls) {
+    init(relayUrls: [String] = MarmotService.launchRelayUrls) {
         self.relayUrls = relayUrls
     }
 

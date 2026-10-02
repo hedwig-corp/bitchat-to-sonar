@@ -19,6 +19,7 @@ scripts/qa/android-smoke.sh                          # scripted scenarios, exit 
 export QA_UDID="$(scripts/qa/ios-setup.sh)"          # QA simulator + signed Debug + log
 scripts/qa/ios-share-smoke.sh                        # share-sheet scenarios, exit = failures
 scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
+scripts/qa/large-account.sh -- --trust-core           # ~400-group account, stall/queue gate (QA-160)
 ```
 
 | Script | Purpose |
@@ -32,6 +33,8 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 | `android-smoke.sh` | Automated registry scenarios (`qaNNN` = `QA-NNN`). |
 | `ios-share-smoke.sh` | iOS share-sheet scenarios QA-080…092: shares real files into Sonar through the system share sheet (Files, Photos, and `ios-share/QAShareHost`, a stand-in third-party app), picks the chat with a fresh peer, and asserts on what the **peer** received (name, MIME, sha256). XCUITest driver in `ios-share/`, generated into `$QA_HOME/share/driver` — the app project is untouched. Pass scenario ids to run a subset. |
 | `idle-cpu.sh` | Average app CPU over a window on Android or an iOS simulator. |
+| `large-account.sh` | QA-160. Seeds a ~400-group account on a local relay (`core/sonar-core/examples/seed_large_account.rs`: 400 1:1 chats, 40 replying peers, 20 duplicate 1:1 groups, 5 team groups; no public relay), drops the store into this worktree's QA simulator, writes per-chat local-time overrides the way a toggle stores them, launches with the DEBUG bench hooks (`SONAR_BENCH_NSEC`, `SONAR_BENCH_RELAYS`, `SONAR_BENCH_APNS_TOKEN`), runs background/foreground rounds and gates with `stall-gate.sh`. Small accounts hid R-054, R-055 and R-056; this is the account shape that shows them. iOS only (Android gap in QA-160). Args after `--` go to `ios-setup.sh`. |
+| `stall-gate.sh` | Reads an app `sonar-ios.log` (optionally `--since`) and fails on any `main thread stalled` line, a `marmot workQueue` wait over `--max-wait-ms` (2000), or a foreground gap recovery missing or over `--max-gap-ms` (15000). Prints the worst stalls with the probe sections they named. Works on a log pulled from a phone too. |
 | `ios-drive.sh` | Headless iOS UI driver: one XCUITest (generated from `ios-driver/`, outside the app's Xcode project) runs a `;`-separated step script — `launch`, `tapc:<label>`, `longpress:<text>`, `tap:👍`, `expect:<text>`, `count:<text>=n`, `shot`, `tree` — against the installed app by UDID. No Simulator panel needed. |
 | `qr-decode.swift` | Print QR payloads found in a screenshot (macOS CoreImage). |
 | `core-flake-check.sh` | Reruns a crate's unit tests many times (default threads, 64 and 1) to catch tests that fail only when another test interleaves with them; exit status = failed runs. QA-125. |
