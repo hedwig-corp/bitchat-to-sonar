@@ -6088,25 +6088,21 @@ final class SonarAppStore: ObservableObject {
         groups.contains { marmotVerified[$0.id] ?? false }
     }
 
-    /// Open the DM's Marmot conversation through core: one step captures the
-    /// unread count and anchor before marking every folded group read, so the
-    /// order of capture and mark in this store can no longer zero the count.
-    /// A revisit (core reports 0) keeps the count and anchor this open took.
-    private func openMarmotConversation(_ id: String, groupId: String) {
+    /// Ask core where the unread divider goes for the count this open
+    /// captured. Read-only: the chat was already marked read the old way, at
+    /// once, so the mark and the reload it triggers land before the
+    /// transcript places the divider (QA-157). Core's anchor is used whenever
+    /// that row is loaded; the local walk stays the fallback.
+    private func fetchUnreadAnchor(_ id: String, groupId: String) {
         let groups = directMarmotGroups(matchingGroupId: groupId)
         let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        guard let unread = unreadCountAtOpenByDM[id], unread > 0 else { return }
         Task { [weak self] in
-            guard let self else { return }
-            guard let open = await self.marmot.openConversation(groupId: groupId, groupIds: ids) else {
-                self.markMarmotGroupsRead(matchingGroupId: groupId)
-                return
-            }
-            if open.unreadCount > 0 || self.unreadCountAtOpenByDM[id] == nil {
-                self.unreadCountAtOpenByDM[id] = open.unreadCount
-            }
-            if let anchor = open.unreadAnchorId {
-                self.unreadAnchorIdAtOpenByDM[id] = anchor.lowercased()
-            }
+            guard let self,
+                  let anchor = await self.marmot.conversationUnreadAnchor(groupIds: ids, unreadCount: unread),
+                  self.unreadCountAtOpenByDM[id] == unread
+            else { return }
+            self.unreadAnchorIdAtOpenByDM[id] = anchor.lowercased()
         }
     }
 
@@ -6912,11 +6908,13 @@ final class SonarAppStore: ObservableObject {
         var result = SNConversationTranscriptLoadResult.none
         for group in localTranscriptGroups(for: id) where groupIDs.contains(group.id) {
             let before = marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
-            if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
+            let loaded = await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id)
+            if loaded > 0 {
                 marmotStagedPageRescanIds.insert(group.id)
                 result.record(
                     before: before,
-                    after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+                    after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id),
+                    loaded: loaded
                 )
             }
         }
@@ -9416,7 +9414,8 @@ final class SonarAppStore: ObservableObject {
         conversationViewStates[id]?.activate()
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
-            openMarmotConversation(id, groupId: knownMarmotGroupId)
+            markMarmotGroupsRead(matchingGroupId: knownMarmotGroupId)
+            fetchUnreadAnchor(id, groupId: knownMarmotGroupId)
         }
         // Bind badge suppression as soon as the DM is considered open — even
         // when navigation used a custom `present` path that skipped `push`.

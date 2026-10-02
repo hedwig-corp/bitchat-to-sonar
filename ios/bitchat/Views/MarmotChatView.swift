@@ -2850,11 +2850,16 @@ final class MarmotChatModel: ObservableObject {
 
     /// Page the next local database window before the oldest retained canonical
     /// row. Returns true only when at least one new row was prepended.
-    func loadOlderLocalPage(groupId: String) async -> Bool {
+    /// Read one older page into the group's window. Returns how many of its
+    /// rows the window did not hold when the page merged: the growth measured
+    /// against the window at merge time, so a newest-page reload that trims the
+    /// window while this read is in flight cannot make a real page look empty.
+    @discardableResult
+    func loadOlderLocalPage(groupId: String) async -> Int {
         guard localTranscriptHasOlderByGroup[groupId] == true,
               let cursor = localTranscriptCursorByGroup[groupId],
               localTranscriptLoadingGroups.insert(groupId).inserted else {
-            return false
+            return 0
         }
         defer { localTranscriptLoadingGroups.remove(groupId) }
 
@@ -2893,9 +2898,9 @@ final class MarmotChatModel: ObservableObject {
                 localTranscriptPreservesOlderEdgeGroups.insert(groupId)
             }
             let retainedIDs = Set(canonical.map(\.id))
-            let added = page.contains {
+            let added = page.filter {
                 !latestIDs.contains($0.id) && retainedIDs.contains($0.id)
-            }
+            }.count
             localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
             localTranscriptHasOlderByGroup[groupId] = rawPage.count > pageCount
 
@@ -2912,22 +2917,25 @@ final class MarmotChatModel: ObservableObject {
                 localTranscriptPreservesOlderEdgeGroups.remove(groupId)
             }
             self.errorText = Self.describe(error)
-            return false
+            return 0
         }
     }
 
-    func loadOlderLocalPageWhenAvailable(groupId: String) async -> Bool {
+    /// [`loadOlderLocalPage`] that waits out a loader already busy for this
+    /// group. Returns the rows the page added (0: nothing new).
+    func loadOlderLocalPageWhenAvailable(groupId: String) async -> Int {
         for attempt in 0..<Self.localTranscriptBusyRetryLimit {
-            if await loadOlderLocalPage(groupId: groupId) { return true }
+            let added = await loadOlderLocalPage(groupId: groupId)
+            if added > 0 { return added }
             guard localTranscriptLoadingGroups.contains(groupId),
-                  attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
+                  attempt + 1 < Self.localTranscriptBusyRetryLimit else { return 0 }
             do {
                 try await Task.sleep(nanoseconds: 50_000_000)
             } catch {
-                return false
+                return 0
             }
         }
-        return false
+        return 0
     }
 
     func loadNewestLocalPageWhenAvailable(groupId: String) async -> Bool {
@@ -3384,19 +3392,9 @@ final class MarmotChatModel: ObservableObject {
         return task
     }
 
-    /// Open a conversation through core (`openConversation`): the badge
-    /// clears at once, core captures unread + anchor and marks the folded set
-    /// read, then the counts reconcile. nil when core could not answer.
-    func openConversation(groupId: String, groupIds: [String]) async -> MarmotService.ConversationOpen? {
-        let ids = groupIds.isEmpty ? [groupId] : groupIds
-        for id in ids {
-            unreadSuppressGroupIds.insert(id)
-            unreadByGroup[id] = nil
-        }
-        let open = await service.openConversation(groupId: groupId)
-        for id in ids { unreadSuppressGroupIds.remove(id) }
-        publishUnread(from: await service.conversationSummaries())
-        return open
+    /// Core's unread anchor for the count an open captured (read-only).
+    func conversationUnreadAnchor(groupIds: [String], unreadCount: UInt64) async -> String? {
+        await service.conversationUnreadAnchor(groupIds: groupIds, unreadCount: unreadCount)
     }
 
     func markConversationRead(groupId: String) {

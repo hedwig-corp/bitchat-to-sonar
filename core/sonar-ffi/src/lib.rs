@@ -2079,6 +2079,24 @@ impl SonarNode {
         self.client.mark_conversation_read(&group_id_hex);
     }
 
+    /// The unread divider's row for `unread_count` across `group_id_hexes`,
+    /// without marking anything read. iOS captures the count at push and marks
+    /// read itself; this is core's anchor for that count (hex), or nil.
+    pub fn conversation_unread_anchor(
+        &self,
+        group_id_hexes: Vec<String>,
+        unread_count: u64,
+    ) -> FfiResult<Option<String>> {
+        let groups = group_id_hexes
+            .iter()
+            .map(|hex| parse_group_id(hex))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .client
+            .conversation_unread_anchor(&groups, unread_count)?
+            .map(|id| id.to_hex()))
+    }
+
     /// Open the conversation containing `group_id_hex`: capture the unread
     /// count and anchor (oldest unread across every folded group, own sends
     /// and hidden control lines skipped), then mark the whole set read, in one

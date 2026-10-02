@@ -2459,27 +2459,11 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    /// What core hands the transcript when a conversation opens.
-    struct ConversationOpen: Sendable, Equatable {
-        let groupIds: [String]
-        let unreadCount: UInt64
-        /// The oldest unread message; the divider goes above it.
-        let unreadAnchorId: String?
-        let newestAt: Date
-    }
-
-    /// Open the conversation containing `groupId`: core captures the unread
-    /// count and anchor, then marks the whole folded set read, in one step.
-    /// nil when the call failed (callers fall back to marking each group).
-    func openConversation(groupId: String) async -> ConversationOpen? {
+    /// Core's unread anchor (hex) for `unreadCount` across `groupIds`: the
+    /// row the divider goes above. Read-only; nil when none or on failure.
+    func conversationUnreadAnchor(groupIds: [String], unreadCount: UInt64) async -> String? {
         await runNonThrowing { service in
-            guard let open = try? service.node?.openConversation(groupIdHex: groupId) else { return nil }
-            return ConversationOpen(
-                groupIds: open.groupIds,
-                unreadCount: open.unreadCount,
-                unreadAnchorId: open.unreadAnchorId,
-                newestAt: Date(timeIntervalSince1970: TimeInterval(open.newestAtSecs))
-            )
+            (try? service.node?.conversationUnreadAnchor(groupIdHexes: groupIds, unreadCount: unreadCount)) ?? nil
         }
     }
 

@@ -2021,6 +2021,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
 
     func conversationSummaries()  -> [ConversationSummaryInfo]
 
+    /**
+     * The unread divider's row for `unread_count` across `group_id_hexes`,
+     * without marking anything read. iOS captures the count at push and marks
+     * read itself; this is core's anchor for that count (hex), or nil.
+     */
+    func conversationUnreadAnchor(groupIdHexes: [String], unreadCount: UInt64) throws  -> String?
+
     func createInviteLink(groupIdHex: String, groupName: String) throws  -> String
 
     /**
@@ -2856,6 +2863,21 @@ open func conversationSummaries() -> [ConversationSummaryInfo]  {
     return try!  FfiConverterSequenceTypeConversationSummaryInfo.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_conversation_summaries(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * The unread divider's row for `unread_count` across `group_id_hexes`,
+     * without marking anything read. iOS captures the count at push and marks
+     * read itself; this is core's anchor for that count (hex), or nil.
+     */
+open func conversationUnreadAnchor(groupIdHexes: [String], unreadCount: UInt64)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_conversation_unread_anchor(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(groupIdHexes),
+        FfiConverterUInt64.lower(unreadCount),$0
     )
 })
 }
@@ -12085,6 +12107,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_summaries() != 56244) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_unread_anchor() != 2152) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_create_invite_link() != 21411) {

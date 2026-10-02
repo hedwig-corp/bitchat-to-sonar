@@ -348,6 +348,22 @@ struct ConversationTranscriptWindowTests {
         #expect(result.movedRetainedWindow == false)
     }
 
+    /// QA-157: the group's window already held all 35 rows when `before` was
+    /// taken; a newest-page reload trimmed it to 30, and the older page put
+    /// the 5 back. The set difference reads 0, so the conversation never grew
+    /// its source limit and the top edge stalled with 01–04 in memory. What
+    /// the page itself added is the growth.
+    @Test func aPageRestoringRowsAConcurrentReloadTrimmedStillCountsAsGrowth() {
+        let all = Set((1...35).map { "message-\($0)" })
+        var result = SNConversationTranscriptLoadResult.none
+
+        result.record(before: all, after: all, loaded: 5)
+
+        #expect(result.added)
+        #expect(result.maxSourceGrowth == 5)
+        #expect(result.movedRetainedWindow == false)
+    }
+
     @Test func fullSourceLoadReportsActualRetainedWindowMovement() {
         let before = Set((30..<530).map { "message-\($0)" })
         let after = Set((0..<500).map { "message-\($0)" })

@@ -529,6 +529,28 @@ nothing by design.
   "Photo", and showed a photo's media label over its caption where iOS showed
   the caption.
 
+### QA-157 — Scrolling up from an unread open reaches the first message
+- **Platforms:** both (found on iOS).
+- **Steps:** a fresh peer sends 35 numbered texts while the app is on
+  Messages. Open the chat (it opens at the unread divider), then scroll to
+  the top.
+- **Expect:** older pages load until message 01 is on screen, in order with
+  no gap. On Android the same with 70 texts.
+- **How:** on iOS, drive it with `scripts/qa/ios-drive.sh`
+  (`tapc:<last text>;swipedown×5;tree:top`) and read the labels in the tree.
+  On Android use `scripts/qa/android-ui.sh swipe`.
+- **Guard:** `ConversationTranscriptWindowTests.aPageRestoringRowsAConcurrentReloadTrimmedStillCountsAsGrowth`
+  pins the growth measurement. It does not pin that `SonarAppStore.loadOlderDM`
+  passes the page's own count; the device run does.
+- **Origin:** core screen models (#652). Opening through core
+  `open_conversation` takes longer than the old mark-read, so its
+  conversation-changed reload lands while the first older page is in flight.
+  That reload trimmed the group's window from 35 rows to 30, the older page
+  restored the 5, and `loadOlderDM` measured growth as the set difference
+  against a snapshot taken before the trim, which read 0. The view never grew
+  its source limit, so scrolling stopped at message 05. Now growth is what the
+  page added at merge time.
+
 ## Note to Self (#339)
 
 Note to Self is a solo Marmot group marked `sonar.note-to-self.v1`: it is

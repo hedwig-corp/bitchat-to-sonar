@@ -7954,18 +7954,12 @@ impl SonarClient {
         if note_to_self {
             unread_count = 0;
         }
-        let unread_anchor_id = if unread_count == 0 {
-            None
-        } else {
-            let limit = OPEN_ANCHOR_SCAN_ROWS.min((unread_count as usize).saturating_mul(4) + 32);
-            let mut merged: Vec<ChatMessage> = Vec::new();
-            for gid in &group_ids {
-                let Ok(bytes) = hex::decode(gid) else { continue };
-                let group = GroupId::from_slice(&bytes);
-                merged.extend(self.messages_cursor_page(&group, None, None, limit)?);
-            }
-            crate::conversation_list::unread_anchor(&mut merged, unread_count)
-        };
+        let groups: Vec<GroupId> = group_ids
+            .iter()
+            .filter_map(|gid| hex::decode(gid).ok())
+            .map(|bytes| GroupId::from_slice(&bytes))
+            .collect();
+        let unread_anchor_id = self.conversation_unread_anchor(&groups, unread_count)?;
         for gid in &group_ids {
             self.mark_conversation_read(gid);
         }
@@ -7975,6 +7969,31 @@ impl SonarClient {
             unread_anchor_id,
             newest_at_secs,
         })
+    }
+
+    /// Where the "N unread" divider goes for `unread_count` across `group_ids`:
+    /// the oldest unread visible incoming row (R-017), read from at most
+    /// [`OPEN_ANCHOR_SCAN_ROWS`] rows per group. Marks nothing read.
+    ///
+    /// iOS captures the count itself when the chat is pushed and marks read at
+    /// once, as before; it asks core only for the anchor. Marking through
+    /// [`Self::open_conversation`] made the mark (and the reload it triggers)
+    /// land after the transcript had placed the divider, and the chat opened at
+    /// the tail (QA-157).
+    pub fn conversation_unread_anchor(
+        &self,
+        group_ids: &[GroupId],
+        unread_count: u64,
+    ) -> Result<Option<nostr::EventId>> {
+        if unread_count == 0 || group_ids.is_empty() {
+            return Ok(None);
+        }
+        let limit = OPEN_ANCHOR_SCAN_ROWS.min((unread_count as usize).saturating_mul(4) + 32);
+        let mut merged: Vec<ChatMessage> = Vec::new();
+        for group in group_ids {
+            merged.extend(self.engine.messages_cursor_page(group, None, None, limit)?);
+        }
+        Ok(crate::conversation_list::unread_anchor(&mut merged, unread_count))
     }
 
     fn conversation_list_rows(&self) -> Result<Vec<crate::conversation_list::ConversationListRow>> {
@@ -13608,6 +13627,26 @@ mod tests {
         let again = bob.open_conversation(&hex_of(&old_leg)).unwrap();
         assert_eq!(again.unread_count, 0, "opening marked the whole set read");
         assert_eq!(again.unread_anchor_id, None);
+
+        // The read-only anchor (iOS) gives the same row for the count the app
+        // captured, and marks nothing.
+        receive_text(&sara, &bob, &old_leg, "third new").await;
+        let legs = [old_leg.clone(), new_leg.clone()];
+        let third = bob
+            .messages(&old_leg)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.content == "third new")
+            .unwrap()
+            .id;
+        assert_eq!(bob.conversation_unread_anchor(&legs, 1).unwrap(), Some(third));
+        assert_eq!(bob.conversation_unread_anchor(&legs, 3).unwrap(), Some(first_new));
+        assert_eq!(bob.conversation_unread_anchor(&legs, 0).unwrap(), None);
+        assert_eq!(
+            bob.conversation_summary(&hex_of(&old_leg)).unwrap().unread_count,
+            1,
+            "asking for the anchor marked nothing read"
+        );
     }
 
     #[tokio::test]

@@ -730,7 +730,17 @@ on both Android and JVM), consumed by the `ChatScreen` feed filter; iOS
 
 **Also guarded by:** `conversation_index.rs::host_hidden_messages_do_not_increment_unread`, `marmot.rs::only_host_rendered_classes_are_transcript_visible`, `conversation_index.rs::mine_messages_do_not_increment_unread`, `client.rs::timezone_share_notifies_conversation_listener_without_unread`, `e2e.rs::timezone_share_does_not_notify_or_increment_unread`, `e2e.rs::kind7_reaction_does_not_notify_or_increment_unread`, `TranscriptDisplayPolicyTest.coreClassificationWinsOverTheLocalStringDecode`, `TranscriptDisplayPolicyTest.coreClassificationDecidesVisibilityForCoreRows`, `TranscriptDisplayPolicyTest.rowsWithoutCoreClassificationKeepTheStringDecode`, `client.rs::unread_anchor_skips_own_sends_and_hidden_control_lines`, `client.rs::open_conversation_anchors_at_the_oldest_unread_across_folded_groups`, `ChatListAppStateTest.openingAChatTakesTheUnreadAnchorFromCore`
 
-**The anchor is now placed in core.** `open_conversation` captures the unread count, computes the anchor with the same visibility rule the counter uses (`conversation_list::unread_anchor`: newest first over every folded group, own sends and hidden control lines skipped), and only then marks the set read. Compose (`openChat` → `openChatCoreAnchor`, preferred in `ChatScreen`'s anchor effect) and iOS (`openedDM` → `unreadAnchorIdAtOpenByDM` → the collection host's resolver hint) use that row whenever it is loaded; their own walks remain only as the fallback. Because capture and mark are one core step, the iOS ordering where `openedDM` marked read before `push` captured can no longer zero the count. Not covered: the macOS `SNMsgList` path still walks for its anchor.
+**The anchor is now placed in core.** `conversation_list::unread_anchor` applies the counter's own visibility rule: newest first over every folded group, own sends and hidden control lines skipped.
+
+- Compose calls `open_conversation`, which captures the count, places the anchor, and marks the set read in one step. `openChat` stores the result in `openChatCoreAnchor`, and `ChatScreen`'s anchor effect prefers it.
+- iOS captures the count at push and marks read at once, as before. It then asks core for the anchor alone with `conversation_unread_anchor` (read-only), which feeds `unreadAnchorIdAtOpenByDM` and the collection host's resolver hint.
+- **Rejected:** opening iOS through `open_conversation`. The core mark, and the reload it triggers, landed after the host had placed the divider, and the chat opened at the tail (QA-157).
+
+Both apps keep their own walk as the fallback when the anchored row is not loaded. That is the common case when the unread count is larger than one page: core's anchor is then above the window.
+
+Not covered:
+- The macOS `SNMsgList` path still walks locally for its anchor.
+- Neither app pages back to a core anchor that is not loaded yet.
 
 **Enforced by the compiler:** `counts_unread` has **no default** on
 `upsert_summary`; a new call site cannot silently fall back to counting
