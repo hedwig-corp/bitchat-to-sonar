@@ -136,6 +136,22 @@ pub(crate) struct CachedPushToken {
 pub(crate) struct OwnPushRegistration {
     pub encrypted_token_b64: String,
     pub server_pubkey: PublicKey,
+    /// Stable id of the (platform, token, server) registration. The ciphertext
+    /// above is re-encrypted with a fresh nonce on every registration, so it
+    /// cannot tell "already shared" from "new token".
+    pub fingerprint: String,
+}
+
+/// `OwnPushRegistration::fingerprint`: hex SHA-256 over the platform byte, the
+/// raw device token and the push server's key.
+pub(crate) fn registration_fingerprint(platform: u8, token: &[u8], server: &PublicKey) -> String {
+    use sha2::Digest;
+    let mut hasher = Sha256::new();
+    hasher.update([platform]);
+    hasher.update((token.len() as u32).to_be_bytes());
+    hasher.update(token);
+    hasher.update(server.to_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// JSON payload sent inside NIP-44 DMs (kind 447) to share encrypted push
