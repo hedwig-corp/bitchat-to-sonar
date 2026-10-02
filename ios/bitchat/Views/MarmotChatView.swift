@@ -397,7 +397,8 @@ final class MarmotChatModel: ObservableObject {
     /// no profile (mirrors Android PROFILE_MISS_TTL_SECS). `title(for:)` calls
     /// `ensureProfile` on every Home/header render, so without it a contact
     /// with no published profile re-queried every relay about twice a second,
-    /// forever, on the serial Marmot work queue that sends and syncs share.
+    /// forever. (Those fetches then ran on the serial queue sync shares; they
+    /// have their own lookup lane since R-056.)
     nonisolated static let profileMissTTL: TimeInterval = 60
     private static let localTranscriptPageLimit = TransportConfig.sonarTranscriptPageCount
     private static let localTranscriptRetainedLimit = TransportConfig.sonarTranscriptRetainedCount
@@ -2238,19 +2239,28 @@ final class MarmotChatModel: ObservableObject {
         // they double-enqueue syncForce() on the serial engine queue and the
         // first completion clears syncingInFlight while the other still runs.
         if let existing = refreshTask, !existing.isCancelled {
+            SecureLogger.info("foreground refresh: joined the one already running", category: .session)
             return
         }
         refreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.refreshTask = nil }
-            guard await self.ensureConnected() else { return }
+            let started = CFAbsoluteTimeGetCurrent()
+            func elapsedMs() -> Int { Int(((CFAbsoluteTimeGetCurrent() - started) * 1000).rounded()) }
+            guard await self.ensureConnected() else {
+                SecureLogger.info("foreground refresh: store not connected after \(elapsedMs()) ms", category: .session)
+                return
+            }
             self.syncingInFlight = true
             defer { self.syncingInFlight = false }
             guard await self.ensureRelayConnected() else {
+                SecureLogger.info("foreground refresh: relays not connected after \(elapsedMs()) ms", category: .session)
                 await self.loadLocalSummaries()
                 return
             }
+            SecureLogger.info("foreground refresh: relays ready at \(elapsedMs()) ms", category: .session)
             try? await self.service.ensureSubscriptions()
+            SecureLogger.info("foreground refresh: subscriptions ensured at \(elapsedMs()) ms", category: .session)
             try? await self.service.drainPending()
             await self.loadLocalSummaries()
             // Route the actual gap-recovery sync through the shared
@@ -2258,7 +2268,9 @@ final class MarmotChatModel: ObservableObject {
             // double-enqueue `syncForce()` on the serial engine queue. Awaiting
             // here keeps the passive indicator active through the real work;
             // local paint remains independent and already completed above.
+            SecureLogger.info("foreground refresh: gap recovery requested at \(elapsedMs()) ms", category: .session)
             _ = await self.ensureGapRecovery().value
+            SecureLogger.info("foreground refresh: gap recovery finished at \(elapsedMs()) ms", category: .session)
         }
     }
 
@@ -3209,6 +3221,7 @@ final class MarmotChatModel: ObservableObject {
     @discardableResult
     private func ensureGapRecovery() -> Task<[DrainNotificationInfo], Never> {
         if let existing = gapRecoveryTask {
+            SecureLogger.info("gap recovery: joined the syncForce already in flight", category: .session)
             return existing
         }
         gapRecoveryGeneration &+= 1
@@ -3225,6 +3238,7 @@ final class MarmotChatModel: ObservableObject {
                 if Task.isCancelled { return [DrainNotificationInfo]() }
                 self.errorText = nil
             } catch {
+                SecureLogger.info("gap recovery: syncForce failed: \(Self.describe(error))", category: .session)
                 if Task.isCancelled { return [DrainNotificationInfo]() }
                 // A suspend abort is not a relay failure — leave the banner alone.
                 if !Self.isSuspendInterrupted(error) {
