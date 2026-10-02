@@ -426,6 +426,22 @@ nothing by design.
 - **Origin:** reported 2026-10-01 on 1.15.2/47 (iPhone 14 Pro Max, 400
   groups). R-055.
 
+### QA-158 — Coming back to the app does not freeze, with local time toggled per chat
+- **Platforms:** iOS (manual, measured by the stall probe). Compose builds
+  its share list in a coroutine, not on the UI thread.
+- **Steps:** on an account with hundreds of chats, turn **Share local time**
+  on or off for at least one chat (that stores per-chat overrides). Background
+  the app for a minute, bring it back, and scroll the chat list right away.
+  Repeat a few times. Pull `sonar-ios.log` and grep `main thread stalled`.
+- **Expect:** no `main thread stalled` line within a few seconds of
+  `became-active`, and `fg.timezoneShare` / `home.groupsSink` never in a
+  `sections=` list. Before the fix: two stalls of 0.65–1.1 s on every
+  activation (8 of 8 on a 400-group account).
+- **How:** manual on a device; `TimezoneShareGroupIdsTests` guards the cost
+  (one peer-key computation per group) and the inheritance rules.
+- **Origin:** reported 2026-10-02 on 1.15.3/48 ("the UI freezes a bit while
+  passing from offline to online"). R-055 (reopened).
+
 ## Home and channels
 
 ### QA-030 — "Around you" names the selected tier
