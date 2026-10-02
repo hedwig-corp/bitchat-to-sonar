@@ -3173,6 +3173,65 @@ waits up to `PUSH_TOKEN_RESHARE_SECS` (7 days) for our token unless it changes.
 - *Dedupe by the token ciphertext.* It is re-encrypted with a fresh nonce on
   every registration, so it never matches.
 
+## R-057 — Resolving one chat must not scan every Marmot group
+
+**Invariant:** `SonarAppStore` resolves a chat's groups through
+`MarmotChatModel.groupIndex` (`SNMarmotGroupIndex`: groups by id, 1:1 groups
+by counterpart), built once per `groups` value and own npub. `marmotGroup(byId:)`
+and `directMarmotGroups(matching:)` are dictionary reads, so a pass over every
+chat (Home rows' mute flags, the local-time share list) stays O(groups).
+`isChatMuted` returns early when nothing is muted, as Compose does.
+
+**Breaks as:** the chat list freezes for about 370 ms on every rebuild, and
+it rebuilds several times per foreground while catch-up lands: roughly 4 s of
+a mostly blocked main thread on a 426-group account. Found by the QA-160
+fixture on 2026-10-02, after #656 and #657: 19 `home.rows` sections of
+~370 ms over 3 foregrounds. `sample` put 267 of 272 `buildHomeDMRows`
+samples in `row.muted = isChatMuted(row.id)`. That call runs `muteKeys`,
+then `localTranscriptGroups`, then `directMarmotGroups(matching:)`, a filter
+over every group deriving each one's peer key: 406 rows × 426 groups per
+rebuild. The probe never logged it as a stall: 370 ms finishes before its
+500 ms tick.
+
+**Why:** second occurrence of R-055's walk. R-055 (#656) made the local-time
+share list stop calling `muteKeys` per group. The Home rows went on calling it
+per row through `isChatMuted`, and `muteKeys` itself still scanned. This time
+the scan is fixed where it lives, in the group lookups every caller shares,
+not caller by caller.
+
+**Apple call sites:** `SonarAppStore.dmRows` → `buildHomeDMRows` (row mute
+flags; `directGroupsByPeer` now read from the index) → `isChatMuted` →
+`muteKeys(forChatId:)` → `localTranscriptGroups(for:)` →
+`directMarmotGroups(matchingGroupId:)`; `marmotGroup(byId:)`,
+`marmotConvId(forGroup:)`; `MarmotChatModel.groups` didSet drops the index.
+
+**Compose call site:** `SonarAppState.isChatMuted` already returns false when
+no chat is muted. With mutes it calls `muteIdsFor`, which scans `chats`,
+but only for the rows `LazyColumn` composes (`App.kt`), so the cost is
+O(visible rows × chats), not O(chats²). Not changed here.
+
+**Guarded by:** `HomeRowsGroupIndexTests.aChatListRebuildDerivesEachGroupsPeerKeyABoundedNumberOfTimes`
+(drives the real `dmRows` with a mute present; counts `snDirectMarmotPeerKey`
+derivations; the scan made 25,600+ for 160 groups),
+`HomeRowsGroupIndexTests.aMuteOnOneOfTwoGroupsWithThePersonMutesTheirRow`,
+`HomeRowsGroupIndexTests.theIndexFollowsGroupsAndOwnNpub`.
+
+**Not guarded:** wall-clock time. The QA-160 fixture is the timing check
+(`scripts/qa/large-account.sh`, `stall-gate.sh` fails on any instrumented
+main-thread section of 250 ms or more). Other per-chat helpers that still
+scan (`callDisplayName`, `marmotGroup(forNpub:)`) run for one chat at a time
+today; a new pass over every chat through them would bring this back.
+
+**Rejected:**
+- *Only the early-out on an empty mute store.* Parity with Compose and free,
+  but one muted chat put every rebuild back on the quadratic path.
+- *Compute the mute flags in a dedicated pure helper, as #656 did for the
+  share list.* That fixes one caller again; the next pass over every chat
+  through `muteKeys` would regress the same way.
+- *Invalidate a cached index from the `$groups` sink.* `@Published` emits in
+  willSet, so a lookup in that sink would rebuild the index from the old
+  groups and keep it. The cache is dropped in `didSet` and rebuilt lazily.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**

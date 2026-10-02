@@ -794,11 +794,27 @@ share a zone with the app and report the zone the app shared with it.
   FAILs on 15 `home.rows` builds of 357–418 ms and a 388 ms `home.groupsSink`.
   With #656 + #657 the groups sink is gone and gap recovery finishes in
   1.5–4.1 s, but 19 `home.rows` builds of about 370 ms remain, so it still
-  FAILs. Both runs answer about 1,250 relay REQs per foreground.
+  FAILs. With #659 (R-057) on top it PASSes: `home.rows` median 38 ms and
+  gap recovery 1.0–2.0 s. All runs answer about 1,250 relay REQs per
+  foreground.
 - **Origin:** 2026-10-02. QA and bench accounts held a handful of groups, and
   R-054, R-055 and R-056 shipped through them: O(groups²) main-thread walks
   and per-member relay fan-out are invisible at five groups. Run it on any
   change to sync, catch-up, the chat list, foreground handling or push.
+
+### QA-161 — The chat list rebuilds in linear time with a muted chat
+- **Platforms:** iOS. Compose returns early from `isChatMuted` with no mutes
+  and resolves mute ids only for composed `LazyColumn` rows.
+- **Steps:** on an account with a few hundred chats (the QA-160 fixture),
+  mute one chat, then background and foreground the app a few times while
+  catch-up lands.
+- **Expect:** no `main-thread section slow name=home.rows` line of 250 ms or
+  more; the list scrolls while the rows rebuild.
+- **Guarded by:** `HomeRowsGroupIndexTests.aChatListRebuildDerivesEachGroupsPeerKeyABoundedNumberOfTimes`
+  (R-057).
+- **Origin:** 2026-10-02, the QA-160 fixture: 19 `home.rows` builds of
+  ~370 ms over 3 foregrounds at 425 groups, each row's mute lookup scanning
+  every group.
 
 ### QA-051 — Cold start paints local state first
 - **Platforms:** iOS (`scripts/bench/provision-and-bench.sh`), Android

@@ -6072,16 +6072,20 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func marmotGroup(byId groupId: String) -> MarmotService.MarmotGroup? {
-        marmot.groups.first { $0.id == groupId }
+        marmot.groupIndex.groupsById[groupId]
     }
 
     private func directMarmotPeerKey(in group: MarmotService.MarmotGroup) -> String? {
         snDirectMarmotPeerKey(for: group, ownNpub: marmot.npub)
     }
 
+    /// Every 1:1 group with `group`'s counterpart, in `groups` order. Reads the
+    /// index: this runs once per chat in passes over every chat (home rows'
+    /// mute flags, the local-time share list), and a filter over all groups
+    /// here made those passes O(groups²) (R-057).
     private func directMarmotGroups(matching group: MarmotService.MarmotGroup) -> [MarmotService.MarmotGroup] {
         guard let peerKey = directMarmotPeerKey(in: group) else { return [group] }
-        let groups = marmot.groups.filter { directMarmotPeerKey(in: $0) == peerKey }
+        let groups = marmot.groupIndex.directGroupsByPeer[peerKey] ?? []
         return groups.isEmpty ? [group] : groups
     }
 
@@ -6585,7 +6589,7 @@ final class SonarAppStore: ObservableObject {
         // (the DM screen renders both transcripts merged) instead of
         // showing a second row.
         var marmotRows: [SNDMRow] = []
-        let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
+        let directGroupsByPeer = marmot.groupIndex.directGroupsByPeer
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
             let last = marmot.homeRowMessage(groupId: group.id)
@@ -10626,7 +10630,7 @@ final class SonarAppStore: ObservableObject {
             keys.insert(group.id)
             keys.insert(Self.marmotIDPrefix + group.id)
             keys.insert(chatAlertKey(marmotConvId(forGroup: group.id)))
-            if let full = marmot.groups.first(where: { $0.id == group.id }),
+            if let full = marmotGroup(byId: group.id),
                marmot.isDirectGroup(full),
                let other = full.memberNpubs.first(where: { $0 != marmot.npub }) {
                 keys.insert(other)
@@ -10650,10 +10654,13 @@ final class SonarAppStore: ObservableObject {
     }
 
     func isChatMuted(_ id: String) -> Bool {
+        // Nothing muted: skip building the key set (Compose `isChatMuted`
+        // does the same). The Home rows ask this for every chat (R-057).
+        guard !SonarChatMuteStore.shared.mutedUntil.isEmpty else { return false }
         // Match the full folded-id set muteChat stores — not just the raw id /
         // canonical peer key — so a mute keyed by group id / npub still wins
         // when the alert path carries a different shape for the same chat.
-        SonarChatMuteStore.shared.isMuted(anyOf: muteKeys(forChatId: id))
+        return SonarChatMuteStore.shared.isMuted(anyOf: muteKeys(forChatId: id))
     }
 
     /// Mute end for the chat (`.distantFuture` = until turned back on).
@@ -10678,7 +10685,7 @@ final class SonarAppStore: ObservableObject {
     /// A Marmot group folded into a Sonar peer's conversation replies on
     /// that conversation id, so sendDm routes by current reachability.
     private func marmotConvId(forGroup groupId: String) -> String {
-        if let group = marmot.groups.first(where: { $0.id == groupId }),
+        if let group = marmotGroup(byId: groupId),
            let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub }),
            let sonarPeerId = sonarProfiles.first(where: { $0.value.npub == otherNpub })?.key {
             return sonarPeerId
