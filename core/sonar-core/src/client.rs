@@ -2242,6 +2242,11 @@ pub struct SonarClient {
     /// starting a second one (connect, every sync and token updates all call
     /// `share_push_token_with_groups`).
     push_token_share_in_flight: Arc<AtomicBool>,
+    /// The last push-token pass left members without our current token. The
+    /// idle heartbeat (`ensure_subscriptions`) then sends the next batch, so
+    /// after a token change every member converges within minutes instead of
+    /// one batch per sync.
+    push_token_share_backlog: Arc<AtomicBool>,
     /// Incoming-message notifications produced by the forced-sync gap-recovery
     /// fetch in `sync_inner`. A push-wake host calls `sync_force()` then
     /// `drain_pending_marmot()`; the recovered messages are stored by the sync
@@ -2805,6 +2810,7 @@ impl SonarClient {
             sticker_ref_prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
             push_token_share_in_flight: Arc::new(AtomicBool::new(false)),
+            push_token_share_backlog: Arc::new(AtomicBool::new(false)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
@@ -6962,6 +6968,11 @@ impl SonarClient {
         // The local-time reshare trickles on this heartbeat: a batch per call,
         // so it spreads over minutes and stops with the app in background.
         self.advance_timezone_share_trickle().await;
+        // Same pacing for the push token: a batch per heartbeat while members
+        // still lack it, nothing once they all have it.
+        if self.push_token_share_backlog.load(Ordering::Acquire) {
+            self.share_push_token_with_groups().await;
+        }
         // The apps use this lightweight idle path instead of `sync()`. Retry
         // the durable outbox here too so a transient outage self-heals after
         // relay reconnection even when the user does not tap the retry button.
@@ -8996,14 +9007,18 @@ impl SonarClient {
             }
         }
         let now = Timestamp::now().as_secs();
-        let due = {
+        let mut due = {
             let state = self.sync_state.lock().unwrap();
             plan_push_token_shares(
                 members,
                 |member_hex| state.push_token_share_due(member_hex, &reg.fingerprint, now),
-                PUSH_TOKEN_SHARE_BATCH,
+                PUSH_TOKEN_SHARE_BATCH + 1,
             )
         };
+        // One past the batch means more are waiting: the heartbeat continues.
+        let backlog = due.len() > PUSH_TOKEN_SHARE_BATCH;
+        due.truncate(PUSH_TOKEN_SHARE_BATCH);
+        self.push_token_share_backlog.store(backlog, Ordering::Release);
         if due.is_empty() {
             in_flight.store(false, Ordering::Release);
             return;
@@ -10200,6 +10215,81 @@ mod tests {
             .await
             .expect("fetch gift wraps");
         assert_eq!(wraps.len(), 1, "one push-token DM for Bob across two groups and two passes");
+    }
+
+    /// After a token change, members beyond one batch must not wait for the
+    /// next sync: the pass flags a backlog, and later passes (the heartbeat
+    /// runs one while the flag is set) send the rest, then clear it.
+    #[tokio::test]
+    async fn push_token_share_backlog_drains_then_clears() {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let relay_url = relay.url().await;
+        let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+            .await
+            .expect("alice connects");
+        let group_relays = vec![relay_url.clone()];
+        let peers: Vec<MarmotEngine> = (0..PUSH_TOKEN_SHARE_BATCH + 2)
+            .map(|_| MarmotEngine::in_memory(Identity::generate()))
+            .collect();
+        for (i, peer) in peers.iter().enumerate() {
+            let kp = peer.key_package_event(group_relays.clone()).expect("peer kp");
+            let creation = alice
+                .engine
+                .create_group(&format!("dm {i}"), vec![kp], group_relays.clone())
+                .expect("alice creates group");
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .expect("merge");
+        }
+        let wait_idle = || async {
+            for _ in 0..400 {
+                if !alice.push_token_share_in_flight.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("push token share batch never finished");
+        };
+        alice
+            .register_push_token("apns", b"device-token", &Keys::generate().public_key().to_hex())
+            .await
+            .expect("register");
+        wait_idle().await;
+        assert!(
+            alice.push_token_share_backlog.load(Ordering::Acquire),
+            "{} members, batch of {}: a backlog remains",
+            peers.len(),
+            PUSH_TOKEN_SHARE_BATCH
+        );
+
+        alice.share_push_token_with_groups().await;
+        wait_idle().await;
+        assert!(
+            !alice.push_token_share_backlog.load(Ordering::Acquire),
+            "the second pass reached everyone"
+        );
+
+        let reader = Client::default();
+        reader.add_relay(relay_url).await.expect("reader relay");
+        reader.connect().await;
+        let mut received = 0;
+        for peer in &peers {
+            let wraps = reader
+                .fetch_events(
+                    Filter::new()
+                        .kind(Kind::GiftWrap)
+                        .pubkey(peer.identity().public_key()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("fetch gift wraps");
+            assert_eq!(wraps.len(), 1, "each member exactly once");
+            received += 1;
+        }
+        assert_eq!(received, peers.len());
     }
 
     #[tokio::test]

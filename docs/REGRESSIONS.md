@@ -3082,7 +3082,9 @@ serial `MarmotService.workQueue` that `syncForce` shares. In core, the push
 token is shared with each group member once per token (durable record in the
 sync sidecar, re-sent weekly), at most `PUSH_TOKEN_SHARE_BATCH` per pass, most
 recently active chats first, and from a spawned task, so no sync waits for
-those relay acks.
+those relay acks. While a pass leaves members without the current token, the
+idle heartbeat (`ensure_subscriptions`) sends the next batch, so a token change
+reaches everyone within minutes rather than one batch per sync.
 
 **Breaks as:** missed messages stay missing after the app comes back. On
 1.15.2–1.15.3 the foreground gap sync never ran in a visit (0 of ~60
@@ -3118,7 +3120,9 @@ there; it gets the core push-token fix unchanged.
 
 **Guarded by:** `client.rs::push_token_share_dms_each_member_once_across_passes`
 (mock relay; Bob shares two groups with Alice; two passes must deliver one DM,
-not four), `client.rs::push_token_share_plan_takes_each_member_once_and_caps_the_batch`,
+not four), `client.rs::push_token_share_backlog_drains_then_clears` (18
+members: the first pass flags a backlog, the second reaches the rest, each
+member exactly once), `client.rs::push_token_share_plan_takes_each_member_once_and_caps_the_batch`,
 `client.rs::push_token_share_is_due_only_for_a_new_token_or_after_the_reshare_window`,
 `client.rs::push_token_share_record_survives_a_restart`,
 `MarmotLookupLaneTests.profileFetchDoesNotWaitBehindTheWorkQueue`,
@@ -3129,8 +3133,13 @@ not four), `client.rs::push_token_share_plan_takes_each_member_once_and_caps_the
 on the old routing), and `MarmotLookupLaneTests.syncForceStillRunsOnTheWorkQueue`
 (control: the seam really parks the queue).
 
+**Measured after the fix** (same iPhone, 2026-10-02 22:40): gap recovery
+requested 2.1 s after activation and finished at 3.2 s; no work-queue op
+waited over 1 s; the push-token share sent 16 in the background.
+
 **Not guarded:** that `refreshAfterForeground` reaches `syncForce` in a short
-visit; its timing markers in `sonar-ios.log` are the check. Other relay work
+visit (its timing markers in `sonar-ios.log` are the check), and that
+`ensure_subscriptions` runs the backlog pass (code only). Other relay work
 still on `workQueue` (`retryOutbox`, the timezone calls, `ensureSubscriptions`'
 catch-up) is bounded but not lane-tested. A member who wipes their push cache
 waits up to `PUSH_TOKEN_RESHARE_SECS` (7 days) for our token unless it changes.
