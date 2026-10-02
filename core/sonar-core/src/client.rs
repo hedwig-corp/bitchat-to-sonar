@@ -1070,6 +1070,23 @@ fn take_catchup_batch(
     batch
 }
 
+/// The members due a push-token share this pass, in the order given (most
+/// recently active chats first): each member once however many groups we
+/// share, only those `due` says lack our current token, at most `batch`.
+fn plan_push_token_shares<T>(
+    members: Vec<(String, T)>,
+    due: impl Fn(&str) -> bool,
+    batch: usize,
+) -> Vec<(String, T)> {
+    let mut seen = HashSet::new();
+    members
+        .into_iter()
+        .filter(|(member_hex, _)| seen.insert(member_hex.clone()))
+        .filter(|(member_hex, _)| due(member_hex))
+        .take(batch)
+        .collect()
+}
+
 /// Catch-up inputs for one group that has a local transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupCatchupCandidate {
@@ -1391,6 +1408,16 @@ impl GroupCatchupGate {
 }
 
 const SYNC_STATE_VERSION: u32 = 1;
+
+/// Push-token share DMs sent per pass, one gift wrap per group member. The
+/// rest go out on later passes, so a 400-group account no longer sends a DM
+/// per member on every sync (R-056).
+const PUSH_TOKEN_SHARE_BATCH: usize = 16;
+
+/// A member who already holds our current token gets it again after this
+/// long, so one who lost their cache (reinstall) still learns it, at a cost of
+/// one DM per member per week instead of one per sync.
+const PUSH_TOKEN_RESHARE_SECS: u64 = 7 * 24 * 60 * 60;
 const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
 /// Passes on which MDK may keep answering Failed for one event before the
 /// sync layer retires it. A Failed record can turn Retryable after an MLS
@@ -1485,6 +1512,19 @@ struct SyncStateDisk {
     /// older sidecars.
     #[serde(default)]
     failed_event_passes: HashMap<String, FailedEventPasses>,
+    /// Which push token each group member already holds from us
+    /// (`share_push_token_with_groups`). Absent in older sidecars, which
+    /// re-share once.
+    #[serde(default)]
+    push_token_shared: HashMap<String, PushTokenShareMark>,
+}
+
+/// One member's copy of our push token: which token (its fingerprint, not the
+/// ciphertext, which changes on every registration) and when it was sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PushTokenShareMark {
+    fingerprint: String,
+    shared_at_secs: u64,
 }
 
 /// Point-in-time relay/sync diagnostics, serialized into the exported debug
@@ -1530,6 +1570,7 @@ struct SyncState {
     processed_event_order: VecDeque<String>,
     failed_event_passes: HashMap<String, FailedEventPasses>,
     failed_event_order: VecDeque<String>,
+    push_token_shared: HashMap<String, PushTokenShareMark>,
     dirty: bool,
 }
 
@@ -1545,12 +1586,13 @@ impl SyncState {
             .and_then(|bytes| serde_json::from_slice::<SyncStateDisk>(&bytes).ok())
             .filter(|state| state.version == SYNC_STATE_VERSION);
 
-        let (disk_watermark, processed_event_ids, failed_event_passes) = disk
+        let (disk_watermark, processed_event_ids, failed_event_passes, push_token_shared) = disk
             .map(|state| {
                 (
                     state.watermark_secs,
                     state.processed_event_ids,
                     state.failed_event_passes,
+                    state.push_token_shared,
                 )
             })
             .unwrap_or_default();
@@ -1559,6 +1601,7 @@ impl SyncState {
         let mut state = Self::new(path, watermark_secs, processed_event_ids);
         state.failed_event_order = failed_event_passes.keys().cloned().collect();
         state.failed_event_passes = failed_event_passes;
+        state.push_token_shared = push_token_shared;
         state
     }
 
@@ -1570,6 +1613,7 @@ impl SyncState {
             processed_event_order: VecDeque::new(),
             failed_event_passes: HashMap::new(),
             failed_event_order: VecDeque::new(),
+            push_token_shared: HashMap::new(),
             dirty: false,
         };
         for id in processed_event_ids {
@@ -1674,6 +1718,29 @@ impl SyncState {
         }
     }
 
+    /// True when `member_hex` does not hold the token `fingerprint` names, or
+    /// got it longer ago than `PUSH_TOKEN_RESHARE_SECS`.
+    fn push_token_share_due(&self, member_hex: &str, fingerprint: &str, now_secs: u64) -> bool {
+        match self.push_token_shared.get(member_hex) {
+            Some(mark) => {
+                mark.fingerprint != fingerprint
+                    || now_secs.saturating_sub(mark.shared_at_secs) >= PUSH_TOKEN_RESHARE_SECS
+            }
+            None => true,
+        }
+    }
+
+    fn mark_push_token_shared(&mut self, member_hex: String, fingerprint: &str, now_secs: u64) {
+        self.push_token_shared.insert(
+            member_hex,
+            PushTokenShareMark {
+                fingerprint: fingerprint.to_owned(),
+                shared_at_secs: now_secs,
+            },
+        );
+        self.dirty = true;
+    }
+
     fn save_if_dirty(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
@@ -1692,6 +1759,7 @@ impl SyncState {
             watermark_secs: self.watermark_secs,
             processed_event_ids: self.processed_event_order.iter().cloned().collect(),
             failed_event_passes: self.failed_event_passes.clone(),
+            push_token_shared: self.push_token_shared.clone(),
         };
         let bytes = serde_json::to_vec(&disk)?;
         let tmp = sync_state_tmp_path(path);
@@ -2170,6 +2238,10 @@ pub struct SonarClient {
     sticker_ref_prefetch_inflight: StickerRefPrefetchInflight,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
+    /// A push-token share batch is being sent; later triggers skip instead of
+    /// starting a second one (connect, every sync and token updates all call
+    /// `share_push_token_with_groups`).
+    push_token_share_in_flight: Arc<AtomicBool>,
     /// Incoming-message notifications produced by the forced-sync gap-recovery
     /// fetch in `sync_inner`. A push-wake host calls `sync_force()` then
     /// `drain_pending_marmot()`; the recovered messages are stored by the sync
@@ -2732,6 +2804,7 @@ impl SonarClient {
             )),
             sticker_ref_prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
+            push_token_share_in_flight: Arc::new(AtomicBool::new(false)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
@@ -6999,6 +7072,7 @@ impl SonarClient {
             processed_event_order: state.processed_event_order.clone(),
             failed_event_passes: state.failed_event_passes.clone(),
             failed_event_order: state.failed_event_order.clone(),
+            push_token_shared: state.push_token_shared.clone(),
             dirty: state.dirty,
         }
     }
@@ -8829,6 +8903,7 @@ impl SonarClient {
         let own_reg = push::OwnPushRegistration {
             encrypted_token_b64: content.clone(),
             server_pubkey,
+            fingerprint: push::registration_fingerprint(plat, token, &server_pubkey),
         };
         *self.own_push_registration.lock().unwrap() = Some(own_reg);
 
@@ -8838,20 +8913,30 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Send our encrypted push token to every member of every joined group
-    /// via a NIP-44 encrypted DM (kind 447). Group members cache this to send
-    /// sender-side notifications to us.
+    /// Send our encrypted push token to the group members who do not hold it
+    /// yet, via NIP-44 gift-wrapped DMs (kind 447). Group members cache it to
+    /// send sender-side notifications to us.
+    ///
+    /// Bounded (R-056): each member once however many groups we share; only
+    /// members whose copy is missing, for another token, or older than
+    /// `PUSH_TOKEN_RESHARE_SECS`; members of the most recently active chats
+    /// first; at most `PUSH_TOKEN_SHARE_BATCH` per pass, the rest on later
+    /// passes. It used to DM every member of every group on every sync: about
+    /// 400 sequential publishes on a 400-group account, 33 s during which the
+    /// iOS engine queue sat inside `sync_force`. The publishes now run in a
+    /// spawned task, so no sync waits for relay acks, and one batch is in
+    /// flight at a time.
     async fn share_push_token_with_groups(&self) {
+        // A push wake (frozen cursor) has seconds and never saves its sync
+        // state, so it must not fan out.
+        if self.sync_watermark_frozen.load(Ordering::Relaxed) {
+            return;
+        }
         // Relay guard: skip when zero relays report `RelayStatus::Connected`
         // (empty write-relay set → `NoRelaysSpecified`, or configured relays
-        // not yet attached). The per-recipient gift-wrapped DM below goes
-        // through `self.nostr.send_event`; walking groups × members before a
-        // relay can accept floods the log (~275/session on a real 43-group
-        // account). This runs at the end of every sync/wake (`sync_inner`, the
-        // live short-circuit, and the token-update path), often before relays
-        // attach — deferring is free and never blocks chat open/send/scroll/
-        // paint. Take the relay map from the `.await` before touching any std
-        // Mutex so no guard is held across it.
+        // not yet attached). This runs at the end of every sync/wake, often
+        // before relays attach; deferring is free. Take the relay map from the
+        // `.await` before touching any std Mutex so no guard is held across it.
         let connected_relays = self
             .nostr
             .relays()
@@ -8870,15 +8955,60 @@ impl SonarClient {
         let own_reg = self.own_push_registration.lock().unwrap().clone();
         let Some(reg) = own_reg else { return };
 
+        if self.push_token_share_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // The flag is claimed: every return below must clear it, and the
+        // spawned task clears it when its batch is done.
+        let in_flight = self.push_token_share_in_flight.clone();
+
         let groups = match self.engine.groups() {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!(%e, "push token share: failed to list groups");
+                in_flight.store(false, Ordering::Release);
                 return;
             }
         };
-
+        let recency: HashMap<String, usize> = self
+            .conversation_summaries()
+            .into_iter()
+            .enumerate()
+            .map(|(rank, summary)| (summary.group_id_hex, rank))
+            .collect();
+        let mut ordered_groups: Vec<_> = groups.iter().collect();
+        ordered_groups.sort_by_key(|group| {
+            recency
+                .get(&hex::encode(group.mls_group_id.as_slice()))
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         let my_pubkey = self.engine.identity().public_key();
+        let mut members: Vec<(String, PublicKey)> = Vec::new();
+        for group in ordered_groups {
+            let Ok(group_members) = self.engine.members(&group.mls_group_id) else {
+                continue;
+            };
+            for member in group_members {
+                if member != my_pubkey {
+                    members.push((member.to_hex(), member));
+                }
+            }
+        }
+        let now = Timestamp::now().as_secs();
+        let due = {
+            let state = self.sync_state.lock().unwrap();
+            plan_push_token_shares(
+                members,
+                |member_hex| state.push_token_share_due(member_hex, &reg.fingerprint, now),
+                PUSH_TOKEN_SHARE_BATCH,
+            )
+        };
+        if due.is_empty() {
+            in_flight.store(false, Ordering::Release);
+            return;
+        }
+
         let payload = crate::push::PushTokenSharePayload {
             encrypted_token: reg.encrypted_token_b64.clone(),
             server_pubkey: reg.server_pubkey.to_hex(),
@@ -8887,33 +9017,54 @@ impl SonarClient {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "push token share: JSON serialization failed");
+                in_flight.store(false, Ordering::Release);
                 return;
             }
         };
-
-        for group in &groups {
-            let members = match self.engine.members(&group.mls_group_id) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            for member in &members {
-                if member == &my_pubkey {
-                    continue;
-                }
-                if let Err(e) = self.send_push_token_dm(member, &payload_json).await {
-                    tracing::debug!(
-                        recipient = %member,
-                        %e,
-                        "push token share DM failed"
-                    );
-                }
+        // Wrapping only needs our identity keys; the store is not touched once
+        // the task is spawned.
+        let mut wrapped = Vec::with_capacity(due.len());
+        for (member_hex, member) in due {
+            match self.build_push_token_dm(&member, &payload_json).await {
+                Ok(event) => wrapped.push((member_hex, event)),
+                Err(e) => tracing::debug!(recipient = %member_hex, %e, "push token share DM wrap failed"),
             }
         }
-        tracing::info!("push token shared with group members");
+
+        let nostr = self.nostr.clone();
+        let sync_state = self.sync_state.clone();
+        let frozen = self.sync_watermark_frozen.clone();
+        let fingerprint = reg.fingerprint;
+        tokio::spawn(async move {
+            let mut sent = 0usize;
+            for (member_hex, event) in wrapped {
+                match nostr.send_event(&event).await {
+                    Ok(output) if !output.success.is_empty() => {
+                        sync_state.lock().unwrap().mark_push_token_shared(
+                            member_hex,
+                            &fingerprint,
+                            Timestamp::now().as_secs(),
+                        );
+                        sent += 1;
+                    }
+                    Ok(_) => tracing::debug!(recipient = %member_hex, "push token share DM: no relay accepted it"),
+                    Err(e) => tracing::debug!(recipient = %member_hex, %e, "push token share DM failed"),
+                }
+            }
+            // One sidecar write for the batch, not one per member.
+            if !frozen.load(Ordering::Relaxed) {
+                if let Err(e) = sync_state.lock().unwrap().save_if_dirty() {
+                    tracing::warn!(%e, "push token share: saving the shared record failed");
+                }
+            }
+            in_flight.store(false, Ordering::Release);
+            tracing::info!(sent, "push token shared with group members");
+        });
     }
 
-    /// NIP-44 encrypted DM carrying our push token info (kind 447).
-    async fn send_push_token_dm(&self, recipient: &PublicKey, payload_json: &str) -> Result<()> {
+    /// NIP-44 gift-wrapped DM carrying our push token info (kind 447), ready
+    /// to publish.
+    async fn build_push_token_dm(&self, recipient: &PublicKey, payload_json: &str) -> Result<Event> {
         let rumor = EventBuilder::new(
             Kind::Custom(crate::push::KIND_PUSH_TOKEN_SHARE),
             payload_json,
@@ -8921,9 +9072,7 @@ impl SonarClient {
         .tags([Tag::public_key(*recipient)])
         .build(self.engine.identity().public_key());
 
-        let wrapped = self.engine.gift_wrap_rumor(recipient, rumor).await?;
-        self.nostr.send_event(&wrapped).await?;
-        Ok(())
+        self.engine.gift_wrap_rumor(recipient, rumor).await
     }
 
     /// Process an incoming push token share DM (kind 447) from a group member.
@@ -9345,6 +9494,7 @@ mod tests {
             processed_event_order: VecDeque::new(),
             failed_event_passes: HashMap::new(),
             failed_event_order: VecDeque::new(),
+            push_token_shared: HashMap::new(),
             dirty: false,
         };
         sync.rewind_for_retry(clamped);
@@ -9369,6 +9519,7 @@ mod tests {
             processed_event_order: VecDeque::new(),
             failed_event_passes: HashMap::new(),
             failed_event_order: VecDeque::new(),
+            push_token_shared: HashMap::new(),
             dirty: false,
         };
         sync.rewind_for_retry(report.oldest_retryable_secs.expect("retryable recorded"));
@@ -9943,6 +10094,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn push_token_share_plan_takes_each_member_once_and_caps_the_batch() {
+        // Bob shares two groups with us; he must get one DM, not two.
+        let members = vec![
+            ("bob".to_string(), 1),
+            ("carol".to_string(), 2),
+            ("bob".to_string(), 3),
+            ("dave".to_string(), 4),
+            ("erin".to_string(), 5),
+        ];
+        let due = plan_push_token_shares(members, |hex| hex != "carol", 2);
+        assert_eq!(
+            due,
+            vec![("bob".to_string(), 1), ("dave".to_string(), 4)],
+            "order kept, duplicates and members who hold the token skipped, capped"
+        );
+    }
+
+    #[test]
+    fn push_token_share_is_due_only_for_a_new_token_or_after_the_reshare_window() {
+        let mut state = SyncState::new(None, 0, Vec::new());
+        let now = 1_700_000_000;
+        assert!(state.push_token_share_due("bob", "token-a", now), "never shared");
+        state.mark_push_token_shared("bob".into(), "token-a", now);
+        assert!(!state.push_token_share_due("bob", "token-a", now + 60), "already holds it");
+        assert!(state.push_token_share_due("bob", "token-b", now + 60), "token changed");
+        assert!(
+            state.push_token_share_due("bob", "token-a", now + PUSH_TOKEN_RESHARE_SECS),
+            "refreshed after the reshare window"
+        );
+    }
+
+    #[test]
+    fn push_token_share_record_survives_a_restart() {
+        // iOS rebuilds the client on every foreground; an in-memory record
+        // would re-send every member's DM on every visit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync-state.json");
+        let now = 1_700_000_000;
+        {
+            let mut state = SyncState::new(Some(path.clone()), 42, Vec::new());
+            state.mark_push_token_shared("bob".into(), "token-a", now);
+            state.save_if_dirty().expect("save");
+        }
+        let reloaded = SyncState::load(Some(path), 42, false);
+        assert!(!reloaded.push_token_share_due("bob", "token-a", now + 60));
+        assert!(reloaded.push_token_share_due("carol", "token-a", now + 60));
+    }
+
+    /// R-056 at the real call site: a member we share two groups with gets ONE
+    /// push-token DM, and a second pass (the next sync) sends nothing. Before,
+    /// every pass DMed every member of every group: 2 per pass for Bob here,
+    /// about 400 per sync on the reporter's account.
+    #[tokio::test]
+    async fn push_token_share_dms_each_member_once_across_passes() {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let relay_url = relay.url().await;
+        let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+            .await
+            .expect("alice connects");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let group_relays = vec![relay_url.clone()];
+        for name in ["first", "second"] {
+            let kp = bob.key_package_event(group_relays.clone()).expect("bob kp");
+            let creation = alice
+                .engine
+                .create_group(name, vec![kp], group_relays.clone())
+                .expect("alice creates group with bob");
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .expect("merge");
+        }
+        alice
+            .register_push_token("apns", b"device-token", &Keys::generate().public_key().to_hex())
+            .await
+            .expect("register");
+
+        let wait_idle = || async {
+            for _ in 0..200 {
+                if !alice.push_token_share_in_flight.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("push token share batch never finished");
+        };
+        wait_idle().await;
+        alice.share_push_token_with_groups().await;
+        wait_idle().await;
+
+        let reader = Client::default();
+        reader.add_relay(relay_url).await.expect("reader relay");
+        reader.connect().await;
+        let wraps = reader
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::GiftWrap)
+                    .pubkey(bob.identity().public_key()),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fetch gift wraps");
+        assert_eq!(wraps.len(), 1, "one push-token DM for Bob across two groups and two passes");
+    }
+
     #[tokio::test]
     async fn share_push_token_with_groups_noops_when_no_relay_connected() {
         // Behavioral coverage for the Connected-status guard on
@@ -9957,6 +10216,7 @@ mod tests {
         *client.own_push_registration.lock().unwrap() = Some(crate::push::OwnPushRegistration {
             encrypted_token_b64: "dGVzdA==".to_owned(),
             server_pubkey,
+            fingerprint: "test-token".to_owned(),
         });
 
         let connected = client
@@ -11267,6 +11527,7 @@ mod tests {
             watermark_secs: 1_000,
             processed_event_ids: vec!["abc".to_string()],
             failed_event_passes: HashMap::new(),
+            push_token_shared: HashMap::new(),
         };
         fs::write(&path, serde_json::to_vec(&disk).expect("json")).expect("write state");
 
