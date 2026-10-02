@@ -267,7 +267,22 @@ func snShortNpubLabel(_ value: String) -> String {
     value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
 }
 
+#if DEBUG
+/// Test seam: counts `snDirectMarmotPeerKey` derivations, so a test can pin
+/// that a pass over every chat derives each group's key a bounded number of
+/// times instead of once per chat per group (R-057).
+enum SNDirectPeerKeyDerivations {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var value = 0
+    static var count: Int { lock.withLock { value } }
+    static func record() { lock.withLock { value &+= 1 } }
+}
+#endif
+
 func snDirectMarmotPeerKey(for group: MarmotService.MarmotGroup, ownNpub: String?) -> String? {
+    #if DEBUG
+    SNDirectPeerKeyDerivations.record()
+    #endif
     let ownKey = ownNpub.map(SNMarmotProfileCache.canonicalKey)
     let others = Array(Set(group.memberNpubs.map(SNMarmotProfileCache.canonicalKey).filter {
         guard !$0.isEmpty else { return false }
@@ -284,6 +299,29 @@ func snCanonicalDirectMarmotGroups(
     groups.reduce(into: [:]) { result, group in
         guard let key = snDirectMarmotPeerKey(for: group, ownNpub: ownNpub) else { return }
         result[key, default: []].append(group)
+    }
+}
+
+/// Group lookups by id and by 1:1 counterpart, built in one pass over the
+/// groups. Resolving one chat used to scan every group (`first(where:)` by id,
+/// then a filter deriving each group's peer key), so any pass over every chat
+/// was O(groups²): ~370 ms on the main thread per chat-list rebuild at 426
+/// groups, several rebuilds per foreground (R-057).
+struct SNMarmotGroupIndex {
+    /// First group per id, like `groups.first { $0.id == id }`.
+    let groupsById: [String: MarmotService.MarmotGroup]
+    /// 1:1 groups per counterpart key, in `groups` order
+    /// (`snCanonicalDirectMarmotGroups`).
+    let directGroupsByPeer: [String: [MarmotService.MarmotGroup]]
+
+    init(groups: [MarmotService.MarmotGroup], ownNpub: String?) {
+        var byId: [String: MarmotService.MarmotGroup] = [:]
+        byId.reserveCapacity(groups.count)
+        for group in groups where byId[group.id] == nil {
+            byId[group.id] = group
+        }
+        groupsById = byId
+        directGroupsByPeer = snCanonicalDirectMarmotGroups(groups, ownNpub: ownNpub)
     }
 }
 
@@ -441,7 +479,24 @@ final class MarmotChatModel: ObservableObject {
     /// skip the RTT on later reconnects. Sonar-domain prefs without a sidecar
     /// still re-enter so reclaim can retry.
     private var didFetchOwnProfileThisSession = false
-    @Published var groups: [MarmotService.MarmotGroup] = []
+    @Published var groups: [MarmotService.MarmotGroup] = [] {
+        didSet { groupIndexCache = nil }
+    }
+    /// Built lazily from the current `groups` and own npub; dropped in
+    /// `groups`' didSet, so a read always sees the value it was built from
+    /// (a `$groups` subscriber runs in willSet and still reads the old groups
+    /// with the old index).
+    private var groupIndexCache: (ownNpub: String?, index: SNMarmotGroupIndex)?
+
+    /// Lookups by id and 1:1 counterpart over `groups` (R-057).
+    var groupIndex: SNMarmotGroupIndex {
+        if let cache = groupIndexCache, cache.ownNpub == npub {
+            return cache.index
+        }
+        let index = SNMarmotGroupIndex(groups: groups, ownNpub: npub)
+        groupIndexCache = (npub, index)
+        return index
+    }
     /// Core-owned private timezone cache, hydrated from the local encrypted
     /// index with group metadata. No relay/profile lookup is involved.
     /// Group id → canonical npub → zone that member shared into that group.
