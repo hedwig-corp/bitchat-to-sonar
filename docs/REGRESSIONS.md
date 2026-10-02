@@ -104,7 +104,11 @@ roughly halves it. The ranking is stable across all three.)
 
 **Guarded by:** `TranscriptDisplayPolicyTest.priorIdenticalRowWithinFormerSlackDoesNotConsumeNewEcho`
 
-**Also guarded by:** `TranscriptDisplayPolicyTest.priorSameSecondIdenticalRowDoesNotConsumeNewEcho`, `TranscriptDisplayPolicyTest.sameSecondCanonicalRowFulfillsOptimisticEcho`
+**Also guarded by:** `TranscriptDisplayPolicyTest.priorSameSecondIdenticalRowDoesNotConsumeNewEcho`, `TranscriptDisplayPolicyTest.sameSecondCanonicalRowFulfillsOptimisticEcho`, `client.rs::send_returns_the_id_of_the_stored_transcript_row`, `TranscriptDisplayPolicyTest.aKnownStoredIdIsTheOnlyRowThatFulfilsTheEcho`, `MarmotOptimisticEchoTests.aKnownStoredIdIsTheOnlyRowThatFulfilsTheEcho`
+
+**Echo and canonical now share an id.** Text, reply and sticker sends return the id of the row core stored (`send_text` / `send_text_reply` / `send_sticker` → hex). Both apps record it per echo (iOS `canonicalIDByOptimisticID`, Compose `canonicalIdByEcho`), and once known the echo resolves to exactly that row, so no older identical row can consume it. The heuristic above still runs before the send returns and for media, where the two apps' rules still differ (iOS 5 s slack plus a media filename/mime check; Compose no slack, no media check).
+
+**Root cause found on the way:** a rumor id hashes its whole-second `created_at` and content, so two identical messages sent in one second were ONE rumor and the second was lost. Chat rumors now take `max(now, last + 1)` from a per-engine clock (`marmot.rs::next_rumor_second`); guarded by `client.rs::rumor_seconds_never_repeat_and_follow_the_wall_clock` and the distinct-id assertion in `send_returns_the_id_of_the_stored_transcript_row`.
 
 **History:** #215 -> #290 (kept while fixing R-001).
 
@@ -724,7 +728,9 @@ on both Android and JVM), consumed by the `ChatScreen` feed filter; iOS
 
 **Guarded by:** `client.rs::hidden_control_lines_do_not_count_as_unread_at_the_index_call_site`
 
-**Also guarded by:** `conversation_index.rs::host_hidden_messages_do_not_increment_unread`, `marmot.rs::only_host_rendered_classes_are_transcript_visible`, `conversation_index.rs::mine_messages_do_not_increment_unread`, `client.rs::timezone_share_notifies_conversation_listener_without_unread`, `e2e.rs::timezone_share_does_not_notify_or_increment_unread`, `e2e.rs::kind7_reaction_does_not_notify_or_increment_unread`, `TranscriptDisplayPolicyTest.coreClassificationWinsOverTheLocalStringDecode`, `TranscriptDisplayPolicyTest.coreClassificationDecidesVisibilityForCoreRows`, `TranscriptDisplayPolicyTest.rowsWithoutCoreClassificationKeepTheStringDecode`
+**Also guarded by:** `conversation_index.rs::host_hidden_messages_do_not_increment_unread`, `marmot.rs::only_host_rendered_classes_are_transcript_visible`, `conversation_index.rs::mine_messages_do_not_increment_unread`, `client.rs::timezone_share_notifies_conversation_listener_without_unread`, `e2e.rs::timezone_share_does_not_notify_or_increment_unread`, `e2e.rs::kind7_reaction_does_not_notify_or_increment_unread`, `TranscriptDisplayPolicyTest.coreClassificationWinsOverTheLocalStringDecode`, `TranscriptDisplayPolicyTest.coreClassificationDecidesVisibilityForCoreRows`, `TranscriptDisplayPolicyTest.rowsWithoutCoreClassificationKeepTheStringDecode`, `client.rs::unread_anchor_skips_own_sends_and_hidden_control_lines`, `client.rs::open_conversation_anchors_at_the_oldest_unread_across_folded_groups`, `ChatListAppStateTest.openingAChatTakesTheUnreadAnchorFromCore`
+
+**The anchor is now placed in core.** `open_conversation` captures the unread count, computes the anchor with the same visibility rule the counter uses (`conversation_list::unread_anchor`: newest first over every folded group, own sends and hidden control lines skipped), and only then marks the set read. Compose (`openChat` → `openChatCoreAnchor`, preferred in `ChatScreen`'s anchor effect) and iOS (`openedDM` → `unreadAnchorIdAtOpenByDM` → the collection host's resolver hint) use that row whenever it is loaded; their own walks remain only as the fallback. Because capture and mark are one core step, the iOS ordering where `openedDM` marked read before `push` captured can no longer zero the count. Not covered: the macOS `SNMsgList` path still walks for its anchor.
 
 **Enforced by the compiler:** `counts_unread` has **no default** on
 `upsert_summary`; a new call site cannot silently fall back to counting

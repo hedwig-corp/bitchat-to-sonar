@@ -949,6 +949,21 @@ fn conversation_preview_info(
     }
 }
 
+/// What the transcript needs when a conversation opens (see
+/// `SonarNode::open_conversation`).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ConversationOpenInfo {
+    /// Every folded group, row group first.
+    pub group_ids: Vec<String>,
+    /// Unread at the moment of opening, before it was marked read.
+    pub unread_count: u64,
+    /// The oldest unread message (hex); the divider goes above it.
+    pub unread_anchor_id: Option<String>,
+    /// Newest message second across the set: the transcript is not complete
+    /// until it holds a row this new.
+    pub newest_at_secs: u64,
+}
+
 /// A display name to remember for titling the Messages list.
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct PeerNameInfo {
@@ -2062,6 +2077,21 @@ impl SonarNode {
 
     pub fn mark_conversation_read(&self, group_id_hex: String) {
         self.client.mark_conversation_read(&group_id_hex);
+    }
+
+    /// Open the conversation containing `group_id_hex`: capture the unread
+    /// count and anchor (oldest unread across every folded group, own sends
+    /// and hidden control lines skipped), then mark the whole set read, in one
+    /// step. Hosts call this instead of reading unread and marking read
+    /// themselves, so the two can never race. Local only.
+    pub fn open_conversation(&self, group_id_hex: String) -> FfiResult<ConversationOpenInfo> {
+        let open = self.client.open_conversation(&group_id_hex)?;
+        Ok(ConversationOpenInfo {
+            group_ids: open.group_ids,
+            unread_count: open.unread_count,
+            unread_anchor_id: open.unread_anchor_id.map(|id| id.to_hex()),
+            newest_at_secs: open.newest_at_secs,
+        })
     }
 
     /// Remember display names for titling the Messages list (hosts seed it

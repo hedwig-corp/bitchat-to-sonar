@@ -555,6 +555,16 @@ actual object SonarCore {
         }
     }
 
+    actual suspend fun openConversation(groupIdHex: String): SonarConversationOpen = withContext(Dispatchers.IO) {
+        val open = requireNode().openConversation(groupIdHex)
+        SonarConversationOpen(
+            groupIds = open.groupIds,
+            unreadCount = open.unreadCount.toLong(),
+            unreadAnchorId = open.unreadAnchorId,
+            newestAtSecs = open.newestAtSecs.toLong(),
+        )
+    }
+
     actual suspend fun rememberPeerNames(names: Map<String, String>): Unit = withContext(Dispatchers.IO) {
         if (names.isEmpty()) return@withContext
         node?.rememberPeerNames(names.map { (hex, name) -> uniffi.sonar_ffi.PeerNameInfo(hex, name) })

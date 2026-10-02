@@ -225,6 +225,26 @@ class ChatListAppStateTest {
         }
     }
 
+    /** Opening a chat is one core step (`open_conversation`): core captures
+     *  the unread count and the anchor before it marks the folded set read,
+     *  and the transcript gets core's anchor, the row iOS anchors at too. */
+    @Test
+    fun openingAChatTakesTheUnreadAnchorFromCore() = runTest {
+        val core = FakeChatListCore().apply {
+            chats = listOf(giulia, giuliaAgain)
+            summaries = listOf(summary(giuliaAgain.id, 900, unread = 2), summary(giulia.id, 500, unread = 1))
+            openAnchorId = "ABC123"
+        }
+        val s = state(core)
+        s.chatList.refresh()
+        s.openChat(s.visibleChats.first { it.id == giulia.id || it.id == giuliaAgain.id })
+        runCurrent()
+        assertEquals(setOf(giulia.id, giuliaAgain.id), core.markedRead.toSet())
+        val chatId = s.openChatUnread.keys.single()
+        assertEquals(3L, s.openChatUnread[chatId])
+        assertEquals("abc123", s.openChatCoreAnchor[chatId])
+    }
+
     /** The phone presenter, on a Home the test marks hydrated. */
     private fun SonarAppState.chatListPresenterForTest(): ChatListPresenter {
         markHomeHydratedForTest()

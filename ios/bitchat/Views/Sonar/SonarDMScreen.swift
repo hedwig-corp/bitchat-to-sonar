@@ -413,6 +413,7 @@ struct SonarDMScreenContent: View {
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                    unreadAnchorHint: store.unreadAnchorIdAtOpenByDM[peerId],
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
                     onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },

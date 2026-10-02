@@ -2177,6 +2177,15 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
 
     /**
+     * Open the conversation containing `group_id_hex`: capture the unread
+     * count and anchor (oldest unread across every folded group, own sends
+     * and hidden control lines skipped), then mark the whole set read, in one
+     * step. Hosts call this instead of reading unread and marking read
+     * themselves, so the two can never race. Local only.
+     */
+    func openConversation(groupIdHex: String) throws  -> ConversationOpenInfo
+
+    /**
      * Local-only batch read of the zones members shared into these MLS
      * groups (hex). Look a zone up by the chat's own group: a person can
      * share in one chat and not another.
@@ -3191,6 +3200,22 @@ open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws 
         FfiConverterString.lower(groupIdHex),
         FfiConverterUInt32.lower(limit),
         FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+
+    /**
+     * Open the conversation containing `group_id_hex`: capture the unread
+     * count and anchor (oldest unread across every folded group, own sends
+     * and hidden control lines skipped), then mark the whole set read, in one
+     * step. Hosts call this instead of reading unread and marking read
+     * themselves, so the two can never race. Local only.
+     */
+open func openConversation(groupIdHex: String)throws  -> ConversationOpenInfo  {
+    return try  FfiConverterTypeConversationOpenInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_open_conversation(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
     )
 })
 }
@@ -4894,6 +4919,98 @@ public func FfiConverterTypeConversationListRowInfo_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeConversationListRowInfo_lower(_ value: ConversationListRowInfo) -> RustBuffer {
     return FfiConverterTypeConversationListRowInfo.lower(value)
+}
+
+
+/**
+ * What the transcript needs when a conversation opens (see
+ * `SonarNode::open_conversation`).
+ */
+public struct ConversationOpenInfo: Equatable, Hashable {
+    /**
+     * Every folded group, row group first.
+     */
+    public var groupIds: [String]
+    /**
+     * Unread at the moment of opening, before it was marked read.
+     */
+    public var unreadCount: UInt64
+    /**
+     * The oldest unread message (hex); the divider goes above it.
+     */
+    public var unreadAnchorId: String?
+    /**
+     * Newest message second across the set: the transcript is not complete
+     * until it holds a row this new.
+     */
+    public var newestAtSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Every folded group, row group first.
+         */groupIds: [String],
+        /**
+         * Unread at the moment of opening, before it was marked read.
+         */unreadCount: UInt64,
+        /**
+         * The oldest unread message (hex); the divider goes above it.
+         */unreadAnchorId: String?,
+        /**
+         * Newest message second across the set: the transcript is not complete
+         * until it holds a row this new.
+         */newestAtSecs: UInt64) {
+        self.groupIds = groupIds
+        self.unreadCount = unreadCount
+        self.unreadAnchorId = unreadAnchorId
+        self.newestAtSecs = newestAtSecs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConversationOpenInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConversationOpenInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationOpenInfo {
+        return
+            try ConversationOpenInfo(
+                groupIds: FfiConverterSequenceString.read(from: &buf),
+                unreadCount: FfiConverterUInt64.read(from: &buf),
+                unreadAnchorId: FfiConverterOptionString.read(from: &buf),
+                newestAtSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConversationOpenInfo, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.groupIds, into: &buf)
+        FfiConverterUInt64.write(value.unreadCount, into: &buf)
+        FfiConverterOptionString.write(value.unreadAnchorId, into: &buf)
+        FfiConverterUInt64.write(value.newestAtSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationOpenInfo_lift(_ buf: RustBuffer) throws -> ConversationOpenInfo {
+    return try FfiConverterTypeConversationOpenInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationOpenInfo_lower(_ value: ConversationOpenInfo) -> RustBuffer {
+    return FfiConverterTypeConversationOpenInfo.lower(value)
 }
 
 
@@ -12049,6 +12166,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_open_conversation() != 19295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_peer_timezones() != 64590) {

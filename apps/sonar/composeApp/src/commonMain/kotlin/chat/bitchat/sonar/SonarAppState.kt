@@ -1444,6 +1444,12 @@ class SonarAppState internal constructor(
      *  grown — new arrivals were already marked read and must not drift it. */
     var openChatUnreadAnchor by mutableStateOf<Map<String, String>>(emptyMap())
 
+    /** The unread anchor core computed at open (`open_conversation`), per
+     *  chat: the row the divider goes above. The transcript prefers it over
+     *  its own walk whenever that row is in the feed. */
+    var openChatCoreAnchor by mutableStateOf<Map<String, String>>(emptyMap())
+        private set
+
     /** Search / deep-link jump target for the current open (#372). Wins over
      *  unread/live-edge in [TranscriptScrollPolicy.resolveOpenAction]. */
     var openChatJumpMessageId by mutableStateOf<Map<String, String>>(emptyMap())
@@ -1462,6 +1468,7 @@ class SonarAppState internal constructor(
     private fun captureOpenChatUnread(chatId: String, jumpMessageId: String? = null) {
         val unreadAtOpen = transcriptGroupIds(chatId).sumOf { unreadByChat[it] ?: 0L }
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
+        openChatCoreAnchor = openChatCoreAnchor - chatId
         // Always publish a settled value (including 0). Missing key means
         // capture has not run — hosts must not coerce that to live-edge.
         openChatUnread = openChatUnread + (chatId to unreadAtOpen)
@@ -1479,6 +1486,7 @@ class SonarAppState internal constructor(
     fun retireOpenChatUnread(chatId: String) {
         openChatUnread = openChatUnread + (chatId to 0L)
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
+        openChatCoreAnchor = openChatCoreAnchor - chatId
         openChatJumpMessageId = openChatJumpMessageId - chatId
     }
 
@@ -1492,6 +1500,7 @@ class SonarAppState internal constructor(
     private fun clearOpenChatTransientState() {
         openChatUnread = emptyMap()
         openChatUnreadAnchor = emptyMap()
+        openChatCoreAnchor = emptyMap()
         openChatJumpMessageId = emptyMap()
         hydratedTranscripts = emptySet()
         chatList.clearUnreadSuppressions()
@@ -7351,9 +7360,23 @@ class SonarAppState internal constructor(
         val readChatIds = directMarmotChatIds(chat.id)
         captureOpenChatUnread(chat.id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(chat.id)
-        // Mark read immediately — do not wait for the local page. Housekeeping
-        // can otherwise restore unreadByChat from still-nonzero summaries.
-        markGroupsRead(readChatIds)
+        // Open through core: one step captures the unread count and the anchor
+        // (oldest unread across every folded group, the same rule iOS uses),
+        // then marks the set read. The badge still clears at once, locally.
+        // Housekeeping can otherwise restore unreadByChat from still-nonzero
+        // summaries.
+        val openedChatId = chat.id
+        chatList.markRead(readChatIds) {
+            val open = chatListCore.openConversation(chat.id)
+            if (openChatUnread.containsKey(openedChatId)) {
+                openChatUnread = openChatUnread + (openedChatId to open.unreadCount)
+                openChatCoreAnchor = if (open.unreadAnchorId != null) {
+                    openChatCoreAnchor + (openedChatId to open.unreadAnchorId.lowercase())
+                } else {
+                    openChatCoreAnchor - openedChatId
+                }
+            }
+        }
         val title = chatTitle(chat)
 
         // Reopen: retained paint is already the last leave frame — push now,
@@ -7590,6 +7613,7 @@ class SonarAppState internal constructor(
             retainOpenTranscript(it.id, messages)
             openChatUnread = openChatUnread - it.id
             openChatUnreadAnchor = openChatUnreadAnchor - it.id
+            openChatCoreAnchor = openChatCoreAnchor - it.id
             openChatJumpMessageId = openChatJumpMessageId - it.id
         }
         if (stack.size > 1) stack = stack.dropLast(1)
@@ -7609,6 +7633,8 @@ class SonarAppState internal constructor(
             messages = emptyList()
             openChatUnread = emptyMap()
             openChatUnreadAnchor = emptyMap()
+            openChatCoreAnchor = emptyMap()
+        openChatCoreAnchor = emptyMap()
             openChatJumpMessageId = emptyMap()
         }
     }

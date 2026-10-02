@@ -1557,14 +1557,21 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Freeze the unread anchor on the first CAUGHT-UP feed that can resolve
     // it, and re-resolve only if its row vanishes (a snapshot row replaced by
     // the canonical DB page) before the user scrolls.
-    LaunchedEffect(screen.id, feed) {
+    val coreAnchorId = state.openChatCoreAnchor[screen.id]
+    LaunchedEffect(screen.id, feed, coreAnchorId) {
         val unreadAtOpen = state.openChatUnread[screen.id] ?: 0L
         if (unreadAtOpen <= 0L || feed.isEmpty()) return@LaunchedEffect
         val current = unreadAnchorId
         if (current != null && feed.any { transcriptFeedKey(it) == current }) return@LaunchedEffect
         if (current != null && userScrolled) return@LaunchedEffect
-        if (!feedCaughtUp(feed)) return@LaunchedEffect
-        val anchor = firstUnreadTranscriptIndex(feed, unreadAtOpen)
+        // Core's anchor (`open_conversation`, the same row iOS anchors at) wins
+        // as soon as its row is in the feed; the local walk below is only the
+        // fallback while core has not answered or the row is outside the feed.
+        val coreIndex = coreAnchorId?.let { id ->
+            feed.indexOfFirst { (it as? SonarMsg)?.id?.equals(id, ignoreCase = true) == true }
+        } ?: -1
+        if (coreIndex < 0 && !feedCaughtUp(feed)) return@LaunchedEffect
+        val anchor = if (coreIndex >= 0) coreIndex else firstUnreadTranscriptIndex(feed, unreadAtOpen)
         if (anchor < 0) {
             // The caught-up feed cannot place a divider (e.g. every unread
             // event is a filtered ☎CALL/⚡PAY control line). Retire the pending

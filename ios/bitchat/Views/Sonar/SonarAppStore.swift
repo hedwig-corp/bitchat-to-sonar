@@ -6088,6 +6088,28 @@ final class SonarAppStore: ObservableObject {
         groups.contains { marmotVerified[$0.id] ?? false }
     }
 
+    /// Open the DM's Marmot conversation through core: one step captures the
+    /// unread count and anchor before marking every folded group read, so the
+    /// order of capture and mark in this store can no longer zero the count.
+    /// A revisit (core reports 0) keeps the count and anchor this open took.
+    private func openMarmotConversation(_ id: String, groupId: String) {
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        Task { [weak self] in
+            guard let self else { return }
+            guard let open = await self.marmot.openConversation(groupId: groupId, groupIds: ids) else {
+                self.markMarmotGroupsRead(matchingGroupId: groupId)
+                return
+            }
+            if open.unreadCount > 0 || self.unreadCountAtOpenByDM[id] == nil {
+                self.unreadCountAtOpenByDM[id] = open.unreadCount
+            }
+            if let anchor = open.unreadAnchorId {
+                self.unreadAnchorIdAtOpenByDM[id] = anchor.lowercased()
+            }
+        }
+    }
+
     private func markMarmotGroupsRead(matchingGroupId groupId: String) {
         let groups = directMarmotGroups(matchingGroupId: groupId)
         if groups.isEmpty {
@@ -9243,6 +9265,10 @@ final class SonarAppStore: ObservableObject {
     /// Consumed by the transcript to anchor at the first unread row with a
     /// divider (Signal-style); cleared when the route pops.
     @Published var unreadCountAtOpenByDM: [String: UInt64] = [:]
+    /// The unread anchor core computed when the DM opened (`openConversation`):
+    /// the row the divider goes above, the same row Compose anchors at. The
+    /// transcript uses it whenever that row is loaded.
+    @Published var unreadAnchorIdAtOpenByDM: [String: String] = [:]
 
     /// Search / deep-link jump for the current DM open (#372). Not `@Published`
     /// — set once at push; host reads it on first apply.
@@ -9263,6 +9289,7 @@ final class SonarAppStore: ObservableObject {
     /// the alpha.11 unread→tail flash race).
     func captureUnreadAtOpen(_ id: String) {
         unreadCountAtOpenByDM[id] = nil
+        unreadAnchorIdAtOpenByDM[id] = nil
         if let jump = pendingJumpMessageIdByDM.removeValue(forKey: id) {
             jumpMessageIdAtOpenByDM[id] = jump
         } else {
@@ -9389,7 +9416,7 @@ final class SonarAppStore: ObservableObject {
         conversationViewStates[id]?.activate()
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
-            markMarmotGroupsRead(matchingGroupId: knownMarmotGroupId)
+            openMarmotConversation(id, groupId: knownMarmotGroupId)
         }
         // Bind badge suppression as soon as the DM is considered open — even
         // when navigation used a custom `present` path that skipped `push`.

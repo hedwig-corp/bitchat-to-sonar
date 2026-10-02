@@ -8,6 +8,7 @@ import chat.bitchat.sonar.MeshDmRow
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarConversationListKind
 import chat.bitchat.sonar.SonarConversationListRow
+import chat.bitchat.sonar.SonarConversationOpen
 import chat.bitchat.sonar.SonarConversationPreview
 import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.directMarmotPeerKey
@@ -66,6 +67,17 @@ internal class FakeChatListCore : ChatListCore {
         listCalls++
         if (failList) error("conversation list read failed")
         return listRows ?: coreLikeConversationRows(chats, summaries, ownNpub, noteToSelfId, rememberedNames)
+    }
+
+    /** Anchor the fake reports from [openConversation]. */
+    var openAnchorId: String? = null
+
+    override suspend fun openConversation(groupIdHex: String): SonarConversationOpen {
+        val set = coreLikeConversationRows(chats, summaries, ownNpub, noteToSelfId, rememberedNames)
+            .firstOrNull { groupIdHex in it.groupIds }?.groupIds ?: listOf(groupIdHex)
+        val unread = set.sumOf { gid -> summaries.firstOrNull { it.groupIdHex == gid }?.unreadCount ?: 0L }
+        for (gid in set) markConversationRead(gid)
+        return SonarConversationOpen(set, unread, openAnchorId.takeIf { unread > 0 }, 0L)
     }
 
     val rememberedNames = mutableMapOf<String, String>()

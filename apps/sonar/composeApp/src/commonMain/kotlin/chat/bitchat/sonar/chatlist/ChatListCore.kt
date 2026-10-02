@@ -2,6 +2,7 @@ package chat.bitchat.sonar.chatlist
 
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarConversationListRow
+import chat.bitchat.sonar.SonarConversationOpen
 import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarRecentTranscriptPage
@@ -37,6 +38,10 @@ internal interface ChatListCore {
     /** Seed core's display-name cache (pubkey hex → name), which titles rows. */
     suspend fun rememberPeerNames(names: Map<String, String>)
 
+    /** Open a conversation: capture unread + anchor, then mark the folded set
+     *  read, in one core step (so a host mark can never zero the count first). */
+    suspend fun openConversation(groupIdHex: String): SonarConversationOpen
+
     /** Bounded newest-message windows for the [groupLimit] most recent chats. */
     suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage>
 
@@ -59,6 +64,9 @@ internal object SonarCoreChatListCore : ChatListCore {
 
     override suspend fun rememberPeerNames(names: Map<String, String>) =
         SonarCore.rememberPeerNames(names)
+
+    override suspend fun openConversation(groupIdHex: String): SonarConversationOpen =
+        SonarCore.openConversation(groupIdHex)
 
     override suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
         SonarCore.recentMessagePages(groupLimit, pageLimit)

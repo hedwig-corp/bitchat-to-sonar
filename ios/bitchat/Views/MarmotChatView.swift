@@ -3384,6 +3384,21 @@ final class MarmotChatModel: ObservableObject {
         return task
     }
 
+    /// Open a conversation through core (`openConversation`): the badge
+    /// clears at once, core captures unread + anchor and marks the folded set
+    /// read, then the counts reconcile. nil when core could not answer.
+    func openConversation(groupId: String, groupIds: [String]) async -> MarmotService.ConversationOpen? {
+        let ids = groupIds.isEmpty ? [groupId] : groupIds
+        for id in ids {
+            unreadSuppressGroupIds.insert(id)
+            unreadByGroup[id] = nil
+        }
+        let open = await service.openConversation(groupId: groupId)
+        for id in ids { unreadSuppressGroupIds.remove(id) }
+        publishUnread(from: await service.conversationSummaries())
+        return open
+    }
+
     func markConversationRead(groupId: String) {
         unreadSuppressGroupIds.insert(groupId)
         unreadByGroup[groupId] = nil

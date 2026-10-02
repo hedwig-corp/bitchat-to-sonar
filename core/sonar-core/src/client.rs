@@ -940,6 +940,10 @@ const MEMBERSHIP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(8);
 /// would silently miss a just-received welcome. Mirrors White Noise's
 /// `GIFTWRAP_LOOKBACK_BUFFER`.
 const GIFTWRAP_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
+/// Rows per folded group `open_conversation` reads to place the unread anchor
+/// (the hosts' retained transcript window). More unread than that anchors at
+/// the oldest row read.
+pub const OPEN_ANCHOR_SCAN_ROWS: usize = 500;
 
 /// Safety overlap subtracted from the watermark on every incremental fetch, to
 /// cover clock skew and events that landed on a relay mid-sync. Already-seen
@@ -7916,6 +7920,63 @@ impl SonarClient {
         Ok(crate::conversation_list::page(rows, limit, after))
     }
 
+    /// Open the conversation containing `group_id_hex`: everything the
+    /// transcript needs at that moment, computed once in core for both apps,
+    /// then the whole folded set is marked read.
+    ///
+    /// The unread anchor is the oldest unread message (the "Unread messages"
+    /// divider goes above it): walking newest first over every folded group in
+    /// one `(created_at, id)` order, it is the `unread_count`-th visible
+    /// message from someone else. Hidden control lines never count (R-017),
+    /// so the walk and the counter agree. Capture and mark-read are one step,
+    /// so no host can read a count that its own mark already zeroed.
+    ///
+    /// Local only and bounded: at most [`OPEN_ANCHOR_SCAN_ROWS`] rows per group.
+    pub fn open_conversation(&self, group_id_hex: &str) -> Result<crate::conversation_list::ConversationOpen> {
+        let rows = self.conversation_list_rows()?;
+        let row = rows
+            .iter()
+            .find(|row| row.group_ids.iter().any(|g| g == group_id_hex));
+        let group_ids: Vec<String> = row
+            .map(|r| r.group_ids.clone())
+            .unwrap_or_else(|| vec![group_id_hex.to_string()]);
+        let note_to_self = row.is_some_and(|r| {
+            r.kind == crate::conversation_list::ConversationListKind::NoteToSelf
+        });
+        let mut unread_count = 0u64;
+        let mut newest_at_secs = 0u64;
+        for gid in &group_ids {
+            if let Some(summary) = self.conversation_summary(gid) {
+                unread_count += summary.unread_count;
+                newest_at_secs = newest_at_secs.max(summary.latest_at_secs);
+            }
+        }
+        if note_to_self {
+            unread_count = 0;
+        }
+        let unread_anchor_id = if unread_count == 0 {
+            None
+        } else {
+            let limit = OPEN_ANCHOR_SCAN_ROWS.min((unread_count as usize).saturating_mul(4) + 32);
+            let mut merged: Vec<ChatMessage> = Vec::new();
+            for gid in &group_ids {
+                let Ok(bytes) = hex::decode(gid) else { continue };
+                let group = GroupId::from_slice(&bytes);
+                merged.extend(self.messages_cursor_page(&group, None, None, limit)?);
+            }
+            crate::conversation_list::unread_anchor(&mut merged, unread_count)
+        };
+        for gid in &group_ids {
+            self.mark_conversation_read(gid);
+        }
+        Ok(crate::conversation_list::ConversationOpen {
+            group_ids,
+            unread_count,
+            unread_anchor_id,
+            newest_at_secs,
+        })
+    }
+
     fn conversation_list_rows(&self) -> Result<Vec<crate::conversation_list::ConversationListRow>> {
         use crate::conversation_list::GroupShape;
         let groups = self.engine.groups()?;
@@ -10092,6 +10153,37 @@ mod tests {
             crate::account_backup::load_backup_policy(&db_path).dirty,
             "our own send is the irreplaceable one — it must still mark dirty"
         );
+    }
+
+    #[test]
+    fn unread_anchor_skips_own_sends_and_hidden_control_lines() {
+        use crate::marmot::MessageClassification as C;
+        let row = |seed: u8, secs: u64, mine: bool, class: C| ChatMessage {
+            id: test_event_id(seed),
+            group_id: GroupId::from_slice(&[1u8; 32]),
+            sender: Keys::generate().public_key(),
+            content: String::new(),
+            created_at: Timestamp::from_secs(secs),
+            mine,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: class,
+            reply: None,
+            reactions: vec![],
+        };
+        // Oldest → newest: read, unread A, own, call signal, unread B.
+        let mut rows = vec![
+            row(5, 50, false, C::CallControl),
+            row(1, 10, false, C::Text),
+            row(4, 40, false, C::Text),
+            row(2, 20, false, C::Text),
+            row(3, 30, true, C::Text),
+        ];
+        // Two unread (R-017 counts only A and B): the anchor is A, not the call.
+        assert_eq!(crate::conversation_list::unread_anchor(&mut rows, 2), Some(test_event_id(2)));
+        // More unread than rows read: the oldest visible incoming row.
+        assert_eq!(crate::conversation_list::unread_anchor(&mut rows, 9), Some(test_event_id(1)));
     }
 
     #[test]
@@ -13476,6 +13568,46 @@ mod tests {
         let row = rows.iter().find(|m| m.id == second).unwrap();
         assert_eq!(row.content, "same words");
         assert!(row.mine);
+    }
+
+    /// Opening a chat is one core step for both apps: the unread count and
+    /// the anchor (the oldest unread message, across every folded group, own
+    /// sends skipped) are captured, then the whole set is marked read.
+    #[tokio::test]
+    async fn open_conversation_anchors_at_the_oldest_unread_across_folded_groups() {
+        let sara = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+        let old_leg = join_group_from(&sara, &bob, "").await;
+        let new_leg = join_group_from(&sara, &bob, "").await;
+        let hex_of = |g: &GroupId| hex::encode(g.as_slice());
+        receive_text(&sara, &bob, &old_leg, "already read").await;
+        bob.open_conversation(&hex_of(&old_leg)).unwrap();
+
+        receive_text(&sara, &bob, &old_leg, "first new").await;
+        bob.send_text(&new_leg, "my own reply").await.unwrap();
+        receive_text(&sara, &bob, &new_leg, "second new").await;
+
+        let first_new = bob
+            .messages(&old_leg)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.content == "first new")
+            .unwrap()
+            .id;
+        let open = bob.open_conversation(&hex_of(&new_leg)).unwrap();
+        assert_eq!(open.unread_count, 2);
+        assert_eq!(open.unread_anchor_id, Some(first_new), "the oldest unread, in the other leg");
+        assert_eq!(open.group_ids.len(), 2);
+        assert!(open.newest_at_secs > 0);
+
+        let again = bob.open_conversation(&hex_of(&old_leg)).unwrap();
+        assert_eq!(again.unread_count, 0, "opening marked the whole set read");
+        assert_eq!(again.unread_anchor_id, None);
     }
 
     #[tokio::test]

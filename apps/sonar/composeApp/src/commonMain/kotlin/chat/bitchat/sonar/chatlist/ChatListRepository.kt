@@ -281,15 +281,24 @@ internal class ChatListRepository(
             .launchIn(scope)
     }
 
-    /** Optimistically clear badges and ask core to zero unread for [groupIds]. */
-    fun markRead(groupIds: Collection<String>) {
+    /** Optimistically clear badges and ask core to zero unread for [groupIds].
+     *  [mark] does the core write; the default marks each group, and a chat
+     *  open passes `openConversation`, which captures before it marks. */
+    fun markRead(
+        groupIds: Collection<String>,
+        mark: (suspend () -> Unit)? = null,
+    ) {
         if (groupIds.isEmpty()) return
         val marked = groupIds.toSet()
         unreadSuppressGroupIds.addAll(marked)
         unreadByChat = unreadByChat - marked
         scope.launch {
-            for (groupId in marked) {
-                runCatching { core.markConversationRead(groupId) }
+            if (mark != null) {
+                runCatching { mark() }
+            } else {
+                for (groupId in marked) {
+                    runCatching { core.markConversationRead(groupId) }
+                }
             }
             // End in-flight suppress for this batch, then reconcile from core.
             // Open-session suppress is re-applied inside applyUnread so a

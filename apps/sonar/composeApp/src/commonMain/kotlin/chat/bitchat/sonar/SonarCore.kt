@@ -809,6 +809,18 @@ data class SonarConversationSummary(
     val unreadCount: Long,
 )
 
+/** What core hands the transcript when a conversation opens
+ *  (`open_conversation`): captured, then the set is marked read, in one step. */
+data class SonarConversationOpen(
+    val groupIds: List<String>,
+    /** Unread at the moment of opening, before it was marked read. */
+    val unreadCount: Long,
+    /** The oldest unread message; the divider goes above it. */
+    val unreadAnchorId: String?,
+    /** Newest message second across the set. */
+    val newestAtSecs: Long,
+)
+
 /** Kind of a core-computed Messages-list row (`conversation_list`). */
 enum class SonarConversationListKind { Direct, Group, NoteToSelf }
 
@@ -1185,6 +1197,10 @@ expect object SonarCore {
 
     /** Seed core's name cache (titles the Messages list): pubkey hex → name. */
     suspend fun rememberPeerNames(names: Map<String, String>)
+
+    /** Open the conversation containing [groupIdHex]: unread count + anchor,
+     *  then the whole folded set marked read, in one core step. */
+    suspend fun openConversation(groupIdHex: String): SonarConversationOpen
 
     /** Update and privately fan out this device's current OS timezone. */
     suspend fun updateLocalTimezone(ianaIdentifier: String)

@@ -198,6 +198,45 @@ pub struct ConversationListRow {
     pub version: u64,
 }
 
+/// What opening a conversation hands the transcript (see
+/// `SonarClient::open_conversation`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationOpen {
+    /// Every group folded into the conversation, row group first.
+    pub group_ids: Vec<String>,
+    /// Unread at the moment of opening (before it was marked read).
+    pub unread_count: u64,
+    /// The oldest unread message: the divider goes above it. `None` when
+    /// nothing was unread.
+    pub unread_anchor_id: Option<nostr::EventId>,
+    /// Newest message second across the set: a host's transcript is not
+    /// complete until it holds a row this new.
+    pub newest_at_secs: u64,
+}
+
+/// The oldest unread message among `rows` (any order; sorted here newest
+/// first by `(created_at, id)`): the `unread`-th visible message from someone
+/// else, or the oldest such message read when there are fewer.
+pub fn unread_anchor(
+    rows: &mut [crate::marmot::ChatMessage],
+    unread: u64,
+) -> Option<nostr::EventId> {
+    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+    let mut counted = 0u64;
+    let mut last = None;
+    for row in rows.iter() {
+        if row.mine || !row.classification.is_transcript_visible() {
+            continue;
+        }
+        counted += 1;
+        last = Some(row.id);
+        if counted == unread {
+            break;
+        }
+    }
+    last
+}
+
 /// Position after which a page starts: the last row of the previous page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationListCursor {
