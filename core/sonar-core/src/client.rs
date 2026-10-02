@@ -4057,7 +4057,11 @@ impl SonarClient {
     /// first, Sonar marks the row pending in the outbox, and relay publish runs
     /// in the background. Publish success/failure only updates local delivery
     /// state; it does not gate transcript visibility.
-    pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
+    /// Send `text`; returns the stored message's id. It is written locally
+    /// before this returns, so hosts key their "Sending" bubble by this id and
+    /// match the transcript row exactly, instead of guessing by content and
+    /// time (R-001, R-002).
+    pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<EventId> {
         self.send_text_with_reply(group_id, text, None).await
     }
 
@@ -4066,7 +4070,7 @@ impl SonarClient {
         group_id: &GroupId,
         text: &str,
         reply: Option<&crate::reply::ReplyTo>,
-    ) -> Result<()> {
+    ) -> Result<EventId> {
         let local_started = Instant::now();
         // One MLS write guard covers encrypt + local-row write, so a
         // concurrently drained commit cannot land in between now that sends
@@ -4095,6 +4099,7 @@ impl SonarClient {
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        let message_id = message.id;
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(Some((group_name, message)), event_id);
@@ -4104,7 +4109,7 @@ impl SonarClient {
         // which a membership change holds across relay publication.
         self.prioritize_timezone_share(&group_id_hex);
         self.spawn_push_notification(group_id.clone(), publish_ack);
-        Ok(())
+        Ok(message_id)
     }
 
     /// Encrypt a NIP-25 kind-7 reaction, persist it locally, then publish.
@@ -4324,7 +4329,8 @@ impl SonarClient {
 
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
-    pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
+    /// Send a sticker; returns the stored message's id (see [`Self::send_text`]).
+    pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<EventId> {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
@@ -4342,9 +4348,10 @@ impl SonarClient {
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        let message_id = message.id;
         self.spawn_send_bookkeeping(Some((group_name, message)), event_id);
         self.spawn_push_notification(group_id.clone(), publish_ack);
-        Ok(())
+        Ok(message_id)
     }
 
     /// Fetch a sticker pack by its pack address coordinate.
@@ -13439,6 +13446,36 @@ mod tests {
         listener.changed.lock().unwrap().clear();
         assert_eq!(bob.remember_peer_names(&[(sara_hex, "Sara".into())]), 0);
         assert!(listener.changed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rumor_seconds_never_repeat_and_follow_the_wall_clock() {
+        use crate::marmot::next_rumor_second;
+        assert_eq!(next_rumor_second(100, 0), 100, "wall clock when the second is free");
+        assert_eq!(next_rumor_second(100, 100), 101, "a used second is never reused");
+        assert_eq!(next_rumor_second(100, 103), 104, "a burst runs ahead by its length");
+        assert_eq!(next_rumor_second(200, 104), 200, "then snaps back to the wall clock");
+    }
+
+    /// A send returns the id of the row it stored, so both apps match their
+    /// "Sending" bubble to the transcript row by id, never by content and time
+    /// (R-001, R-002). Two identical texts in a row get two distinct ids.
+    #[tokio::test]
+    async fn send_returns_the_id_of_the_stored_transcript_row() {
+        let luca = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let group = join_group_from(&luca, &bob, "").await;
+        let first = bob.send_text(&group, "same words").await.unwrap();
+        let second = bob.send_text(&group, "same words").await.unwrap();
+        assert_ne!(first, second, "identical texts are distinct rows");
+        let rows = bob.messages(&group).unwrap();
+        let mine: Vec<_> = rows.iter().filter(|m| m.mine).map(|m| m.id).collect();
+        assert!(mine.contains(&first) && mine.contains(&second), "{mine:?}");
+        let row = rows.iter().find(|m| m.id == second).unwrap();
+        assert_eq!(row.content, "same words");
+        assert!(row.mine);
     }
 
     #[tokio::test]

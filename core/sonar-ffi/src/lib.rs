@@ -1610,11 +1610,15 @@ impl SonarNode {
     }
 
     /// Encrypt + publish a text message to the group.
-    pub fn send_text(&self, group_id_hex: String, text: String) -> FfiResult<()> {
+    /// Send `text`; returns the stored message's id (hex). The row is written
+    /// locally before this returns: hosts key their "Sending" bubble by this
+    /// id and match the transcript row exactly (R-001, R-002).
+    pub fn send_text(&self, group_id_hex: String, text: String) -> FfiResult<String> {
         let group_id = parse_group_id(&group_id_hex)?;
-        self.runtime
+        let id = self
+            .runtime
             .block_on(self.client.send_text(&group_id, &text))?;
-        Ok(())
+        Ok(id.to_hex())
     }
 
     /// Like `send_text`, attaching a NIP-C7 reply pointer.
@@ -1625,19 +1629,19 @@ impl SonarNode {
         reply_to_hex: String,
         reply_to_npub: String,
         preview: Option<String>,
-    ) -> FfiResult<()> {
+    ) -> FfiResult<String> {
         let group_id = parse_group_id(&group_id_hex)?;
         let parent_id = nostr::EventId::from_hex(&reply_to_hex)
             .map_err(|e| SonarFfiError::InvalidInput(format!("reply_to: {e}")))?;
         let parent_pk = PublicKey::parse(&reply_to_npub)
             .map_err(invalid("reply_to npub"))?;
         let reply = sonar_core::reply::ReplyTo::new(parent_id, parent_pk, preview);
-        self.runtime.block_on(self.client.send_text_with_reply(
+        let id = self.runtime.block_on(self.client.send_text_with_reply(
             &group_id,
             &text,
             Some(&reply),
         ))?;
-        Ok(())
+        Ok(id.to_hex())
     }
 
     /// Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message.
@@ -1668,15 +1672,16 @@ impl SonarNode {
         pack_coordinate: String,
         shortcode: String,
         plaintext_sha256: String,
-    ) -> FfiResult<()> {
+    ) -> FfiResult<String> {
         let group_id = parse_group_id(&group_id_hex)?;
         let pack = sonar_stickers::PackAddress::parse(&pack_coordinate)
             .map_err(|e| SonarFfiError::InvalidInput(format!("bad pack coordinate: {e}")))?;
         let sticker_ref = sonar_stickers::StickerRef::new(pack, shortcode, plaintext_sha256)
             .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker ref: {e}")))?;
-        self.runtime
+        let id = self
+            .runtime
             .block_on(self.client.send_sticker(&group_id, &sticker_ref))?;
-        Ok(())
+        Ok(id.to_hex())
     }
 
     /// Fetch a sticker pack from relays by its pack address.
