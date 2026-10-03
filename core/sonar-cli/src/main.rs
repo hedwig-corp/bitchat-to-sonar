@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -11,6 +12,7 @@ use nostr_blossom::prelude::*;
 use nostr_sdk::Client as NostrClient;
 use serde::{Deserialize, Serialize};
 use sonar_core::client::{MediaUpload, SonarClient, DEFAULT_BLOSSOM_SERVER};
+use sonar_core::conversation_index::ConversationChangeListener;
 use sonar_core::identity::Identity;
 use sonar_core::marmot::DeliveryState;
 use sonar_core::GroupId;
@@ -1183,17 +1185,50 @@ fn init(home: PathBuf, relay_overrides: Vec<String>, args: InitArgs) -> Result<O
     })
 }
 
+/// Collects the groups the core reports as changed (the same database
+/// invalidation signal the apps repaint from), so a live wake scans only
+/// those transcripts instead of every row of every group.
+#[derive(Default)]
+struct ListenChangeCollector {
+    touched: Mutex<BTreeSet<String>>,
+}
+
+impl ListenChangeCollector {
+    fn take(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.touched.lock().unwrap())
+    }
+}
+
+impl ConversationChangeListener for ListenChangeCollector {
+    fn on_conversation_changed(&self, group_id_hex: String) {
+        self.touched.lock().unwrap().insert(group_id_hex);
+    }
+}
+
 async fn listen(loaded: LoadedConfig, args: ListenArgs) -> Result<()> {
     let client = loaded.connect().await?;
     if !args.no_publish {
         client.publish_key_package().await?;
     }
+    let collector = Arc::new(ListenChangeCollector::default());
+    client.set_conversation_change_listener(Some(collector.clone()));
     let seen_path = loaded.home.join(SEEN_FILE);
     let mut seen = load_seen(&seen_path)?;
     let start = Instant::now();
+    // The full pass (every group, every row, plus the seen-file prune) runs
+    // at start and on every poll cycle. A live wake used to run it too — on
+    // the Hermes agent's store that was 20 groups × 4,013 rows decrypted and
+    // a 560 KB seen.json rewrite per inbound message — so wakes now scan
+    // only the groups the core marked changed; reactions on old rows and
+    // anything the core did not attribute to a group ride the next poll.
+    let mut full_pass = true;
     loop {
-        client.sync().await?;
-        emit_unseen_messages(&client, &seen_path, &mut seen)?;
+        if full_pass {
+            client.sync().await?;
+            collector.take();
+            emit_unseen_messages(&client, &seen_path, &mut seen, None)?;
+            full_pass = false;
+        }
         if args.once {
             return Ok(());
         }
@@ -1205,7 +1240,14 @@ async fn listen(loaded: LoadedConfig, args: ListenArgs) -> Result<()> {
         let wait_secs = next_wait_secs(start, args.timeout_secs, args.poll_secs);
         if client.wait_for_marmot_event(wait_secs).await {
             client.drain_pending_marmot().await?;
-            emit_unseen_messages(&client, &seen_path, &mut seen)?;
+            let touched = collector.take();
+            if touched.is_empty() {
+                full_pass = true;
+            } else {
+                emit_unseen_messages(&client, &seen_path, &mut seen, Some(&touched))?;
+            }
+        } else {
+            full_pass = true;
         }
     }
 }
@@ -1248,43 +1290,82 @@ fn print_messages(client: &SonarClient, group_filter: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// What `listen` prints for one row, given what it printed before.
+#[derive(Debug, PartialEq, Eq)]
+struct SeenVerdict {
+    print_message: bool,
+    print_reactions: bool,
+    changed: bool,
+}
+
+/// Record a row in the seen state. A row prints once (inbound only); a
+/// changed reaction tally prints on its own unless the row itself is being
+/// printed now (its chips ride the message line).
+fn note_seen(seen: &mut SeenState, id: &str, mine: bool, fingerprint: &str) -> SeenVerdict {
+    let old = seen
+        .reaction_fingerprints
+        .get(id)
+        .map(String::as_str)
+        .unwrap_or("");
+    let reactions_changed = old != fingerprint;
+    if reactions_changed {
+        if fingerprint.is_empty() {
+            seen.reaction_fingerprints.remove(id);
+        } else {
+            seen.reaction_fingerprints
+                .insert(id.to_owned(), fingerprint.to_owned());
+        }
+    }
+    let first_sight = seen.message_ids.insert(id.to_owned());
+    let print_message = first_sight && !mine;
+    SeenVerdict {
+        print_message,
+        print_reactions: reactions_changed && !print_message,
+        changed: reactions_changed || first_sight,
+    }
+}
+
+/// Drop seen ids whose rows no longer exist: the file otherwise grows for
+/// the life of the identity (7,809 ids for 4,013 rows on the Hermes agent)
+/// and is rewritten on every inbound message. Returns true when it shrank.
+fn prune_seen(seen: &mut SeenState, live_ids: &BTreeSet<String>) -> bool {
+    let before = seen.message_ids.len() + seen.reaction_fingerprints.len();
+    seen.message_ids.retain(|id| live_ids.contains(id));
+    seen.reaction_fingerprints
+        .retain(|id, _| live_ids.contains(id));
+    before != seen.message_ids.len() + seen.reaction_fingerprints.len()
+}
+
+/// Print rows not printed before. `only` limits the scan to those groups (a
+/// live wake); `None` is the full pass over every group, which also prunes
+/// the seen state to rows that still exist.
 fn emit_unseen_messages(
     client: &SonarClient,
     seen_path: &Path,
     seen: &mut SeenState,
+    only: Option<&BTreeSet<String>>,
 ) -> Result<()> {
     let mut changed = false;
+    let mut live_ids = BTreeSet::new();
     for group in client.groups()? {
+        let group_hex = hex::encode(group.mls_group_id.as_slice());
+        if only.is_some_and(|wanted| !wanted.contains(&group_hex)) {
+            continue;
+        }
         let mut messages = client.messages(&group.mls_group_id)?;
         messages.sort_by_key(|m| m.created_at);
         for msg in messages {
             let id = msg.id.to_hex();
             let fingerprint = reaction_fingerprint(&msg.reactions);
-            let old = seen
-                .reaction_fingerprints
-                .get(&id)
-                .map(String::as_str)
-                .unwrap_or("");
-            let reactions_changed = old != fingerprint;
-            if reactions_changed {
-                if fingerprint.is_empty() {
-                    seen.reaction_fingerprints.remove(&id);
-                } else {
-                    seen.reaction_fingerprints
-                        .insert(id.clone(), fingerprint.clone());
-                }
-                changed = true;
+            let verdict = note_seen(seen, &id, msg.mine, &fingerprint);
+            changed |= verdict.changed;
+            if only.is_none() {
+                live_ids.insert(id);
             }
-            let first_sight = seen.message_ids.insert(id);
-            if first_sight {
-                changed = true;
-                if !msg.mine {
-                    print_json(&message_output(&msg))?;
-                }
+            if verdict.print_message {
+                print_json(&message_output(&msg))?;
             }
-            // A new inbound message already carries its chips in the line
-            // above; otherwise report the change on its own.
-            if reactions_changed && !(first_sight && !msg.mine) {
+            if verdict.print_reactions {
                 print_json(&Output::Reactions {
                     group_id: hex::encode(msg.group_id.as_slice()),
                     target_id: msg.id.to_hex(),
@@ -1297,6 +1378,9 @@ fn emit_unseen_messages(
                 })?;
             }
         }
+    }
+    if only.is_none() && prune_seen(seen, &live_ids) {
+        changed = true;
     }
     if changed {
         write_private_json(seen_path, seen)?;
@@ -1871,6 +1955,49 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_prints_once_and_its_reactions_print_when_they_change() {
+        let mut seen = SeenState::default();
+        let first = note_seen(&mut seen, "m1", false, "");
+        assert!(first.print_message && !first.print_reactions && first.changed);
+        let again = note_seen(&mut seen, "m1", false, "");
+        assert_eq!(
+            again,
+            SeenVerdict { print_message: false, print_reactions: false, changed: false }
+        );
+        // A chip lands on the already-printed row: its own line, once.
+        let chip = note_seen(&mut seen, "m1", false, "👍:1:false");
+        assert_eq!(
+            chip,
+            SeenVerdict { print_message: false, print_reactions: true, changed: true }
+        );
+        assert!(!note_seen(&mut seen, "m1", false, "👍:1:false").changed);
+        // Own rows never print as messages; a chip on them still reports.
+        let mine = note_seen(&mut seen, "m2", true, "🔥:1:false");
+        assert_eq!(
+            mine,
+            SeenVerdict { print_message: false, print_reactions: true, changed: true }
+        );
+    }
+
+    #[test]
+    fn prune_keeps_only_rows_that_still_exist() {
+        let mut seen = SeenState::default();
+        for id in ["gone-1", "gone-2", "live-1"] {
+            note_seen(&mut seen, id, false, "");
+        }
+        note_seen(&mut seen, "live-1", false, "👍:1:false");
+        note_seen(&mut seen, "gone-2", false, "👍:1:false");
+        let live: BTreeSet<String> = ["live-1".to_owned()].into_iter().collect();
+        assert!(prune_seen(&mut seen, &live));
+        assert_eq!(seen.message_ids.len(), 1);
+        assert!(seen.message_ids.contains("live-1"));
+        assert_eq!(seen.reaction_fingerprints.len(), 1);
+        assert!(!prune_seen(&mut seen, &live), "a second prune is a no-op");
+        // A pruned row that reappears prints again — it is no longer known.
+        assert!(note_seen(&mut seen, "gone-1", false, "").print_message);
+    }
 
     #[test]
     fn init_creates_loadable_private_config() {
