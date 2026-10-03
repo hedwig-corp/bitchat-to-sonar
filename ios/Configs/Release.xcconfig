@@ -1,4 +1,4 @@
-MARKETING_VERSION = 1.15.3
+MARKETING_VERSION = 1.15.4
 // App Store Connect rejects a second upload of a (MARKETING_VERSION,
 // CURRENT_PROJECT_VERSION) pair it has already accepted — it fails the
 // whole submission with "the state of the relationship 'buildUpload'".
@@ -10,7 +10,8 @@ MARKETING_VERSION = 1.15.3
 // v0.1-alpha.15.1 ships as 1.15.1/46 (slow-launch index repair, #629).
 // v0.1-alpha.15.2 ships as 1.15.2/47 (Apple-only: lost local-time share, #644).
 // v0.1-alpha.15.3 ships as 1.15.3/48 (catch-up order #649, sync freeze #650).
-CURRENT_PROJECT_VERSION = 48
+// v0.1-alpha.15.4 ships as 1.15.4/49 (offline→online freeze: #656, #657, #659).
+CURRENT_PROJECT_VERSION = 49
 
 IPHONEOS_DEPLOYMENT_TARGET = 16.0
 MACOSX_DEPLOYMENT_TARGET = 15.0

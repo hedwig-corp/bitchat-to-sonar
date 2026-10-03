@@ -1,42 +1,55 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.15.3 (48)** · **v0.1-alpha.15.3** (Android 0.1-alpha.15.3, code 26)
+Build: **Sonar 1.15.4 (49)** · **v0.1-alpha.15.4** (Android 0.1-alpha.15.4, code 27)
 
-Point release on alpha.15. **Headlines: messages you missed while away arrive
-on your next visit (#649), and the chat list no longer freezes while it
-catches up (#650).**
+Point release on alpha.15. **Headline: going from offline to online no
+longer freezes the app (#656, #657, #659).** The effect is biggest on
+accounts with hundreds of chats.
 
-## 0. Messages missed while you were away (headline, #649)
+## 0. Offline → online without freezing (headline, iOS)
 
-When two people were offline at alternating times, replies that landed while
-the app was away for more than 30 minutes could stay missing for days. The
-catch-up now runs the chats you were most recently active in first.
+Three things blocked the screen or the catch-up when the app came back:
+- recomputing every chat's local-time setting on the way into the
+  foreground (#656);
+- looking up every chat's mute state each time the chat list rebuilt (#659);
+- profile lookups and push-token messages queued ahead of the catch-up (#657).
+
+- Switch on airplane mode (or leave Sonar in the background) for a few
+  minutes, then come back. While it catches up, scroll the chat list and open
+  a chat straight away. It should stay smooth, with no one-second hitches.
+- Mute one chat first if you can. With nothing muted the app now skips that
+  lookup entirely, so a muted chat is what exercises the fixed path.
+- Messages that arrived while you were away should show up within a few
+  seconds, even with many chats.
+- If it still stutters: **Settings → Diagnostics → Share** right away.
+
+## 0a. Fewer background messages to your contacts (#657, iOS + Android)
+
+Sonar tells the people you chat with how to wake your phone for new
+messages. It used to resend that to everyone on every sync, which on a big
+account was hundreds of relay messages each time. It now goes to each person
+once, in small batches, and again only when your notification token changes.
+
+- Nothing to tap. Check that a message from someone you have not talked to in
+  a while still produces a notification while Sonar is closed.
+
+## 0b. Messages missed while you were away (from 1.15.3, #649)
 
 - Send a message in a chat, then leave Sonar in the background (or switch off
   data) for more than 30 minutes while the other person replies.
 - Open Sonar for about 15 seconds **without** opening that chat. The reply
   should already be in the chat row and in the transcript.
-- Especially useful on accounts with many chats: the chat you were last in
-  must not wait behind old, quiet ones.
 
-## 0a. No freezing while syncing (headline, iOS, #650)
-
-- Background the app a few minutes, bring it back, and while it catches up
-  scroll the chat list and open a chat. Nothing should stall or stutter.
-- If it does freeze: **Settings → Diagnostics → Share** right away. The log
-  now names what blocked the screen.
-
-## 0b. Local time in chats (from 1.15.2, #644)
+## 0c. Local time in chats (from 1.15.2, #644)
 
 - With **Settings → Privacy & safety → Share local time** on, ask a contact
-  on 1.15.2+ (or Android 0.1-alpha.15.3) to open your chat. Their header should show your time
-  (`10:48 PM`, plus `· N hours ahead/behind` if you are in different zones).
-- The first launch re-shares into your recent chats in small batches. Leave
-  the app open a minute; it must not flood or slow down.
+  on 1.15.2+ (or Android 0.1-alpha.15.3+) to open your chat. Their header
+  should show your time (`10:48 PM`, plus `· N hours ahead/behind` if you are
+  in different zones).
 - If a header still shows "Via internet" / "Nearby · Bluetooth" after a
   minute, send **Settings → Diagnostics → Share** from **both** phones.
 
-## 0c. Launch speed (from 1.15.1, #629)
+## 0d. Launch speed (from 1.15.1, #629)
 
 - Kill the app, reopen it. Home should show your chats within a couple of
   seconds, not sit empty while the network thrashes.
