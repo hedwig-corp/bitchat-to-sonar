@@ -77,6 +77,13 @@ chatting*, grant prompts) — that *is* scenario QA-022 on a fresh install.
 scripts/qa/android-smoke.sh            # exit status = failed scenarios
 ```
 
+Before a release, or when `plan.sh` asks for it, run it with `QA_SLOW=1`.
+That adds QA-142, about 12 min: the emulator goes offline until the outbox
+gives up on a share, and the peer must still receive it after reconnecting.
+Fresh peers on healthy relays never lose a publish, so the plain smoke
+cannot see bugs where an app thinks it sent something that never arrived
+(registry rule 6).
+
 It drives the app with `scripts/qa/android-ui.sh` against fresh peers and
 checks the automated registry scenarios (first message + keyboard, reply
 latency, pending draft, inbound-first, unread divider, labels, partial npub,
