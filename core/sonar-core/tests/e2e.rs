@@ -1459,3 +1459,548 @@ async fn wallet_offer_backups_are_sealed_to_the_account_and_survive_a_reinstall(
         .expect("fetch ok")
         .is_empty());
 }
+
+// ── Relay routes (#626): find peers, and be found, without sharing a relay ──
+
+mod relay_routes {
+    use super::*;
+    use sonar_core::relay_routes::{RecordOutcome, RelayRoutesConfig};
+
+    /// A throwaway reader for one relay: what does it hold for `author` of
+    /// `kind`? Waits for the socket so an unconnected pool cannot return an
+    /// empty answer that looks like "nothing stored".
+    async fn events_on(relay: &RelayUrl, author: PublicKey, kind: Kind) -> Vec<Event> {
+        let probe = NostrClient::default();
+        probe.add_relay(relay.clone()).await.expect("add relay");
+        probe.connect().await;
+        probe
+            .relay(relay.clone())
+            .await
+            .expect("relay handle")
+            .wait_for_connection(Duration::from_secs(5))
+            .await;
+        let filter = Filter::new().author(author).kind(kind);
+        let events = probe
+            .fetch_events_from(vec![relay.clone()], filter, Duration::from_secs(5))
+            .await
+            .expect("fetch");
+        probe.disconnect().await;
+        events.into_iter().collect()
+    }
+
+    /// Gift wraps addressed to `recipient` on one relay. The outer kind-1059
+    /// is signed by a throwaway key (NIP-59), so only the `p` tag identifies
+    /// them.
+    async fn gift_wraps_for(relay: &RelayUrl, recipient: PublicKey) -> Vec<Event> {
+        let probe = NostrClient::default();
+        probe.add_relay(relay.clone()).await.expect("add relay");
+        probe.connect().await;
+        probe
+            .relay(relay.clone())
+            .await
+            .expect("relay handle")
+            .wait_for_connection(Duration::from_secs(5))
+            .await;
+        let filter = Filter::new().kind(Kind::GiftWrap).pubkey(recipient);
+        let events = probe
+            .fetch_events_from(vec![relay.clone()], filter, Duration::from_secs(5))
+            .await
+            .expect("fetch");
+        probe.disconnect().await;
+        events.into_iter().collect()
+    }
+
+    /// Publish an already-signed event to one relay.
+    async fn publish_on(relay: &RelayUrl, event: &Event) {
+        let probe = NostrClient::default();
+        probe.add_relay(relay.clone()).await.expect("add relay");
+        probe.connect().await;
+        probe
+            .relay(relay.clone())
+            .await
+            .expect("relay handle")
+            .wait_for_connection(Duration::from_secs(5))
+            .await;
+        let out = probe
+            .send_event_to(vec![relay.clone()], event)
+            .await
+            .expect("publish");
+        assert!(!out.success.is_empty(), "relay accepted the seed event");
+        probe.disconnect().await;
+    }
+
+    async fn connect_with_lookup(relays: Vec<RelayUrl>, lookup: Vec<RelayUrl>) -> SonarClient {
+        SonarClient::connect_in_memory_with_routes(
+            Identity::generate(),
+            relays,
+            RelayRoutesConfig::local(lookup),
+        )
+        .await
+        .expect("client connects")
+    }
+
+    /// Sync until `group` shows at least `expected` messages. Foreign-relay
+    /// publishes go through a second pool that connects on demand, so the
+    /// first sync after a send can legitimately land before the event.
+    async fn sync_until_messages(
+        client: &SonarClient,
+        group: &sonar_core::GroupId,
+        expected: usize,
+    ) {
+        for _ in 0..60 {
+            client.sync().await.expect("sync");
+            if client.messages(group).expect("messages").len() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("group never reached {expected} message(s)");
+    }
+
+    /// The acceptance test from #626 / #113: two accounts whose relay sets
+    /// are disjoint complete a DM round trip, because Alice's lists reach the
+    /// lookup relay, Bob reads them there, fetches her KeyPackage from her
+    /// relay, delivers the welcome to her inbox, and both publish group
+    /// messages to the union of relays.
+    #[tokio::test]
+    async fn disjoint_relay_sets_complete_a_dm_round_trip_through_a_lookup_relay() {
+        let relay_a = MockRelay::run().await.expect("relay A");
+        let relay_b = MockRelay::run().await.expect("relay B");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_a, url_b, url_l) = (relay_a.url().await, relay_b.url().await, lookup.url().await);
+
+        let alice = connect_with_lookup(vec![url_a.clone()], vec![url_l.clone()]).await;
+        let bob = connect_with_lookup(vec![url_b.clone()], vec![url_l.clone()]).await;
+        let alice_pk = alice.identity().public_key();
+
+        alice.publish_key_package().await.expect("alice publishes");
+
+        // Her lists are on the lookup relay; her KeyPackage is not (no
+        // indexer stores kind 30443, and the copy must not be attempted).
+        assert_eq!(events_on(&url_l, alice_pk, Kind::RelayList).await.len(), 1);
+        assert_eq!(
+            events_on(&url_l, alice_pk, Kind::InboxRelays).await.len(),
+            1
+        );
+        assert!(events_on(&url_l, alice_pk, Kind::Custom(KEY_PACKAGE_KIND))
+            .await
+            .is_empty());
+        assert_eq!(
+            events_on(&url_a, alice_pk, Kind::Custom(KEY_PACKAGE_KIND))
+                .await
+                .len(),
+            1
+        );
+
+        // Bob shares no relay with Alice.
+        let bob_group = timeout(
+            Duration::from_secs(60),
+            bob.start_dm(alice_pk, "bob & alice"),
+        )
+        .await
+        .expect("start_dm did not time out")
+        .expect("bob starts the dm");
+        let group_relays = bob.engine().group_relays(&bob_group).expect("group relays");
+        assert!(
+            group_relays.contains(&url_a),
+            "group names alice's relay: {group_relays:?}"
+        );
+        assert!(
+            group_relays.contains(&url_b),
+            "group names bob's relay: {group_relays:?}"
+        );
+
+        bob.send_text(&bob_group, "hi from relay B")
+            .await
+            .expect("bob sends");
+
+        // Alice reads only her own relay: the welcome and the message got there.
+        alice.sync().await.expect("alice syncs");
+        let alice_groups = alice.groups().expect("alice groups");
+        assert_eq!(alice_groups.len(), 1, "welcome reached alice's inbox relay");
+        let alice_group = alice_groups[0].mls_group_id.clone();
+        sync_until_messages(&alice, &alice_group, 1).await;
+        let seen = alice.messages(&alice_group).expect("alice messages");
+        assert_eq!(seen[0].content, "hi from relay B");
+
+        // And the other direction: Alice publishes to the group's relays,
+        // which include Bob's.
+        alice
+            .send_text(&alice_group, "hi back from relay A")
+            .await
+            .expect("alice replies");
+        sync_until_messages(&bob, &bob_group, 2).await;
+        let reply = bob
+            .messages(&bob_group)
+            .expect("bob messages")
+            .into_iter()
+            .find(|m| m.sender == alice_pk)
+            .expect("alice's reply reached bob's relay");
+        assert_eq!(reply.content, "hi back from relay A");
+    }
+
+    /// An imported account already has lists from another client, on relays
+    /// Sonar is not on. They must survive untouched (kinds 10002/10050 are
+    /// replaceable — publishing defaults would replace them network-wide),
+    /// and the KeyPackage must follow the user's real write relay so peers
+    /// honouring that list find it.
+    #[tokio::test]
+    async fn existing_relay_lists_are_kept_and_their_relays_adopted() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let relay_theirs = MockRelay::run().await.expect("the user's relay");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_own, url_theirs, url_l) = (
+            relay_own.url().await,
+            relay_theirs.url().await,
+            lookup.url().await,
+        );
+
+        let identity = Identity::generate();
+        let pk = identity.public_key();
+        let outbox_list = EventBuilder::relay_list([(url_theirs.clone(), None)])
+            .build(pk)
+            .sign_with_keys(identity.keys())
+            .expect("sign 10002");
+        let inbox_list = EventBuilder::new(Kind::InboxRelays, "")
+            .tags([Tag::relay(url_theirs.clone())])
+            .build(pk)
+            .sign_with_keys(identity.keys())
+            .expect("sign 10050");
+        publish_on(&url_l, &outbox_list).await;
+        publish_on(&url_l, &inbox_list).await;
+
+        let client = SonarClient::connect_in_memory_with_routes(
+            identity,
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_l.clone()]),
+        )
+        .await
+        .expect("connects");
+        client.publish_key_package().await.expect("publishes");
+
+        // Same signed events, untouched; nothing of Sonar's on its own relay.
+        let kept = events_on(&url_l, pk, Kind::RelayList).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, outbox_list.id, "10002 replaced");
+        let kept = events_on(&url_l, pk, Kind::InboxRelays).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, inbox_list.id, "10050 replaced");
+        assert!(events_on(&url_own, pk, Kind::RelayList).await.is_empty());
+        assert!(events_on(&url_own, pk, Kind::InboxRelays).await.is_empty());
+
+        // The KeyPackage went where the user's list says they write.
+        assert_eq!(
+            events_on(&url_theirs, pk, Kind::Custom(KEY_PACKAGE_KIND))
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            events_on(&url_own, pk, Kind::Custom(KEY_PACKAGE_KIND))
+                .await
+                .len(),
+            1
+        );
+
+        // A peer on a third relay follows the list and finds the package.
+        let relay_peer = MockRelay::run().await.expect("peer relay");
+        let peer = connect_with_lookup(vec![relay_peer.url().await], vec![url_l]).await;
+        let found = timeout(Duration::from_secs(30), peer.fetch_key_package(pk))
+            .await
+            .expect("fetch did not time out")
+            .expect("KeyPackage found via the adopted write relay");
+        assert_eq!(found.pubkey, pk);
+
+        // And a welcome for the account goes to the inbox relay the user chose.
+        let group = timeout(Duration::from_secs(60), peer.start_dm(pk, "peer & user"))
+            .await
+            .expect("start_dm did not time out")
+            .expect("dm starts");
+        assert!(peer
+            .engine()
+            .group_relays(&group)
+            .unwrap()
+            .contains(&url_theirs));
+        let wraps = gift_wraps_for(&url_theirs, pk).await;
+        assert_eq!(
+            wraps.len(),
+            1,
+            "welcome delivered to the user's inbox relay"
+        );
+    }
+
+    /// "Nobody answered" is not "nobody has one": with the lookup relay
+    /// down, nothing is published — not even to our own relay, which did
+    /// answer — so a bad network can never overwrite an imported account's
+    /// lists. The KeyPackage itself still goes out.
+    #[tokio::test]
+    async fn nothing_is_published_when_no_lookup_relay_answers() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let url_own = relay_own.url().await;
+        // Nothing listens on port 1: the connect is refused at once. (A
+        // `MockRelay` that was `shutdown()` keeps accepting for a while.)
+        let url_dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+
+        let client = SonarClient::connect_in_memory_with_routes(
+            Identity::generate(),
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_dead]),
+        )
+        .await
+        .expect("connects");
+        let pk = client.identity().public_key();
+
+        let report = timeout(
+            Duration::from_secs(30),
+            client.distribute_account_records(true),
+        )
+        .await
+        .expect("distribution did not time out");
+        assert!(report.lookup_failed, "{report:?}");
+        assert!(report.actions.is_empty(), "{report:?}");
+
+        client
+            .publish_key_package()
+            .await
+            .expect("key package still publishes");
+        assert_eq!(
+            events_on(&url_own, pk, Kind::Custom(KEY_PACKAGE_KIND))
+                .await
+                .len(),
+            1
+        );
+        assert!(events_on(&url_own, pk, Kind::RelayList).await.is_empty());
+        assert!(events_on(&url_own, pk, Kind::InboxRelays).await.is_empty());
+        assert!(events_on(&url_own, pk, Kind::MlsKeyPackageRelays)
+            .await
+            .is_empty());
+    }
+
+    /// A persistent install distributes once, skips inside the interval,
+    /// and a later forced pass re-broadcasts the same signed event instead
+    /// of minting a new one (stable `created_at`, no relay churn).
+    #[tokio::test]
+    async fn records_are_not_republished_within_the_interval_and_rebroadcast_unchanged_after() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_own, url_l) = (relay_own.url().await, lookup.url().await);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let client = SonarClient::connect_with_routes(
+            Identity::generate(),
+            vec![url_own.clone()],
+            dir.path().join("marmot.sqlite"),
+            [0x62; 32],
+            RelayRoutesConfig::local(vec![url_l.clone()]),
+        )
+        .await
+        .expect("connects");
+        let pk = client.identity().public_key();
+
+        let first = client.distribute_account_records(false).await;
+        assert!(!first.lookup_failed && !first.skipped_fresh, "{first:?}");
+        assert!(
+            matches!(
+                first.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Published { accepted }) if *accepted >= 2
+            ),
+            "{first:?}"
+        );
+        assert!(
+            matches!(
+                first.actions.get(&Kind::Metadata.as_u16()),
+                Some(RecordOutcome::Absent)
+            ),
+            "no profile was invented: {first:?}"
+        );
+        let published = events_on(&url_l, pk, Kind::RelayList).await;
+        assert_eq!(published.len(), 1);
+
+        let second = client.distribute_account_records(false).await;
+        assert!(second.skipped_fresh, "{second:?}");
+
+        let third = client.distribute_account_records(true).await;
+        assert!(
+            matches!(
+                third.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Rebroadcast { .. })
+            ),
+            "{third:?}"
+        );
+        let again = events_on(&url_l, pk, Kind::RelayList).await;
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            again[0].id, published[0].id,
+            "rebroadcast minted a new event"
+        );
+    }
+
+    /// A recipient with a kind-10002 but no kind-10050 still gets the
+    /// welcome: it goes to their read relays instead of failing outright
+    /// (which is what the current White Noise runtime does).
+    #[tokio::test]
+    async fn welcome_falls_back_to_read_relays_when_the_recipient_has_no_inbox_list() {
+        let relay_a = MockRelay::run().await.expect("relay A");
+        let relay_b = MockRelay::run().await.expect("relay B");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_a, url_b, url_l) = (relay_a.url().await, relay_b.url().await, lookup.url().await);
+
+        // Alice publishes her KeyPackage with routing disabled: no lists of
+        // her own. Someone (another client) published only a 10002 for her.
+        let alice = SonarClient::connect_in_memory(Identity::generate(), vec![url_a.clone()])
+            .await
+            .expect("alice connects");
+        let alice_pk = alice.identity().public_key();
+        alice.publish_key_package().await.expect("alice publishes");
+        let outbox_only = EventBuilder::relay_list([(url_a.clone(), None)])
+            .build(alice_pk)
+            .sign_with_keys(alice.identity().keys())
+            .expect("sign 10002");
+        publish_on(&url_l, &outbox_only).await;
+        assert!(events_on(&url_l, alice_pk, Kind::InboxRelays)
+            .await
+            .is_empty());
+
+        let bob = connect_with_lookup(vec![url_b], vec![url_l]).await;
+        let bob_group = timeout(
+            Duration::from_secs(60),
+            bob.start_dm(alice_pk, "bob & alice"),
+        )
+        .await
+        .expect("start_dm did not time out")
+        .expect("bob starts the dm");
+        assert!(bob
+            .engine()
+            .group_relays(&bob_group)
+            .unwrap()
+            .contains(&url_a));
+
+        alice.sync().await.expect("alice syncs");
+        assert_eq!(
+            alice.groups().expect("groups").len(),
+            1,
+            "welcome reached alice's read relay"
+        );
+    }
+
+    /// Absence needs every lookup relay: with one indexer silent, a default
+    /// is deferred (nothing published anywhere), because the silent one may
+    /// be the one holding the user's real list. A list found on the relay
+    /// that did answer is acted on regardless.
+    #[tokio::test]
+    async fn defaults_wait_until_every_lookup_relay_answers_but_a_found_list_does_not() {
+        use sonar_core::relay_routes::RecordOutcome;
+
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let live = MockRelay::run().await.expect("live lookup relay");
+        let (url_own, url_live) = (relay_own.url().await, live.url().await);
+        let url_dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+
+        let identity = Identity::generate();
+        let pk = identity.public_key();
+        let keys = identity.keys().clone();
+        let client = SonarClient::connect_in_memory_with_routes(
+            identity,
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_live.clone(), url_dead]),
+        )
+        .await
+        .expect("connects");
+
+        let report = timeout(
+            Duration::from_secs(60),
+            client.distribute_account_records(true),
+        )
+        .await
+        .expect("distribution did not time out");
+        assert!(!report.lookup_failed, "{report:?}");
+        assert!(
+            matches!(
+                report.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Deferred {
+                    answered: 1,
+                    asked: 2
+                })
+            ),
+            "{report:?}"
+        );
+        assert!(events_on(&url_live, pk, Kind::RelayList).await.is_empty());
+        assert!(events_on(&url_own, pk, Kind::RelayList).await.is_empty());
+
+        // The user's own list turns up on the live relay: acted on at once.
+        let list = EventBuilder::relay_list([(url_own.clone(), None)])
+            .build(pk)
+            .sign_with_keys(&keys)
+            .expect("sign 10002");
+        publish_on(&url_live, &list).await;
+        let report = timeout(
+            Duration::from_secs(60),
+            client.distribute_account_records(true),
+        )
+        .await
+        .expect("distribution did not time out");
+        assert!(
+            matches!(
+                report.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Rebroadcast { .. })
+            ),
+            "{report:?}"
+        );
+        let on_own = events_on(&url_own, pk, Kind::RelayList).await;
+        assert_eq!(on_own.len(), 1);
+        assert_eq!(on_own[0].id, list.id, "rebroadcast changed the event");
+
+        // Acted on, but not stamped: with a relay still silent, the next
+        // connect must look again (the silent one may hold a newer list).
+        let next = client.distribute_account_records(false).await;
+        assert!(
+            !next.skipped_fresh,
+            "partial lookup stamped freshness: {next:?}"
+        );
+    }
+
+    /// A welcome that reaches none of the recipient's inbox relays is a
+    /// failed send, not a success the peer never sees: the DM start fails
+    /// and leaves no half-created group behind.
+    #[tokio::test]
+    async fn a_welcome_that_reaches_no_inbox_relay_fails_the_dm_start() {
+        let relay_a = MockRelay::run().await.expect("relay A");
+        let relay_b = MockRelay::run().await.expect("relay B");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_a, url_b, url_l) = (relay_a.url().await, relay_b.url().await, lookup.url().await);
+        let url_dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+
+        let alice = SonarClient::connect_in_memory(Identity::generate(), vec![url_a.clone()])
+            .await
+            .expect("alice connects");
+        let alice_pk = alice.identity().public_key();
+        alice.publish_key_package().await.expect("alice publishes");
+        let outbox = EventBuilder::relay_list([(url_a.clone(), None)])
+            .build(alice_pk)
+            .sign_with_keys(alice.identity().keys())
+            .expect("sign 10002");
+        let inbox = EventBuilder::new(Kind::InboxRelays, "")
+            .tags([Tag::relay(url_dead)])
+            .build(alice_pk)
+            .sign_with_keys(alice.identity().keys())
+            .expect("sign 10050");
+        publish_on(&url_l, &outbox).await;
+        publish_on(&url_l, &inbox).await;
+
+        let bob = connect_with_lookup(vec![url_b], vec![url_l]).await;
+        let result = timeout(
+            Duration::from_secs(60),
+            bob.start_dm(alice_pk, "bob & alice"),
+        )
+        .await
+        .expect("start_dm did not time out");
+        assert!(
+            result.is_err(),
+            "dm start succeeded with the welcome undelivered"
+        );
+        assert!(
+            bob.groups().expect("groups").is_empty(),
+            "half-created group left behind"
+        );
+    }
+}

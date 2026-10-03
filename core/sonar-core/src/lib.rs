@@ -25,6 +25,7 @@ pub mod own_profile;
 pub mod push;
 pub mod reaction;
 pub mod relay_directory;
+pub mod relay_routes;
 pub mod reply;
 pub mod sonar_descriptor;
 pub mod sqlcipher_runtime;
