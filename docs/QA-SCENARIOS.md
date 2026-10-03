@@ -1167,6 +1167,79 @@ real mint and need the maintainer's approval of the amounts.
   the amount never on screen; Compose ignored that amount and paid the typed
   one.
 
+## Relay lists on indexers (#626)
+
+Being found without sharing a relay. Design and the decision table:
+[`docs/RELAY-ROUTES.md`](RELAY-ROUTES.md). Each scenario is automated in
+`core/sonar-core/tests/e2e.rs` (`relay_routes` module) against in-process
+`MockRelay`s; the app-level steps are for a real build against public relays.
+
+### QA-137 — Another Nostr client finds a Sonar account without sharing a relay
+- **Platforms:** both (core); app check on either.
+- **Steps:** Fresh account in the app; let it connect for a minute. From a
+  machine that knows only the indexer: `nak req -k 10002 -a <hex> wss://purplepag.es`,
+  then the same for `-k 10050` and `-k 0`. Open the npub in Amethyst or
+  Coracle.
+- **Expect:** 10002 lists the app's five relays (unmarked), 10050 lists
+  `nostr.relay.hedwig.sh` first plus two more, kind-0 carries the nickname.
+  The KeyPackage (`-k 30443`) is on the relays the 10002 names, not on
+  purplepag.es. The other client shows the name. The app's Marmot pool still
+  lists only its five relays.
+- **Guard:** `e2e::relay_routes::an_outbox_client_finds_a_sonar_account_through_the_lookup_relay_alone`,
+  `client::tests::lookup_relays_never_join_the_marmot_pool`
+- **Origin:** #626: Sonar published no relay lists and nothing to indexers.
+
+### QA-138 — An imported account keeps the relay lists it already had
+- **Platforms:** both.
+- **Steps:** Take an nsec that already has a kind-10002 and kind-10050 from
+  another client (Damus, Amethyst) naming relays Sonar is not on. Import it
+  (restore), let the app connect, wait a minute.
+- **Expect:** on `purplepag.es` the account's 10002 and 10050 are the same
+  events as before (same ids, same `created_at`): nothing was replaced. The
+  app's KeyPackage is also on the write relay that list names.
+- **Guard:** `e2e::relay_routes::existing_relay_lists_are_kept_and_their_relays_adopted`,
+  `relay_routes::tests::plan_rebroadcasts_a_list_that_names_us_and_adopts_one_that_does_not`
+- **Origin:** #626. Kinds 10002/10050 are replaceable; a default published
+  over the user's real list replaces it network-wide.
+
+### QA-139 — Nothing is published without a lookup quorum
+- **Platforms:** both.
+- **Steps:** Fresh account. Firewall the indexers (`purplepag.es`,
+  `user.kindpag.es`, `indexer.coracle.social`, `relay.ditto.pub`,
+  `index.hzrd149.com`) but not the five Marmot relays. Connect. Then unblock
+  all but two and reconnect. Then unblock all.
+- **Expect:** all blocked: the KeyPackage is published, no 10002/10050/10051
+  appears anywhere, every list kind is logged as `relay record not found, but
+  too few lookup relays answered; deferred`. Three blocked (2 of 5 answer,
+  quorum is 3): still no default, and a *first* profile publish is refused
+  rather than published over a profile the lookup could not read — but a
+  rename of an account whose profile is already on the Marmot relays still
+  publishes (a found profile is the profile). Two blocked (3 of 5 answer):
+  everything is published; two dead indexers must not block the account.
+- **Guard:** `e2e::relay_routes::nothing_is_published_when_no_lookup_relay_answers`,
+  `e2e::relay_routes::defaults_wait_for_a_lookup_quorum_but_a_found_list_does_not`,
+  `e2e::relay_routes::a_profile_is_not_published_over_one_the_lookup_could_not_read`,
+  `e2e::relay_routes::a_rename_publishes_when_own_relays_hold_the_profile_and_indexers_are_silent`,
+  `relay_routes::tests::absence_needs_a_majority_of_the_relays_asked`,
+  `relay_routes::tests::a_lookup_counts_own_relays_as_reached_but_not_as_absence_evidence`
+- **Origin:** #626 and the #628 review: "nobody answered" and "one relay had
+  nothing" must never read as "nobody has one".
+
+### QA-140 — Relay records are not republished on every connect
+- **Platforms:** both.
+- **Steps:** Connected account with lists already distributed. Toggle
+  airplane mode three times in a minute (three relay connects). Separately:
+  block every indexer but leave one lookup relay reachable, connect twice.
+- **Expect:** the 10002 on `purplepag.es` keeps its event id and
+  `created_at`; the core logs at most one `record spread` per kind per 24 h.
+  With the indexers blocked, the second connect runs the pass again (a copy
+  that reached only our relays does not make the account findable).
+- **Guard:** `e2e::relay_routes::records_are_not_republished_within_the_interval_and_rebroadcast_unchanged_after`,
+  `e2e::relay_routes::a_pass_that_reached_no_indexer_is_retried_on_the_next_connect`,
+  `e2e::relay_routes::a_kind_the_indexer_refuses_is_retried_not_stamped`,
+  `relay_routes::tests::a_record_is_stamped_only_when_an_indexer_took_it`
+- **Origin:** #626; same churn class as the kind-0 republish fixed in #584.
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs

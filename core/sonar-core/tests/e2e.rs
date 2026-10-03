@@ -1459,3 +1459,617 @@ async fn wallet_offer_backups_are_sealed_to_the_account_and_survive_a_reinstall(
         .expect("fetch ok")
         .is_empty());
 }
+
+// ── Relay routes (#626): be found without sharing a relay ──
+
+mod relay_routes {
+    use super::*;
+    use sonar_core::relay_routes::{RecordOutcome, RelayRoutesConfig};
+
+    /// A throwaway reader for one relay: what does it hold for `author` of
+    /// `kind`? Waits for the socket so an unconnected pool cannot return an
+    /// empty answer that looks like "nothing stored".
+    async fn events_on(relay: &RelayUrl, author: PublicKey, kind: Kind) -> Vec<Event> {
+        let probe = NostrClient::default();
+        probe.add_relay(relay.clone()).await.expect("add relay");
+        probe.connect().await;
+        probe
+            .relay(relay.clone())
+            .await
+            .expect("relay handle")
+            .wait_for_connection(Duration::from_secs(5))
+            .await;
+        let filter = Filter::new().author(author).kind(kind);
+        let events = probe
+            .fetch_events_from(vec![relay.clone()], filter, Duration::from_secs(5))
+            .await
+            .expect("fetch");
+        probe.disconnect().await;
+        events.into_iter().collect()
+    }
+
+    /// Publish an already-signed event to one relay.
+    async fn publish_on(relay: &RelayUrl, event: &Event) {
+        let probe = NostrClient::default();
+        probe.add_relay(relay.clone()).await.expect("add relay");
+        probe.connect().await;
+        probe
+            .relay(relay.clone())
+            .await
+            .expect("relay handle")
+            .wait_for_connection(Duration::from_secs(5))
+            .await;
+        let out = probe
+            .send_event_to(vec![relay.clone()], event)
+            .await
+            .expect("publish");
+        assert!(!out.success.is_empty(), "relay accepted the seed event");
+        probe.disconnect().await;
+    }
+
+    /// `events_on` until at least `n` events show up, for copies that are
+    /// spawned rather than awaited (the indexer copy of a profile).
+    async fn wait_for_events(
+        relay: &RelayUrl,
+        author: PublicKey,
+        kind: Kind,
+        n: usize,
+    ) -> Vec<Event> {
+        for _ in 0..40 {
+            let found = events_on(relay, author, kind).await;
+            if found.len() >= n {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("relay never showed {n} event(s) of kind {}", kind.as_u16());
+    }
+
+    /// A relay that refuses one kind with an OK=false, like an indexer that
+    /// does not take that record.
+    #[derive(Debug)]
+    struct RejectKind(Kind);
+
+    impl nostr_relay_builder::prelude::WritePolicy for RejectKind {
+        fn admit_event<'a>(
+            &'a self,
+            event: &'a Event,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr::util::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult> {
+            use nostr_relay_builder::prelude::PolicyResult;
+            let verdict = if event.kind == self.0 {
+                PolicyResult::Reject("blocked: kind not accepted here".into())
+            } else {
+                PolicyResult::Accept
+            };
+            Box::pin(async move { verdict })
+        }
+    }
+
+    async fn relay_rejecting(kind: Kind) -> nostr_relay_builder::prelude::LocalRelay {
+        let relay = nostr_relay_builder::prelude::LocalRelay::new(
+            nostr_relay_builder::prelude::RelayBuilder::default().write_policy(RejectKind(kind)),
+        );
+        relay.run().await.expect("rejecting relay starts");
+        relay
+    }
+
+    async fn connect_with_lookup(relays: Vec<RelayUrl>, lookup: Vec<RelayUrl>) -> SonarClient {
+        SonarClient::connect_in_memory_with_routes(
+            Identity::generate(),
+            relays,
+            RelayRoutesConfig::local(lookup),
+        )
+        .await
+        .expect("client connects")
+    }
+
+    /// The headline claim: a client that knows only the lookup relay finds a
+    /// Sonar account — its outbox and inbox lists, the profile, and (by
+    /// following the outbox list) the KeyPackage — without sharing a single
+    /// relay with it. No indexer gets the KeyPackage itself.
+    #[tokio::test]
+    async fn an_outbox_client_finds_a_sonar_account_through_the_lookup_relay_alone() {
+        let relay_a = MockRelay::run().await.expect("sonar relay");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_a, url_l) = (relay_a.url().await, lookup.url().await);
+
+        let alice = connect_with_lookup(vec![url_a.clone()], vec![url_l.clone()]).await;
+        let pk = alice.identity().public_key();
+        alice.publish_key_package().await.expect("publish");
+        alice
+            .publish_profile("Alice on Sonar", Some("findable"), None)
+            .await
+            .expect("profile");
+
+        // Step 1: the lookup relay says where Alice writes and reads DMs.
+        let outbox = events_on(&url_l, pk, Kind::RelayList).await;
+        assert_eq!(outbox.len(), 1, "10002 on the lookup relay");
+        let write: Vec<RelayUrl> = nostr::nips::nip65::extract_relay_list(&outbox[0])
+            .filter(|(_, m)| !matches!(m, Some(RelayMetadata::Read)))
+            .map(|(u, _)| u.clone())
+            .collect();
+        assert_eq!(write, vec![url_a.clone()]);
+        assert_eq!(events_on(&url_l, pk, Kind::InboxRelays).await.len(), 1);
+        assert_eq!(
+            events_on(&url_l, pk, Kind::MlsKeyPackageRelays).await.len(),
+            1,
+            "legacy 10051 twin for older clients"
+        );
+
+        // Step 2: the profile is on the lookup relay (copied off the
+        // caller's path) and where Alice writes.
+        let profile = wait_for_events(&url_l, pk, Kind::Metadata, 1).await;
+        assert_eq!(profile.len(), 1, "kind-0 copied to the lookup relay");
+        assert!(profile[0].content.contains("Alice on Sonar"));
+        assert_eq!(events_on(&write[0], pk, Kind::Metadata).await.len(), 1);
+
+        // Step 3: the KeyPackage is where the list says, and only there.
+        assert_eq!(
+            events_on(&write[0], pk, Kind::Custom(KEY_PACKAGE_KIND))
+                .await
+                .len(),
+            1
+        );
+        assert!(events_on(&url_l, pk, Kind::Custom(KEY_PACKAGE_KIND))
+            .await
+            .is_empty());
+    }
+
+    /// Kind-0 follows the same evidence rule as the lists. An imported
+    /// account's profile may live only on lookup relays; if too few of them
+    /// answer and none had it, publishing would replace a profile we never
+    /// read, so the publish is refused and nothing goes out. Once the
+    /// profile is readable, the publish merges over it (fields kept).
+    #[tokio::test]
+    async fn a_profile_is_not_published_over_one_the_lookup_could_not_read() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let live = MockRelay::run().await.expect("live lookup relay");
+        let (url_own, url_live) = (relay_own.url().await, live.url().await);
+        let url_dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+
+        let identity = Identity::generate();
+        let pk = identity.public_key();
+        let keys = identity.keys().clone();
+        let client = SonarClient::connect_in_memory_with_routes(
+            identity,
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_live.clone(), url_dead]),
+        )
+        .await
+        .expect("connects");
+
+        let refused = timeout(
+            Duration::from_secs(60),
+            client.publish_profile("New Name", None, None),
+        )
+        .await
+        .expect("publish did not time out");
+        assert!(refused.is_err(), "published over an unreadable profile");
+        assert!(events_on(&url_own, pk, Kind::Metadata).await.is_empty());
+        assert!(events_on(&url_live, pk, Kind::Metadata).await.is_empty());
+
+        // The real profile (set by another client) is on the live relay.
+        let real = EventBuilder::metadata(
+            &Metadata::new()
+                .name("Old Name")
+                .about("written by another client"),
+        )
+        .build(pk)
+        .sign_with_keys(&keys)
+        .expect("sign kind-0");
+        publish_on(&url_live, &real).await;
+        timeout(
+            Duration::from_secs(60),
+            client.publish_profile("New Name", None, None),
+        )
+        .await
+        .expect("publish did not time out")
+        .expect("profile readable now");
+        let merged = events_on(&url_own, pk, Kind::Metadata).await;
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].content.contains("New Name"));
+        assert!(
+            merged[0].content.contains("written by another client"),
+            "merge dropped a field the other client set"
+        );
+    }
+
+    /// A copy that reached our relays but no indexer does not make the
+    /// account findable, so it is not stamped and the next connect tries
+    /// again instead of waiting out the 24 h interval.
+    #[tokio::test]
+    async fn a_pass_that_reached_no_indexer_is_retried_on_the_next_connect() {
+        use sonar_core::relay_routes::{IndexerRelay, RecordOutcome};
+
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_own, url_l) = (relay_own.url().await, lookup.url().await);
+        let dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+        let config = RelayRoutesConfig {
+            lookup_relays: vec![url_l],
+            indexers: vec![IndexerRelay {
+                url: dead,
+                kinds: vec![Kind::Metadata, Kind::RelayList, Kind::InboxRelays],
+            }],
+        };
+        let client =
+            SonarClient::connect_in_memory_with_routes(Identity::generate(), vec![url_own], config)
+                .await
+                .expect("connects");
+
+        let first = client.distribute_account_records(false).await;
+        assert!(
+            matches!(
+                first.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Published { accepted: 1 })
+            ),
+            "{first:?}"
+        );
+        let second = client.distribute_account_records(false).await;
+        assert!(
+            !second.skipped_fresh,
+            "stamped though no indexer took it: {second:?}"
+        );
+    }
+
+    /// An imported account already has lists from another client, on relays
+    /// Sonar is not on. They must survive untouched (kinds 10002/10050 are
+    /// replaceable — publishing defaults would replace them network-wide),
+    /// and the KeyPackage must follow the user's real write relay so peers
+    /// honouring that list find it.
+    #[tokio::test]
+    async fn existing_relay_lists_are_kept_and_their_relays_adopted() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let relay_theirs = MockRelay::run().await.expect("the user's relay");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_own, url_theirs, url_l) = (
+            relay_own.url().await,
+            relay_theirs.url().await,
+            lookup.url().await,
+        );
+
+        let identity = Identity::generate();
+        let pk = identity.public_key();
+        let outbox_list = EventBuilder::relay_list([(url_theirs.clone(), None)])
+            .build(pk)
+            .sign_with_keys(identity.keys())
+            .expect("sign 10002");
+        let inbox_list = EventBuilder::new(Kind::InboxRelays, "")
+            .tags([Tag::relay(url_theirs.clone())])
+            .build(pk)
+            .sign_with_keys(identity.keys())
+            .expect("sign 10050");
+        publish_on(&url_l, &outbox_list).await;
+        publish_on(&url_l, &inbox_list).await;
+
+        // One lookup relay is dead: the pass is short of its quorum, which
+        // must not stop the adoption — a found list is real evidence.
+        let url_dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+        let client = SonarClient::connect_in_memory_with_routes(
+            identity,
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_l.clone(), url_dead]),
+        )
+        .await
+        .expect("connects");
+        client.publish_key_package().await.expect("publishes");
+
+        // Same signed events, untouched; nothing of Sonar's on its own relay.
+        let kept = events_on(&url_l, pk, Kind::RelayList).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, outbox_list.id, "10002 replaced");
+        let kept = events_on(&url_l, pk, Kind::InboxRelays).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, inbox_list.id, "10050 replaced");
+        assert!(events_on(&url_own, pk, Kind::RelayList).await.is_empty());
+        assert!(events_on(&url_own, pk, Kind::InboxRelays).await.is_empty());
+
+        // The KeyPackage went where the user's list says they write, even
+        // though the lookup was short of its quorum — and that pass claimed
+        // no freshness, so the next connect looks again.
+        assert_eq!(
+            events_on(&url_theirs, pk, Kind::Custom(KEY_PACKAGE_KIND))
+                .await
+                .len(),
+            1
+        );
+        let next = client.distribute_account_records(false).await;
+        assert!(
+            !next.skipped_fresh,
+            "partial lookup stamped freshness: {next:?}"
+        );
+        assert_eq!(
+            events_on(&url_own, pk, Kind::Custom(KEY_PACKAGE_KIND))
+                .await
+                .len(),
+            1
+        );
+    }
+
+    /// "Nobody answered" is not "nobody has one": with the lookup relay
+    /// down, nothing is published — not even to our own relay, which did
+    /// answer — so a bad network can never overwrite an imported account's
+    /// lists. The KeyPackage itself still goes out.
+    #[tokio::test]
+    async fn nothing_is_published_when_no_lookup_relay_answers() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let url_own = relay_own.url().await;
+        // Nothing listens on port 1: the connect is refused at once. (A
+        // `MockRelay` that was `shutdown()` keeps accepting for a while.)
+        let url_dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+
+        let client = SonarClient::connect_in_memory_with_routes(
+            Identity::generate(),
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_dead]),
+        )
+        .await
+        .expect("connects");
+        let pk = client.identity().public_key();
+
+        let report = timeout(
+            Duration::from_secs(30),
+            client.distribute_account_records(true),
+        )
+        .await
+        .expect("distribution did not time out");
+        // Our own relay answered, so the pass ran — and deferred every kind,
+        // because no lookup relay did.
+        assert!(!report.lookup_failed, "{report:?}");
+        for kind in [
+            Kind::RelayList,
+            Kind::InboxRelays,
+            Kind::MlsKeyPackageRelays,
+        ] {
+            assert!(
+                matches!(
+                    report.actions.get(&kind.as_u16()),
+                    Some(RecordOutcome::Deferred {
+                        answered: 0,
+                        asked: 1
+                    })
+                ),
+                "{kind:?}: {report:?}"
+            );
+        }
+
+        client
+            .publish_key_package()
+            .await
+            .expect("key package still publishes");
+        assert_eq!(
+            events_on(&url_own, pk, Kind::Custom(KEY_PACKAGE_KIND))
+                .await
+                .len(),
+            1
+        );
+        assert!(events_on(&url_own, pk, Kind::RelayList).await.is_empty());
+        assert!(events_on(&url_own, pk, Kind::InboxRelays).await.is_empty());
+        assert!(events_on(&url_own, pk, Kind::MlsKeyPackageRelays)
+            .await
+            .is_empty());
+    }
+
+    /// A persistent install distributes once, skips inside the interval,
+    /// and a later forced pass re-broadcasts the same signed event instead
+    /// of minting a new one (stable `created_at`, no relay churn).
+    #[tokio::test]
+    async fn records_are_not_republished_within_the_interval_and_rebroadcast_unchanged_after() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let lookup = MockRelay::run().await.expect("lookup relay");
+        let (url_own, url_l) = (relay_own.url().await, lookup.url().await);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let client = SonarClient::connect_with_routes(
+            Identity::generate(),
+            vec![url_own.clone()],
+            dir.path().join("marmot.sqlite"),
+            [0x62; 32],
+            RelayRoutesConfig::local(vec![url_l.clone()]),
+        )
+        .await
+        .expect("connects");
+        let pk = client.identity().public_key();
+
+        let first = client.distribute_account_records(false).await;
+        assert!(!first.lookup_failed && !first.skipped_fresh, "{first:?}");
+        assert!(
+            matches!(
+                first.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Published { accepted }) if *accepted >= 2
+            ),
+            "{first:?}"
+        );
+        assert!(
+            matches!(
+                first.actions.get(&Kind::Metadata.as_u16()),
+                Some(RecordOutcome::Absent)
+            ),
+            "no profile was invented: {first:?}"
+        );
+        let published = events_on(&url_l, pk, Kind::RelayList).await;
+        assert_eq!(published.len(), 1);
+
+        let second = client.distribute_account_records(false).await;
+        assert!(second.skipped_fresh, "{second:?}");
+
+        let third = client.distribute_account_records(true).await;
+        assert!(
+            matches!(
+                third.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Rebroadcast { .. })
+            ),
+            "{third:?}"
+        );
+        let again = events_on(&url_l, pk, Kind::RelayList).await;
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            again[0].id, published[0].id,
+            "rebroadcast minted a new event"
+        );
+    }
+
+    /// Absence needs a quorum of lookup relays (all but a third): with two
+    /// configured and one silent, a default is deferred and nothing is
+    /// published anywhere, because the silent one may hold the user's real
+    /// list. A list found on the relay that did answer is acted on at once.
+    #[tokio::test]
+    async fn defaults_wait_for_a_lookup_quorum_but_a_found_list_does_not() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let live = MockRelay::run().await.expect("live lookup relay");
+        let (url_own, url_live) = (relay_own.url().await, live.url().await);
+        let url_dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+
+        let identity = Identity::generate();
+        let pk = identity.public_key();
+        let keys = identity.keys().clone();
+        let client = SonarClient::connect_in_memory_with_routes(
+            identity,
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_live.clone(), url_dead]),
+        )
+        .await
+        .expect("connects");
+
+        let report = timeout(
+            Duration::from_secs(60),
+            client.distribute_account_records(true),
+        )
+        .await
+        .expect("distribution did not time out");
+        assert!(!report.lookup_failed, "{report:?}");
+        assert!(
+            matches!(
+                report.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Deferred {
+                    answered: 1,
+                    asked: 2
+                })
+            ),
+            "{report:?}"
+        );
+        assert!(events_on(&url_live, pk, Kind::RelayList).await.is_empty());
+        assert!(events_on(&url_own, pk, Kind::RelayList).await.is_empty());
+
+        // The user's own list turns up on the live relay: acted on at once.
+        let list = EventBuilder::relay_list([(url_own.clone(), None)])
+            .build(pk)
+            .sign_with_keys(&keys)
+            .expect("sign 10002");
+        publish_on(&url_live, &list).await;
+        let report = timeout(
+            Duration::from_secs(60),
+            client.distribute_account_records(true),
+        )
+        .await
+        .expect("distribution did not time out");
+        assert!(
+            matches!(
+                report.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Rebroadcast { .. })
+            ),
+            "{report:?}"
+        );
+        let on_own = events_on(&url_own, pk, Kind::RelayList).await;
+        assert_eq!(on_own.len(), 1);
+        assert_eq!(on_own[0].id, list.id, "rebroadcast changed the event");
+
+        // Acted on, but not stamped: with a relay still silent, the next
+        // connect must look again (the silent one may hold a newer list).
+        let next = client.distribute_account_records(false).await;
+        assert!(
+            !next.skipped_fresh,
+            "partial lookup stamped freshness: {next:?}"
+        );
+    }
+
+    /// The profile the user already has on Sonar's own relays is the
+    /// profile, whatever the indexers are doing: a rename while every
+    /// lookup relay is unreachable still publishes (to our relays; the
+    /// indexer copy waits for the next pass).
+    #[tokio::test]
+    async fn a_rename_publishes_when_own_relays_hold_the_profile_and_indexers_are_silent() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let url_own = relay_own.url().await;
+        let url_dead = RelayUrl::parse("ws://127.0.0.1:1").expect("dead url");
+
+        let identity = Identity::generate();
+        let pk = identity.public_key();
+        let existing = EventBuilder::metadata(
+            &Metadata::new()
+                .name("Old Name")
+                .about("kept across renames"),
+        )
+        .build(pk)
+        .sign_with_keys(identity.keys())
+        .expect("sign kind-0");
+        publish_on(&url_own, &existing).await;
+
+        let client = SonarClient::connect_in_memory_with_routes(
+            identity,
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_dead]),
+        )
+        .await
+        .expect("connects");
+        timeout(
+            Duration::from_secs(60),
+            client.publish_profile("New Name", None, None),
+        )
+        .await
+        .expect("publish did not time out")
+        .expect("rename publishes from the profile on our own relays");
+        let now = events_on(&url_own, pk, Kind::Metadata).await;
+        assert_eq!(now.len(), 1);
+        assert!(now[0].content.contains("New Name"));
+        assert!(
+            now[0].content.contains("kept across renames"),
+            "merge lost a field"
+        );
+    }
+
+    /// An indexer that refuses a kind answers OK=false. That copy must not
+    /// count as distributed: the kind is retried on the next connect instead
+    /// of waiting out the interval, while the kinds it took are stamped.
+    #[tokio::test]
+    async fn a_kind_the_indexer_refuses_is_retried_not_stamped() {
+        let relay_own = MockRelay::run().await.expect("sonar relay");
+        let picky = relay_rejecting(Kind::InboxRelays).await;
+        let (url_own, url_picky) = (relay_own.url().await, picky.url().await);
+        let client = SonarClient::connect_in_memory_with_routes(
+            Identity::generate(),
+            vec![url_own.clone()],
+            RelayRoutesConfig::local(vec![url_picky.clone()]),
+        )
+        .await
+        .expect("connects");
+        let pk = client.identity().public_key();
+
+        let first = client.distribute_account_records(false).await;
+        assert!(
+            matches!(
+                first.actions.get(&Kind::RelayList.as_u16()),
+                Some(RecordOutcome::Published { accepted: 2 })
+            ),
+            "{first:?}"
+        );
+        assert!(
+            matches!(
+                first.actions.get(&Kind::InboxRelays.as_u16()),
+                Some(RecordOutcome::Published { accepted: 1 })
+            ),
+            "own relay only: {first:?}"
+        );
+        assert_eq!(events_on(&url_picky, pk, Kind::RelayList).await.len(), 1);
+        assert!(events_on(&url_picky, pk, Kind::InboxRelays)
+            .await
+            .is_empty());
+        assert_eq!(events_on(&url_own, pk, Kind::InboxRelays).await.len(), 1);
+
+        // The refused kind keeps the pass unstamped, so the next connect
+        // tries it again.
+        let second = client.distribute_account_records(false).await;
+        assert!(!second.skipped_fresh, "{second:?}");
+    }
+}
