@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -37,6 +38,18 @@ class SonarDescriptorTest {
     fun aDescriptorWithoutAnOfferIsNeverLegacy() {
         assertFalse(callDescriptor(publishedAtSecs = 1L, bolt12Offer = null).hasLegacyPaymentOffer)
         assertFalse(callDescriptor(publishedAtSecs = 1L, bolt12Offer = " ").hasLegacyPaymentOffer)
+    }
+
+    @Test
+    fun thePayGateNamesWhatStandsBetweenAChatAndItsSheet() {
+        assertEquals(PaymentGateReason.LookupFailed, paymentGateReason(null, lookupFailed = true))
+        assertEquals(PaymentGateReason.NothingFound, paymentGateReason(null, lookupFailed = false))
+        assertEquals(PaymentGateReason.NoAddress, paymentGateReason(callDescriptor(bolt12Offer = null), lookupFailed = false))
+        assertEquals(
+            PaymentGateReason.LegacyAddress,
+            paymentGateReason(callDescriptor(publishedAtSecs = SONAR_PAYMENT_OFFER_CUTOVER_SECS - 1), lookupFailed = false),
+        )
+        assertEquals(PaymentGateReason.Payable, paymentGateReason(callDescriptor(), lookupFailed = true))
     }
 
     private fun callDescriptor(

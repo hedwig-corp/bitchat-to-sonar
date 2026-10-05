@@ -536,6 +536,11 @@ final class MarmotChatModel: ObservableObject {
     /// Recent relay misses, keyed by npub. A miss is NOT proof the user is White
     /// Noise-only; it only lets call-offer handling stop deferring forever.
     @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
+    /// Why the last descriptor lookup for an npub threw (relay unreachable,
+    /// node closing, interrupted for suspend), cleared by the next lookup that
+    /// gets an answer. A lookup that answers "nothing published" is a miss,
+    /// not a failure; the pay gate words the two differently.
+    private(set) var sonarDescriptorLookupFailures: [String: String] = [:]
     /// True when the current node is relay-backed, not just the local DB node.
     @Published private(set) var relayConnected = false {
         didSet {
@@ -3825,10 +3830,12 @@ final class MarmotChatModel: ObservableObject {
                 if !outcome.missed {
                     self.scheduleDescriptorCacheWrite()
                 }
+                self.sonarDescriptorLookupFailures[npubToFetch] = nil
             }
         } catch {
             await MainActor.run {
                 _ = self.descriptorFetches.remove(npubToFetch)
+                self.sonarDescriptorLookupFailures[npubToFetch] = Self.describe(error)
             }
         }
     }

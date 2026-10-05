@@ -163,6 +163,7 @@
     <string name="couldn_t_create_the_invoice_try_again">Couldn't create the invoice. Try again.</string>
     <string name="couldn_t_decode_image">Couldn't decode image</string>
     <string name="couldn_t_load_stickers">Couldn't load stickers</string>
+    <string name="couldn_t_reach_the_relays_for_their">Couldn't reach the relays for their payment address. Check your connection and try again.</string>
     <string name="couldn_t_update_your_address_retrying">Couldn't update your address %1$s. Retrying.</string>
     <string name="create_a_new_identity">Create a new identity</string>
     <string name="create_invoice">Create invoice</string>
@@ -397,6 +398,7 @@
     <string name="the_old_wallet_couldn_t_be_removed">The old wallet couldn't be removed. Restart Sonar and try again.</string>
     <string name="the_old_wallet_has_a_refund_waiting_to">The old wallet has a refund waiting to be claimed.</string>
     <string name="their_payment_address_is_from_an_older">Their payment address is from an older Sonar. Ask them to open the latest Sonar to pay them here.</string>
+    <string name="they_haven_t_published_a_payment">They haven't published a payment address in Sonar yet.</string>
     <string name="this">This </string>
     <string name="this_deletes_every_conversation_from">This deletes every conversation from this phone — Bluetooth chats and White Noise secure chats. Your identity, nickname and wallet stay, so you can start fresh without setting up again.</string>
     <string name="this_deletes_your_key_your_nickname_and">This deletes your key, your nickname and every conversation from this phone. There is no account to recover — gone is gone.</string>
