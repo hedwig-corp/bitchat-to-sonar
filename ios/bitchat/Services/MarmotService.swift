@@ -347,6 +347,25 @@ final class MarmotService: @unchecked Sendable {
             else { return false }
             return offer.lowercased().hasPrefix("lno")
         }
+
+        /// Sonar's wallet changed on 2026-09-27 (v0.1-alpha.15, #614): every
+        /// offer published before then came from the retired Breez wallet. A
+        /// descriptor is a replaceable relay event, so an install that has not
+        /// run since keeps advertising that offer forever, and the current
+        /// wallet can only pay it if the old wallet is still online to answer
+        /// the invoice request, which it almost never is. Nothing in the
+        /// descriptor itself tells the two apart (same schema, same receipts),
+        /// so the publish time is the signal. Compose mirrors this in
+        /// `SonarDescriptor.hasLegacyPaymentOffer` (SonarCore.kt).
+        static let paymentOfferCutover = Date(timeIntervalSince1970: 1_790_467_200)
+
+        /// An offer the current wallet should not try to pay: see
+        /// `paymentOfferCutover`. The payer refetches once, and when the relays
+        /// still hold the old offer it explains instead of starting a melt the
+        /// mint cannot finish.
+        var hasLegacyPaymentOffer: Bool {
+            supportsDirectPayments && publishedAt < Self.paymentOfferCutover
+        }
     }
 
     enum ServiceError: Error, Equatable {

@@ -9864,20 +9864,47 @@ final class SonarAppStore: ObservableObject {
         return false
     }
 
-    func paymentDetailsUnavailableMessage(_ id: String) async -> String? {
+    static let paymentDetailsPendingMessage =
+        String(localized: "Fetching payment details — try again in a moment.")
+    /// The contact's relay descriptor still carries an offer from the retired
+    /// wallet (`SonarDescriptor.hasLegacyPaymentOffer`): a melt to it hangs
+    /// until the mint gives up, so the payer is told instead. Nearby payments
+    /// read a live address over Bluetooth and are not affected.
+    static let legacyPaymentOfferMessage =
+        String(localized: "Their payment address is from an older Sonar. Ask them to open the latest Sonar to pay them here.")
+
+    /// The contact's payment descriptor, refreshed from the relays when the
+    /// cache holds nothing payable or an offer from before the wallet switch
+    /// (whatever the TTL says). A current offer is only re-read in the
+    /// background. nil when the contact has no npub to look up.
+    private func paymentDescriptorForPaying(_ id: String, stage: String) async -> MarmotService.SonarDescriptor? {
         guard let npub = callNpub(id) else {
-            return "Fetching payment details — try again in a moment."
-        }
-        let cached = marmot.sonarDescriptorsByNpub[npub]
-        let hasBolt12 = cached?.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        if hasBolt12 {
-            marmot.ensureSonarDescriptor(npub)
+            SecureLogger.info("Sonar pay \(stage): no npub for chat \(id.prefix(16))", category: .session)
             return nil
         }
-        await marmot.fetchSonarDescriptorSync(npub)
-        let offer = marmot.sonarDescriptorsByNpub[npub]?.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !offer.isEmpty { return nil }
-        return "Fetching payment details — try again in a moment."
+        var descriptor = marmot.sonarDescriptorsByNpub[npub]
+        var refreshed = false
+        if descriptor?.supportsDirectPayments != true || descriptor?.hasLegacyPaymentOffer == true {
+            descriptor = await marmot.fetchSonarDescriptorSync(npub, force: true)
+            refreshed = true
+        } else {
+            marmot.ensureSonarDescriptor(npub)
+        }
+        let published = descriptor.map { ISO8601DateFormatter().string(from: $0.publishedAt) } ?? "-"
+        SecureLogger.info(
+            "Sonar pay \(stage): peer=\(npub.prefix(12)) offer=\(descriptor?.bolt12Offer?.count ?? 0)c "
+                + "published=\(published) legacy=\(descriptor?.hasLegacyPaymentOffer ?? false) refreshed=\(refreshed)",
+            category: .session
+        )
+        return descriptor
+    }
+
+    func paymentDetailsUnavailableMessage(_ id: String) async -> String? {
+        guard let descriptor = await paymentDescriptorForPaying(id, stage: "sheet"),
+              descriptor.supportsDirectPayments
+        else { return Self.paymentDetailsPendingMessage }
+        if descriptor.hasLegacyPaymentOffer { return Self.legacyPaymentOfferMessage }
+        return nil
     }
 
     /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
@@ -9899,6 +9926,7 @@ final class SonarAppStore: ObservableObject {
         guard let npub = callNpub(id),
               let descriptor = marmot.sonarDescriptorsByNpub[npub],
               descriptor.supportsDirectPayments,
+              !descriptor.hasLegacyPaymentOffer,
               let offer = descriptor.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines),
               !offer.isEmpty
         else { return nil }
@@ -10257,17 +10285,17 @@ final class SonarAppStore: ObservableObject {
         if isContactBlocked(id, npub: callNpub(id) ?? "") {
             return "Unblock this contact before paying."
         }
-        var offer: String?
-        if let npub = callNpub(id) {
-            let cached = marmot.sonarDescriptorsByNpub[npub]
-            let hasBolt12 = cached?.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            if !hasBolt12 {
-                await marmot.fetchSonarDescriptorSync(npub)
-            }
+        // Store-level, like the block check: the sheet asks the same question,
+        // but a stale sheet or another caller must not start a melt to an
+        // offer the retired wallet owns.
+        guard let descriptor = await paymentDescriptorForPaying(id, stage: "send"),
+              descriptor.supportsDirectPayments,
+              let offer = directPaymentOffer(id)
+        else {
+            return Self.paymentDetailsPendingMessage
         }
-        offer = directPaymentOffer(id)
-        guard let offer else {
-            return "Fetching payment details — try again in a moment."
+        if descriptor.hasLegacyPaymentOffer {
+            return Self.legacyPaymentOfferMessage
         }
         let activityId = UUID().uuidString.lowercased()
         let via = dmTransport(id)
@@ -10314,7 +10342,7 @@ final class SonarAppStore: ObservableObject {
             // ⚡PAY receipt + PAYDONE (with the preimage) go out when the
             // wallet reports the same payment complete.
             catchUpEarlyUpdate(for: payment, from: sender)
-            return String(localized: "Payment is on its way — it shows in the chat once it settles.")
+            return String(localized: "Payment is on its way — the chat shows it as Sending until it settles.")
         case .paid(_, let receiptDue):
             guard receiptDue, let entry = paymentActivityLedger.entries[activityId] else { return nil }
             // Wallet settled — record locally before sending receipts so the
