@@ -933,7 +933,10 @@ real mint and need the maintainer's approval of the amounts.
 
 ### QA-113 — Chat ⚡PAY to a contact
 - **Platforms:** both (manual; the payee can be headless: a `sonar-cli` peer
-  whose descriptor carries a second wallet's offer on the same mint)
+  whose descriptor carries a second wallet's offer on the same mint —
+  `sonar-cashu-cli … receive --bolt12`, then
+  `sonar-cli publish-descriptor --offer <lno…>`; the recipe with a local
+  fake mint, `mint-proxy.py` and the iOS driver is in QA-162's origin)
 - **Steps:** open the chat → + → *Send money* → amount → Send.
 - **Expect:** the fee line prices the contact's cached offer; the bubble reads
   "Paid"; the peer receives `⚡PAY` then `⚡PAYDONE`; the payee's wallet
@@ -944,6 +947,40 @@ real mint and need the maintainer's approval of the amounts.
   `SonarPaymentStatusTests.testASettledPaymentNeverClaimsAProofItMayNotHave`
 - **Origin:** #614 (QA pass: the receipt promised a proof an internal
   settlement does not have).
+
+### QA-162 — A contact whose published offer is from the old wallet
+- **Platforms:** both (iOS: `PaymentOfferFreshnessTests` on the real sheet
+  and send call sites; Compose: `SonarDescriptorTest` on the rule).
+- **Steps:** cache a contact whose Sonar descriptor carries an offer
+  published before 2026-09-27 (the Cashu switch, #614): on a real account
+  most contacts who have not opened Sonar since still do. Open their chat →
+  + → *Send money*.
+- **Expect:** the app refetches the descriptor once; when the relays still
+  hold the old offer, a toast reads "Their payment address is from an older
+  Sonar…", no pay sheet opens, nothing reaches the wallet, and no "Sending"
+  bubble appears. The contact is not listed in *Send a payment → People you
+  can pay*. The diagnostics log has `Sonar pay sheet: peer=… legacy=true
+  refreshed=true`. A nearby peer's Bluetooth-announced offer is unaffected.
+- **Guard:** `PaymentOfferFreshnessTests.theSheetDoesNotOpenOnAnOfferTheRelaysStillHoldFromTheOldWallet`,
+  `aSendToALegacyOfferIsRefusedBeforeTheWalletAndLeavesNoPendingRow`,
+  `thePickerLeavesOutAContactWithOnlyALegacyOffer`;
+  `SonarDescriptorTest.anOfferPublishedBeforeTheWalletSwitchIsLegacy`.
+- **Origin:** 2026-10-05, "cannot pay in chats over the internet, only over
+  Bluetooth; a send takes a while and shows no pending bubble". The phone's
+  descriptor cache held 29 of 37 contacts with 316-char Breez offers from
+  June–September; a Cashu melt to one waits on a Breez node that is gone
+  (60 s send budget + 60 s grace), while the Bluetooth path reads the peer's
+  live offer. The pending bubble itself was never missing
+  (`PaymentPendingRowTests`, both chat kinds; a 40 s `mint-proxy.py
+  delay-melt` showed "Sending to …" the whole time), but the toast said the
+  chat would show the payment "once it settles"; it now says it shows as
+  Sending. Reproduced headlessly: `cdk-mintd` fakewallet on 8085 (`[ln]`
+  needs `min_mint/max_mint/min_melt/max_melt`), `mint-proxy.py` on 8095,
+  iOS DEBUG `sonar.debug.cashuMintURL` written by plist path while the
+  simulator is shut down, payee = `sonar-cli` + `sonar-cashu-cli` offer,
+  payer = the QA simulator under `SONAR_BENCH_NSEC` (delete the store
+  `ios-setup.sh`'s verification launch created first: it is keyed by the
+  keychain, not the bench key), driven by `scripts/qa/ios-drive.sh`.
 
 ### QA-114 — Two Sonars in Bluetooth range, both with a wallet
 - **Platforms:** Android (two emulators share the virtual Bluetooth medium,

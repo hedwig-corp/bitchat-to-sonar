@@ -92,7 +92,8 @@ import chat.bitchat.sonar.resources.amount_plus_fee_exceeds_your_balance
 import chat.bitchat.sonar.resources.mint_offline_retrying_nothing_was_sent
 import chat.bitchat.sonar.resources.old_lightning_wallet_removed
 import chat.bitchat.sonar.resources.payment_failed_you_were_not_charged
-import chat.bitchat.sonar.resources.payment_is_on_its_way_it_shows_in_the
+import chat.bitchat.sonar.resources.payment_is_on_its_way_the_chat_shows_it
+import chat.bitchat.sonar.resources.their_payment_address_is_from_an_older
 import chat.bitchat.sonar.resources.that_payment_address_can_t_be_paid
 import chat.bitchat.sonar.resources.the_network_fee_is_now_up_to_nothing
 import chat.bitchat.sonar.resources.the_old_wallet_couldn_t_be_removed
@@ -103,6 +104,10 @@ import chat.bitchat.sonar.wallet.SendErrorKind
 import org.jetbrains.compose.resources.getString
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
+
+/** iOS: `SonarAppStore.paymentDetailsPendingMessage`. */
+internal const val PAYMENT_DETAILS_PENDING_MESSAGE = "Fetching payment details — try again in a moment."
+
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
 private const val PROFILE_MISS_TTL_SECS = 60L
 /** How long after BLE activity the mesh drain loop stays at 150ms. */
@@ -3827,28 +3832,58 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
 
     private fun directPaymentOffer(chatId: String): String? {
-        if (isMeshChat(chatId)) {
-            preferredMeshAliases(meshPeerId(chatId)).firstNotNullOfOrNull { alias ->
-                sonarProfile(alias)?.bolt12Offer?.takeIf { it.isNotBlank() }
-            }?.let { return it }
-        }
+        meshAnnouncedPaymentOffer(chatId)?.let { return it }
         val npubHex = paymentNpubHex(chatId) ?: return null
         return sonarDescriptorsByNpubHex[npubHex]?.bolt12Offer?.takeIf { it.isNotBlank() }
     }
 
-    suspend fun paymentDetailsUnavailableMessage(chatId: String): String? {
-        val npubHex = paymentNpubHex(chatId) ?: return "Fetching payment details — try again in a moment."
+    /** True when the only offer we hold for [chatId] is a relay descriptor's
+     *  from before the wallet switch: the picker leaves such a contact out,
+     *  and a send to them is refused with an explanation
+     *  (`their_payment_address_is_from_an_older`; iOS
+     *  `SonarAppStore.legacyPaymentOfferMessage`). */
+    private fun holdsOnlyLegacyPaymentOffer(chatId: String): Boolean {
+        if (meshAnnouncedPaymentOffer(chatId) != null) return false
+        val npubHex = paymentNpubHex(chatId) ?: return false
+        return sonarDescriptorsByNpubHex[npubHex.lowercase()]?.hasLegacyPaymentOffer == true
+    }
+
+    /** The contact's payment descriptor, refreshed from the relays when the
+     *  cache holds nothing payable or an offer from before the wallet switch
+     *  (whatever the TTL says); a current offer is only re-read in the
+     *  background. A mesh alias profile's offer (read live over Bluetooth)
+     *  never needs this. iOS: `SonarAppStore.paymentDescriptorForPaying`. */
+    private suspend fun paymentDescriptorForPaying(chatId: String): SonarDescriptor? {
+        val npubHex = paymentNpubHex(chatId) ?: return null
         val key = npubHex.lowercase()
         val cached = sonarDescriptorsByNpubHex[key]
-        val hasBolt12 = cached?.bolt12Offer?.isNotBlank() == true
-        if (hasBolt12) {
-            ensureSonarDescriptorHex(npubHex)
-            return null
+        if (cached?.bolt12Offer.isNullOrBlank() || cached?.hasLegacyPaymentOffer == true) {
+            return fetchSonarDescriptorSync(npubHex, force = true)
         }
-        fetchSonarDescriptorSync(npubHex)
-        val fetched = sonarDescriptorsByNpubHex[key]
-        if (fetched?.bolt12Offer?.isNotBlank() == true) return null
-        return "Fetching payment details — try again in a moment."
+        ensureSonarDescriptorHex(npubHex)
+        return cached
+    }
+
+    /** Why the pay sheet cannot open for [chatId] right now, or null when it
+     *  can. A live mesh offer (0x53 announce) always wins: it is the peer's
+     *  current address. Otherwise the relay descriptor must carry an offer
+     *  from the current wallet — one from before the switch (see
+     *  [SonarDescriptor.hasLegacyPaymentOffer]) is refetched once and, when
+     *  the relays still hold it, explained instead of melted. */
+    suspend fun paymentDetailsUnavailableMessage(chatId: String): String? {
+        if (meshAnnouncedPaymentOffer(chatId) != null) return null
+        val descriptor = paymentDescriptorForPaying(chatId)
+        if (descriptor?.bolt12Offer.isNullOrBlank()) return PAYMENT_DETAILS_PENDING_MESSAGE
+        if (descriptor.hasLegacyPaymentOffer) return getString(Res.string.their_payment_address_is_from_an_older)
+        return null
+    }
+
+    /** The offer a nearby peer announced over Bluetooth, if any. */
+    private fun meshAnnouncedPaymentOffer(chatId: String): String? {
+        if (!isMeshChat(chatId)) return null
+        return preferredMeshAliases(meshPeerId(chatId)).firstNotNullOfOrNull { alias ->
+            sonarProfile(alias)?.bolt12Offer?.takeIf { it.isNotBlank() }
+        }
     }
 
     suspend fun sendPay(
@@ -3862,16 +3897,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (sats <= 0) return null
         if (isContactBlocked(chatId)) return "Unblock this contact before paying."
         walletSendBlockReason(fromLegacy)?.let { return it }
-        val npubHex = paymentNpubHex(chatId)
-        if (npubHex != null) {
-            val key = npubHex.lowercase()
-            val hasBolt12 = sonarDescriptorsByNpubHex[key]?.bolt12Offer?.isNotBlank() == true
-            if (!hasBolt12) {
-                fetchSonarDescriptorSync(npubHex)
-            }
+        // Store-level, like the block check: the sheet asks the same question,
+        // but a stale sheet or another caller must not start a melt to an
+        // offer the retired wallet owns.
+        if (meshAnnouncedPaymentOffer(chatId) == null) {
+            paymentDescriptorForPaying(chatId)
+            if (holdsOnlyLegacyPaymentOffer(chatId)) return getString(Res.string.their_payment_address_is_from_an_older)
         }
         val offer = directPaymentOffer(chatId)
-        if (offer == null) return "Fetching payment details — try again in a moment."
+        if (offer == null) return PAYMENT_DETAILS_PENDING_MESSAGE
         val payId = randomPayId()
         // iOS parity (SonarAppStore.sendPay → SonarPaymentActivityLedger):
         // record a pending sonarDirect activity BEFORE the wallet send, then
@@ -3904,7 +3938,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // the preimage) goes out when the wallet reports it settled —
                 // see settlePendingWalletSend. Never re-sent.
                 trackPendingWalletSend(payId, result)
-                toast = getString(Res.string.payment_is_on_its_way_it_shows_in_the)
+                toast = getString(Res.string.payment_is_on_its_way_the_chat_shows_it)
                 return@launch
             }
             if (result.ok) {
@@ -3981,6 +4015,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (!seen.add(chatId)) return
             if (isContactBlocked(chatId)) return
             if (directPaymentOffer(chatId).isNullOrBlank()) return
+            if (holdsOnlyLegacyPaymentOffer(chatId)) return
             val nearby = isMeshChat(chatId) && hasLiveMeshRoute(meshPeerId(chatId))
             // Design pay.jsx: nearby peers read "Nearby · Bluetooth"; everyone
             // else shows their published payment address, falling back to
@@ -6974,16 +7009,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** [force] skips the refresh TTL: a payer about to pay an offer from
+     *  before the wallet switch asks the relays once more, whatever the TTL
+     *  says, because the contact may have published a current offer since. */
     private suspend fun fetchSonarDescriptorSync(
         npubHex: String,
         bypassRecentMiss: Boolean = true,
+        force: Boolean = false,
     ): SonarDescriptor? {
         val key = npubHex.lowercase()
         val now = SonarClock.nowSecs()
         val cached = sonarDescriptorsByNpubHex[key]
         val hasBolt12 = cached?.bolt12Offer?.isNotBlank() == true
         val fetchedAt = sonarDescriptorFetchedAt[key]
-        if (hasBolt12 && fetchedAt != null && now - fetchedAt < SONAR_DESCRIPTOR_TTL_SECS) {
+        if (!force && hasBolt12 && fetchedAt != null && now - fetchedAt < SONAR_DESCRIPTOR_TTL_SECS) {
             return cached
         }
         val missedAt = sonarDescriptorMissedAt[key]

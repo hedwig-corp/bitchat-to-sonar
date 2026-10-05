@@ -424,7 +424,19 @@ data class SonarDescriptor(
             "marmot" in signaling &&
             "iroh" in transports &&
             callIdentity == "iroh-hkdf-sonar-call-iroh-v1"
+
+    /** An offer the current wallet should not try to pay: published before
+     *  the wallet switch (2026-09-27, #614), so it belongs to the retired
+     *  Breez wallet. A descriptor is a replaceable relay event, so an install
+     *  that has not run since keeps advertising it; nothing in the content
+     *  tells the two apart. iOS mirrors this in
+     *  `MarmotService.SonarDescriptor.hasLegacyPaymentOffer`. */
+    val hasLegacyPaymentOffer: Boolean get() =
+        !bolt12Offer.isNullOrBlank() && publishedAtSecs < SONAR_PAYMENT_OFFER_CUTOVER_SECS
 }
+
+/** 2026-09-27T00:00:00Z: the first day a Sonar build published a Cashu offer. */
+const val SONAR_PAYMENT_OFFER_CUTOVER_SECS = 1_790_467_200L
 
 internal const val PROFILE_CACHE_BLOB_KEY = "profiles.byNpub.v1"
 internal const val CHAT_SNAPSHOT_BLOB_KEY = "chats.snapshot.v1"

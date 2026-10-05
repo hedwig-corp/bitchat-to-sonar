@@ -315,7 +315,7 @@
     <string name="pay_anyone_or_move_the_sats_to_your">Pay anyone, or move the sats to your wallet</string>
     <string name="payment_address">Payment address</string>
     <string name="payment_failed_you_were_not_charged">Payment failed — you were not charged.</string>
-    <string name="payment_is_on_its_way_it_shows_in_the">Payment is on its way — it shows in the chat once it settles.</string>
+    <string name="payment_is_on_its_way_the_chat_shows_it">Payment is on its way — the chat shows it as Sending until it settles.</string>
     <string name="payments_need_your_wallet_to_finish">Payments need your wallet to finish opening on this Mac. It starts once your Sonar identity is ready.</string>
     <string name="payments_to_this_address_go_to_your">Payments to this address go to your wallet at mint.hedwig.sh.</string>
     <string name="payments_to_will_go_to_your_new_wallet">Payments to %1$s will go to your new wallet, held as ecash at mint.hedwig.sh. Your old wallet stays spendable. Deleting the new wallet does not move the address back.</string>
@@ -396,6 +396,7 @@
     <string name="the_network_fee_is_now_up_to_nothing">The network fee is now up to %1$s. Nothing was sent — try again to pay it.</string>
     <string name="the_old_wallet_couldn_t_be_removed">The old wallet couldn't be removed. Restart Sonar and try again.</string>
     <string name="the_old_wallet_has_a_refund_waiting_to">The old wallet has a refund waiting to be claimed.</string>
+    <string name="their_payment_address_is_from_an_older">Their payment address is from an older Sonar. Ask them to open the latest Sonar to pay them here.</string>
     <string name="this">This </string>
     <string name="this_deletes_every_conversation_from">This deletes every conversation from this phone — Bluetooth chats and White Noise secure chats. Your identity, nickname and wallet stay, so you can start fresh without setting up again.</string>
     <string name="this_deletes_your_key_your_nickname_and">This deletes your key, your nickname and every conversation from this phone. There is no account to recover — gone is gone.</string>

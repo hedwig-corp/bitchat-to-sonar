@@ -154,10 +154,13 @@
     "Payment failed — you were not charged." : {
 
     },
-    "Payment is on its way — it shows in the chat once it settles." : {
+    "Payment is on its way — the chat shows it as Sending until it settles." : {
 
     },
     "Payments need your wallet to finish opening on this Mac. It starts once your Sonar identity is ready." : {
+
+    },
+    "Their payment address is from an older Sonar. Ask them to open the latest Sonar to pay them here." : {
 
     },
     "Pays like you message — tap to pay nearby or over the internet" : {

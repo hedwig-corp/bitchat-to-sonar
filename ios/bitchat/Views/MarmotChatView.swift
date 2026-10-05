@@ -3685,14 +3685,18 @@ final class MarmotChatModel: ObservableObject {
     /// Use when the descriptor is missing and the caller needs it before
     /// proceeding (e.g. opening a pay sheet). When the descriptor is already
     /// cached and just stale, prefer the fire-and-forget `ensureSonarDescriptor`.
+    /// `force` skips the refresh TTL: a payer about to pay an offer from
+    /// before the wallet switch asks the relays once more, whatever the TTL
+    /// says, because the contact may have published a current offer since.
     func fetchSonarDescriptorSync(
         _ npubToFetch: String,
-        bypassRecentMiss: Bool = true
+        bypassRecentMiss: Bool = true,
+        force: Bool = false
     ) async -> MarmotService.SonarDescriptor? {
         guard !npubToFetch.isEmpty, npubToFetch != npub else { return nil }
         let cached = sonarDescriptorsByNpub[npubToFetch]
         let hasBolt12 = cached?.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        if hasBolt12,
+        if !force, hasBolt12,
            let fetchedAt = sonarDescriptorFetchedAtByNpub[npubToFetch],
            Date().timeIntervalSince(fetchedAt) < Self.sonarDescriptorRefreshInterval {
             return cached

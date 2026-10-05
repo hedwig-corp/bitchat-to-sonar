@@ -30,12 +30,15 @@ func makeIsolatedSonarAppStore(
         keychain: keychain,
         defaults: defaults
     )
+    // The payment ledger persists through UserDefaults; left on `.standard`,
+    // a pending row recorded by one suite showed up in another's assertions.
     let store = SonarAppStore(
         chatViewModel: chatViewModel,
         marmot: marmot,
         keychain: keychain,
         idBridge: idBridge,
-        wallet: wallet
+        wallet: wallet,
+        paymentActivityLedger: SonarPaymentActivityLedger(defaults: defaults)
     )
     return (store, { defaults.removePersistentDomain(forName: suiteName) })
 }
