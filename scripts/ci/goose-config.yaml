@@ -1,0 +1,11 @@
+# Goose config for CI: enables the built-in Moonshot (Kimi) provider.
+# Secret-free — the actual key is read at runtime from the MOONSHOT_API_KEY env var
+# (set as a GitHub Actions secret). The model can be overridden at run time with
+# `goose review --override-model <id>`; see .github/workflows/pr-review.yml and
+# the KIMI_REVIEW_MODEL repo variable.
+active_provider: moonshot
+providers:
+  moonshot:
+    enabled: true
+    model: moonshot-v1-128k
+    configured: true
