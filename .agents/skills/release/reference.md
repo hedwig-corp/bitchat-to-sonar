@@ -12,7 +12,7 @@ lengths, and non-secret IDs (team, hostnames, version numbers).
 | Firebase iOS (payment push) | gitignored `ios/bitchat/GoogleService-Info.plist` | `test -f` |
 | Breez + Android keystore | gitignored `apps/sonar/local.properties` | `breez.apiKey=`, `sonar.keystore=`, `sonar.key.alias=`, passwords — print `=set` only |
 | FCM Android | gitignored `apps/sonar/composeApp/google-services.json` | `test -f` |
-| Zapstore Nostr signer | env `SIGN_WITH` = `nsec1…` \| `bunker://…` \| `browser` | `test -n`; scheme only (`bunker`/`nsec`/`browser`) |
+| Zapstore Nostr signer | env `SIGN_WITH` = `nsec1…` \| `bunker://…` (zsp 0.5.x has no browser signer) | `test -n`; scheme only (`bunker`/`nsec`) |
 | Zapstore publisher npub | committed `zapstore.yaml` → `pubkey:` | may print npub |
 | GitHub API | `gh auth token` → `GITHUB_TOKEN` | `gh auth status` |
 | `zsp` CLI | `$(go env GOPATH)/bin/zsp` | `command -v zsp` or add GOPATH/bin to `PATH` |

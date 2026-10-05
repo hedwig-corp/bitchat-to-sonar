@@ -3,7 +3,7 @@
 #
 # Prerequisites:
 #   - zsp          (go install github.com/zapstore/zsp/cmd/zsp@latest)
-#   - SIGN_WITH    nsec1… | bunker://… | browser
+#   - SIGN_WITH    nsec1… | bunker://… (zsp 0.5.x has no browser signer)
 #   - Android release signing keystore + passwords (see below)
 #   - gh auth      optional; used as GITHUB_TOKEN to avoid API rate limits
 #
@@ -137,7 +137,7 @@ case "$MODE" in
     "$ZSP" publish --check "${PRERELEASE[@]}" "$CONFIG"
     ;;
   local)
-    [[ -n "${SIGN_WITH:-}" ]] || die "set SIGN_WITH (nsec1…, bunker://…, or browser)"
+    [[ -n "${SIGN_WITH:-}" ]] || die "set SIGN_WITH (nsec1… or bunker://…)"
     echo "→ building phone release APK"
     (
       cd "$REPO_ROOT/apps/sonar"
@@ -156,7 +156,7 @@ case "$MODE" in
       "$SIGNED_APK"
     ;;
   github)
-    [[ -n "${SIGN_WITH:-}" ]] || die "set SIGN_WITH (nsec1…, bunker://…, or browser)"
+    [[ -n "${SIGN_WITH:-}" ]] || die "set SIGN_WITH (nsec1… or bunker://…)"
     # Prefer publishing a freshly signed local phone APK if present; else GitHub.
     if [[ -f "$SIGNED_APK" ]]; then
       echo "→ publishing existing $SIGNED_APK"
