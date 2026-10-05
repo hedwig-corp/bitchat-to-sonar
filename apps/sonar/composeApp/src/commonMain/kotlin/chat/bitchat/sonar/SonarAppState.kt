@@ -94,6 +94,8 @@ import chat.bitchat.sonar.resources.old_lightning_wallet_removed
 import chat.bitchat.sonar.resources.payment_failed_you_were_not_charged
 import chat.bitchat.sonar.resources.payment_is_on_its_way_the_chat_shows_it
 import chat.bitchat.sonar.resources.their_payment_address_is_from_an_older
+import chat.bitchat.sonar.resources.couldn_t_reach_the_relays_for_their
+import chat.bitchat.sonar.resources.they_haven_t_published_a_payment
 import chat.bitchat.sonar.resources.that_payment_address_can_t_be_paid
 import chat.bitchat.sonar.resources.the_network_fee_is_now_up_to_nothing
 import chat.bitchat.sonar.resources.the_old_wallet_couldn_t_be_removed
@@ -107,6 +109,18 @@ private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 
 /** iOS: `SonarAppStore.paymentDetailsPendingMessage`. */
 internal const val PAYMENT_DETAILS_PENDING_MESSAGE = "Fetching payment details — try again in a moment."
+
+/** What stands between a chat and its pay sheet, from what we hold for the
+ *  contact. Pure, so the wording decision is testable without a store. */
+internal enum class PaymentGateReason { Payable, LookupFailed, NothingFound, NoAddress, LegacyAddress }
+
+internal fun paymentGateReason(descriptor: SonarDescriptor?, lookupFailed: Boolean): PaymentGateReason = when {
+    descriptor == null && lookupFailed -> PaymentGateReason.LookupFailed
+    descriptor == null -> PaymentGateReason.NothingFound
+    descriptor.bolt12Offer.isNullOrBlank() -> PaymentGateReason.NoAddress
+    descriptor.hasLegacyPaymentOffer -> PaymentGateReason.LegacyAddress
+    else -> PaymentGateReason.Payable
+}
 
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
 private const val PROFILE_MISS_TTL_SECS = 60L
@@ -3864,18 +3878,34 @@ class SonarAppState(private val scope: CoroutineScope) {
         return cached
     }
 
-    /** Why the pay sheet cannot open for [chatId] right now, or null when it
-     *  can. A live mesh offer (0x53 announce) always wins: it is the peer's
-     *  current address. Otherwise the relay descriptor must carry an offer
-     *  from the current wallet — one from before the switch (see
+    /** The one gate for paying [chatId] in chat, asked by the sheet and again
+     *  by [sendPay]: the offer to pay, or the message that says why not. A
+     *  live mesh offer (0x53 announce) always wins: it is the peer's current
+     *  address. Otherwise the relay descriptor must carry an offer from the
+     *  current wallet — one from before the switch (see
      *  [SonarDescriptor.hasLegacyPaymentOffer]) is refetched once and, when
-     *  the relays still hold it, explained instead of melted. */
-    suspend fun paymentDetailsUnavailableMessage(chatId: String): String? {
-        if (meshAnnouncedPaymentOffer(chatId) != null) return null
+     *  the relays still hold it, explained instead of melted. iOS:
+     *  `SonarAppStore.paymentOfferGate`. */
+    private suspend fun paymentOfferGate(chatId: String): Pair<String?, String?> {
+        meshAnnouncedPaymentOffer(chatId)?.let { return it to null }
+        val npubHex = paymentNpubHex(chatId) ?: return null to PAYMENT_DETAILS_PENDING_MESSAGE
         val descriptor = paymentDescriptorForPaying(chatId)
-        if (descriptor?.bolt12Offer.isNullOrBlank()) return PAYMENT_DETAILS_PENDING_MESSAGE
-        if (descriptor.hasLegacyPaymentOffer) return getString(Res.string.their_payment_address_is_from_an_older)
-        return null
+        val lookupFailed = sonarDescriptorLookupFailures.containsKey(npubHex.lowercase())
+        val reason = paymentGateReason(descriptor, lookupFailed)
+        val message = when (reason) {
+            PaymentGateReason.Payable -> null
+            PaymentGateReason.LookupFailed -> getString(Res.string.couldn_t_reach_the_relays_for_their)
+            PaymentGateReason.NothingFound -> PAYMENT_DETAILS_PENDING_MESSAGE
+            PaymentGateReason.NoAddress -> getString(Res.string.they_haven_t_published_a_payment)
+            PaymentGateReason.LegacyAddress -> getString(Res.string.their_payment_address_is_from_an_older)
+        }
+        return (if (message == null) directPaymentOffer(chatId) else null) to message
+    }
+
+    /** Why the pay sheet cannot open for [chatId] right now, or null when it can. */
+    suspend fun paymentDetailsUnavailableMessage(chatId: String): String? {
+        val (offer, message) = paymentOfferGate(chatId)
+        return message ?: if (offer == null) PAYMENT_DETAILS_PENDING_MESSAGE else null
     }
 
     /** The offer a nearby peer announced over Bluetooth, if any. */
@@ -3900,12 +3930,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Store-level, like the block check: the sheet asks the same question,
         // but a stale sheet or another caller must not start a melt to an
         // offer the retired wallet owns.
-        if (meshAnnouncedPaymentOffer(chatId) == null) {
-            paymentDescriptorForPaying(chatId)
-            if (holdsOnlyLegacyPaymentOffer(chatId)) return getString(Res.string.their_payment_address_is_from_an_older)
-        }
-        val offer = directPaymentOffer(chatId)
-        if (offer == null) return PAYMENT_DETAILS_PENDING_MESSAGE
+        val (gatedOffer, gateMessage) = paymentOfferGate(chatId)
+        if (gateMessage != null) return gateMessage
+        val offer = gatedOffer ?: return PAYMENT_DETAILS_PENDING_MESSAGE
         val payId = randomPayId()
         // iOS parity (SonarAppStore.sendPay → SonarPaymentActivityLedger):
         // record a pending sonarDirect activity BEFORE the wallet send, then
@@ -7034,8 +7061,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         return sonarDescriptorsByNpubHex[key]
     }
 
+    /** Why the last descriptor lookup for an npub (lowercase hex) threw,
+     *  cleared by the next lookup that gets an answer. A lookup that answers
+     *  "nothing published" is a miss, not a failure. iOS:
+     *  `MarmotChatModel.sonarDescriptorLookupFailures`. */
+    private val sonarDescriptorLookupFailures = HashMap<String, String>()
+
     private suspend fun performDescriptorFetch(key: String, generation: Int) {
-        val descriptor = runCatching { SonarCore.fetchSonarDescriptor(key) }.getOrNull()
+        val lookup = runCatching { SonarCore.fetchSonarDescriptor(key) }
+        lookup.exceptionOrNull()?.let { sonarDescriptorLookupFailures[key] = it.message ?: it::class.simpleName.orEmpty() }
+            ?: sonarDescriptorLookupFailures.remove(key)
+        val descriptor = lookup.getOrNull()
         // The cache is durable now, so a fetch started under the previous
         // identity must not write (and persist) its contacts into the new
         // account after a wipe/restore.

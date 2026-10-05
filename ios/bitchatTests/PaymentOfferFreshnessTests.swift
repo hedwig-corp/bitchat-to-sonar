@@ -115,6 +115,26 @@ struct PaymentOfferFreshnessTests {
         )
     }
 
+    /// The isolated store has no relay node, so every lookup throws: the gate
+    /// must say the relays were unreachable, not "fetching".
+    @Test
+    func anUnreachableRelayIsNamedWhenNothingIsCached() async {
+        let (store, cleanup) = makeIsolatedSonarAppStore()
+        defer { cleanup() }
+        store.marmot.npub = Self.me
+        store.marmot.groups = [MarmotService.MarmotGroup(id: "g1", name: "", memberNpubs: [Self.me, Self.peer])]
+        let message = await store.paymentDetailsUnavailableMessage(SonarAppStore.marmotIDPrefix + "g1")
+        #expect(message == SonarAppStore.paymentLookupFailedMessage)
+    }
+
+    @Test
+    func aDescriptorWithoutAnAddressIsNamedAsSuch() async {
+        let (store, chatId, cleanup) = Self.store(descriptor: Self.descriptor(offer: nil, publishedAt: Self.cutover.addingTimeInterval(86_400)))
+        defer { cleanup() }
+        let message = await store.paymentDetailsUnavailableMessage(chatId)
+        #expect(message == SonarAppStore.paymentOfferMissingMessage)
+    }
+
     @Test
     func thePickerLeavesOutAContactWithOnlyALegacyOffer() {
         let (legacyStore, _, cleanupLegacy) = Self.store(descriptor: Self.legacy())

@@ -9866,6 +9866,14 @@ final class SonarAppStore: ObservableObject {
 
     static let paymentDetailsPendingMessage =
         String(localized: "Fetching payment details — try again in a moment.")
+    /// The descriptor lookup threw: relays unreachable, the node closing for
+    /// the background, or the app suspended mid-fetch.
+    static let paymentLookupFailedMessage =
+        String(localized: "Couldn't reach the relays for their payment address. Check your connection and try again.")
+    /// Their descriptor exists but carries no offer: a Sonar without a wallet
+    /// address published yet.
+    static let paymentOfferMissingMessage =
+        String(localized: "They haven't published a payment address in Sonar yet.")
     /// The contact's relay descriptor still carries an offer from the retired
     /// wallet (`SonarDescriptor.hasLegacyPaymentOffer`): a melt to it hangs
     /// until the mint gives up, so the payer is told instead. Nearby payments
@@ -9873,14 +9881,17 @@ final class SonarAppStore: ObservableObject {
     static let legacyPaymentOfferMessage =
         String(localized: "Their payment address is from an older Sonar. Ask them to open the latest Sonar to pay them here.")
 
-    /// The contact's payment descriptor, refreshed from the relays when the
-    /// cache holds nothing payable or an offer from before the wallet switch
-    /// (whatever the TTL says). A current offer is only re-read in the
-    /// background. nil when the contact has no npub to look up.
-    private func paymentDescriptorForPaying(_ id: String, stage: String) async -> MarmotService.SonarDescriptor? {
+    /// The one gate for paying `id` in chat, asked by the sheet and again by
+    /// `sendPay`: the offer to pay, or the message that says why not. The
+    /// contact's descriptor is refreshed from the relays when the cache holds
+    /// nothing payable or an offer from before the wallet switch (whatever the
+    /// TTL says); a current offer is only re-read in the background. Every
+    /// outcome is logged with the offer's age and the lookup's failure, so a
+    /// report of "cannot pay" names its reason without a device pull.
+    private func paymentOfferGate(_ id: String, stage: String) async -> (offer: String?, message: String?) {
         guard let npub = callNpub(id) else {
             SecureLogger.info("Sonar pay \(stage): no npub for chat \(id.prefix(16))", category: .session)
-            return nil
+            return (nil, Self.paymentDetailsPendingMessage)
         }
         var descriptor = marmot.sonarDescriptorsByNpub[npub]
         var refreshed = false
@@ -9890,21 +9901,25 @@ final class SonarAppStore: ObservableObject {
         } else {
             marmot.ensureSonarDescriptor(npub)
         }
+        let lookupFailure = marmot.sonarDescriptorLookupFailures[npub]
         let published = descriptor.map { ISO8601DateFormatter().string(from: $0.publishedAt) } ?? "-"
         SecureLogger.info(
             "Sonar pay \(stage): peer=\(npub.prefix(12)) offer=\(descriptor?.bolt12Offer?.count ?? 0)c "
-                + "published=\(published) legacy=\(descriptor?.hasLegacyPaymentOffer ?? false) refreshed=\(refreshed)",
+                + "published=\(published) legacy=\(descriptor?.hasLegacyPaymentOffer ?? false) "
+                + "refreshed=\(refreshed) lookup=\(lookupFailure ?? "ok")",
             category: .session
         )
-        return descriptor
+        guard let descriptor else {
+            return (nil, lookupFailure != nil ? Self.paymentLookupFailedMessage : Self.paymentDetailsPendingMessage)
+        }
+        guard descriptor.supportsDirectPayments else { return (nil, Self.paymentOfferMissingMessage) }
+        if descriptor.hasLegacyPaymentOffer { return (nil, Self.legacyPaymentOfferMessage) }
+        return (directPaymentOffer(id), nil)
     }
 
     func paymentDetailsUnavailableMessage(_ id: String) async -> String? {
-        guard let descriptor = await paymentDescriptorForPaying(id, stage: "sheet"),
-              descriptor.supportsDirectPayments
-        else { return Self.paymentDetailsPendingMessage }
-        if descriptor.hasLegacyPaymentOffer { return Self.legacyPaymentOfferMessage }
-        return nil
+        let gate = await paymentOfferGate(id, stage: "sheet")
+        return gate.message ?? (gate.offer == nil ? Self.paymentDetailsPendingMessage : nil)
     }
 
     /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
@@ -10288,15 +10303,9 @@ final class SonarAppStore: ObservableObject {
         // Store-level, like the block check: the sheet asks the same question,
         // but a stale sheet or another caller must not start a melt to an
         // offer the retired wallet owns.
-        guard let descriptor = await paymentDescriptorForPaying(id, stage: "send"),
-              descriptor.supportsDirectPayments,
-              let offer = directPaymentOffer(id)
-        else {
-            return Self.paymentDetailsPendingMessage
-        }
-        if descriptor.hasLegacyPaymentOffer {
-            return Self.legacyPaymentOfferMessage
-        }
+        let gate = await paymentOfferGate(id, stage: "send")
+        if let message = gate.message { return message }
+        guard let offer = gate.offer else { return Self.paymentDetailsPendingMessage }
         let activityId = UUID().uuidString.lowercased()
         let via = dmTransport(id)
         paymentActivityLedger.recordPending(SonarPaymentActivity(

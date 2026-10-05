@@ -960,17 +960,28 @@ real mint and need the maintainer's approval of the amounts.
   Sonar…", no pay sheet opens, nothing reaches the wallet, and no "Sending"
   bubble appears. The contact is not listed in *Send a payment → People you
   can pay*. The diagnostics log has `Sonar pay sheet: peer=… legacy=true
-  refreshed=true`. A nearby peer's Bluetooth-announced offer is unaffected.
+  refreshed=true lookup=ok`. A nearby peer's Bluetooth-announced offer is
+  unaffected. The other ways the sheet can refuse are worded apart, never as
+  one "Fetching payment details": a lookup that threw (relays unreachable,
+  app suspended mid-fetch) says "Couldn't reach the relays for their payment
+  address…" and logs `lookup=<error>`; a descriptor without an offer says
+  "They haven't published a payment address in Sonar yet."; only a lookup
+  that answered nothing keeps the "Fetching…" wording.
 - **Guard:** `PaymentOfferFreshnessTests.theSheetDoesNotOpenOnAnOfferTheRelaysStillHoldFromTheOldWallet`,
   `aSendToALegacyOfferIsRefusedBeforeTheWalletAndLeavesNoPendingRow`,
   `thePickerLeavesOutAContactWithOnlyALegacyOffer`;
   `SonarDescriptorTest.anOfferPublishedBeforeTheWalletSwitchIsLegacy`.
 - **Origin:** 2026-10-05, "cannot pay in chats over the internet, only over
-  Bluetooth; a send takes a while and shows no pending bubble". The phone's
-  descriptor cache held 29 of 37 contacts with 316-char Breez offers from
-  June–September; a Cashu melt to one waits on a Breez node that is gone
-  (60 s send budget + 60 s grace), while the Bluetooth path reads the peer's
-  live offer. The pending bubble itself was never missing
+  Bluetooth; a send takes a while and shows no pending bubble". Two things
+  in the phone's data. The descriptor cache held 29 of 37 contacts with
+  316-char Breez offers from June–September; on 2026-09-29 four in-chat pays
+  to one of them went out as external Lightning melts and failed while the
+  same person's pasted offer settled internally with 0 fee (payment ledger
+  + mint log). And on 2026-10-04 the ledger has no outgoing row at all and
+  the mint saw no melt from the phone: the attempt stopped at a guard
+  before the pending row, with the one wording the 1.15.3 sheet had for
+  every reason, which is why the gate now words and logs each reason. The
+  pending bubble itself was never missing
   (`PaymentPendingRowTests`, both chat kinds; a 40 s `mint-proxy.py
   delay-melt` showed "Sending to …" the whole time), but the toast said the
   chat would show the payment "once it settles"; it now says it shows as

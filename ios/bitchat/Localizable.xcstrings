@@ -163,6 +163,12 @@
     "Their payment address is from an older Sonar. Ask them to open the latest Sonar to pay them here." : {
 
     },
+    "Couldn't reach the relays for their payment address. Check your connection and try again." : {
+
+    },
+    "They haven't published a payment address in Sonar yet." : {
+
+    },
     "Pays like you message — tap to pay nearby or over the internet" : {
 
     },
