@@ -11,6 +11,8 @@ MARKETING_VERSION = 1.15.4
 // v0.1-alpha.15.2 ships as 1.15.2/47 (Apple-only: lost local-time share, #644).
 // v0.1-alpha.15.3 ships as 1.15.3/48 (catch-up order #649, sync freeze #650).
 // v0.1-alpha.15.4 ships as 1.15.4/49 (offline→online freeze: #656, #657, #659).
+//   macOS 1.15.4/49 is archived after the tag, with the two unused sandbox
+//   entitlements removed (1.15.3/48 failed macOS beta review).
 CURRENT_PROJECT_VERSION = 49
 
 IPHONEOS_DEPLOYMENT_TARGET = 16.0
