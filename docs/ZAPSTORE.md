@@ -18,8 +18,15 @@ Publish Sonar’s Android alpha to [Zapstore](https://zapstore.dev) with
 
 1. **Nostr publisher identity** — env `SIGN_WITH`:
    - `nsec1…` (dev only), or
-   - `bunker://…` (preferred for CI), or
-   - `browser` (NIP-07 extension)
+   - `bunker://…` (preferred for CI; also what a human uses).
+
+   `zsp` 0.5.x accepts only these (and raw hex). `SIGN_WITH=browser` fails
+   with `signer_unavailable`. A bunker must also be allowed to sign kind
+   24242 (the Blossom upload authorization), not just the release kinds;
+   when it is not, the APK upload never starts and `zsp` reports a
+   misleading `source_failed` with `"uploaded": 0`. Approve that kind in the
+   signer app, then retry: nothing reaches the relays until the upload
+   succeeds.
 
 2. **Android upload keystore** (APK **must** be signed with v2+; targetSdk 35):
    - Path: e.g. `~/upload-keystore.jks` (or `.p12`)
@@ -76,12 +83,12 @@ export GITHUB_TOKEN="$(gh auth token)"
 scripts/zapstore-publish.sh --check
 
 # Full path: build phone release, sign, publish to Zapstore
-export SIGN_WITH='nsec1…'   # or bunker://… or browser
+export SIGN_WITH='nsec1…'   # or bunker://…
 # (keystore passwords via local.properties — see above)
 scripts/zapstore-publish.sh --local
 
 # If you already have dist/sonar-android-signed.apk:
-export SIGN_WITH=browser
+export SIGN_WITH='bunker://…'
 scripts/zapstore-publish.sh
 ```
 
@@ -96,7 +103,7 @@ zsp publish --wizard
 Link the APK signing cert to your Nostr identity once (NIP-C1):
 
 ```bash
-export SIGN_WITH=…          # bunker / nsec / browser
+export SIGN_WITH=…          # bunker / nsec
 export KEYSTORE_PASSWORD=…  # PKCS12 / JKS password
 # JKS is not accepted by zsp identity — use PKCS12:
 # keytool -importkeystore -srckeystore ~/upload-keystore.jks \

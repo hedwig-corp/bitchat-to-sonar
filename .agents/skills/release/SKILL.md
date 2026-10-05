@@ -139,7 +139,7 @@ gh release create "v0.1-alpha.…" --prerelease --title "Sonar v0.1-alpha.…" \
   --notes "…"
 
 # Zapstore — phone APK only, always --pre-release for alphas
-source /path/to/sign.env   # export SIGN_WITH=… (nsec|bunker|browser); never echo
+source /path/to/sign.env   # export SIGN_WITH=… (nsec|bunker; zsp 0.5.x has no browser signer); never echo
 export GITHUB_TOKEN="$(gh auth token)"
 export PATH="$PATH:$(go env GOPATH)/bin"
 scripts/zapstore-publish.sh --local
