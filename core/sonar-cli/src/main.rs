@@ -76,6 +76,11 @@ enum Command {
     Identity,
     /// Publish this agent's Marmot KeyPackage so peers can start DMs.
     Publish,
+    /// Publish this agent's Sonar descriptor (kind 30078): what the apps read
+    /// to decide whether a contact can be called or paid. With --offer the
+    /// descriptor carries a BOLT12 offer, so an app can pay this agent in
+    /// chat the way it pays another Sonar user (QA-113).
+    PublishDescriptor(PublishDescriptorArgs),
     /// Import a Signal sticker pack, upload assets, and publish a Sonar sticker pack.
     Post(PostArgs),
     /// Send an encrypted text or media message (voice/image/video) to a peer.
@@ -158,6 +163,16 @@ enum TimezoneAction {
         #[arg(long, requires = "from")]
         absent: bool,
     },
+}
+
+#[derive(Args, Debug)]
+struct PublishDescriptorArgs {
+    /// A BOLT12 offer (lno1…) to advertise as this agent's payment address.
+    #[arg(long)]
+    offer: Option<String>,
+    /// Advertise call support. Off by default: the CLI cannot answer a call.
+    #[arg(long)]
+    calls: bool,
 }
 
 #[derive(Args, Debug)]
@@ -539,6 +554,19 @@ async fn run(cli: Cli) -> Result<()> {
             let loaded = LoadedConfig::load(home, cli.relays)?;
             let client = loaded.connect().await?;
             client.publish_key_package().await?;
+            let relays = loaded.relay_strings();
+            print_json(&Output::Published {
+                npub: client.identity().npub(),
+                relays,
+            })?;
+            Ok(())
+        }
+        Command::PublishDescriptor(args) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client
+                .publish_sonar_descriptor(args.calls, Vec::new(), args.offer)
+                .await?;
             let relays = loaded.relay_strings();
             print_json(&Output::Published {
                 npub: client.identity().npub(),
