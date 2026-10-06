@@ -19,8 +19,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -34,6 +36,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -180,6 +184,15 @@ fun PaySheet(
 ) {
     val s = sonar
     TransientBackHandler(onClose)
+    // The sheet brings its own keypad. Opened from a chat, the composer still
+    // held the soft keyboard, and the app root's `imePadding()` left the sheet
+    // only the space above it: the Send button lost its label (QA-163).
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(Unit) {
+        focusManager.clearFocus(force = true)
+        keyboard?.hide()
+    }
     var v by remember { mutableStateOf(fixedSats?.toString().orEmpty()) }
     // True only while the amount is exactly what `Max` proposed; any edit
     // clears it, so a typed amount is never shaved by a fee.
@@ -229,7 +242,14 @@ fun PaySheet(
         contentAlignment = Alignment.BottomCenter
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 16.dp, bottom = 20.dp)) {
+            // Scrolls once the window is shorter than the sheet (~575 dp: a
+            // small phone, a large font, or a keyboard still closing). A plain
+            // Column squeezed its last children instead, down to a 0 dp Send
+            // label. The iOS sheet already scrolls (SNFittedScrollView).
+            Column(
+                Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                    .padding(start = 14.dp, end = 14.dp, top = 16.dp, bottom = 20.dp)
+            ) {
                 Text("Send bitcoin · $peerName", color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(10.dp))
 

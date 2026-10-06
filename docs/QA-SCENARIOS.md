@@ -993,6 +993,25 @@ real mint and need the maintainer's approval of the amounts.
   `ios-setup.sh`'s verification launch created first: it is keyed by the
   keychain, not the bench key), driven by `scripts/qa/ios-drive.sh`.
 
+### QA-163 — Send money from a chat while the keyboard is up
+- **Platforms:** Android (Compose). iOS presents `SNPaySheet` through
+  `snSheet`, whose `SNFittedScrollView` already scrolls a sheet taller than
+  its window.
+- **Steps:** open a chat, tap the composer so the keyboard shows, then
+  + → *Send money*. Repeat on a small phone or with the largest system font.
+- **Expect:** the keyboard goes away as the sheet opens, and the Send button
+  shows its label ("Send over Lightning" / "Send over Bluetooth") with the
+  footer under it. When the window is still shorter than the sheet, the
+  sheet scrolls. The button never shrinks to a bare colored bar.
+- **Guard:** `PaySheetShortWindowUiTest.theSendButtonKeepsItsLabelWhenTheSheetIsTallerThanItsWindow`,
+  `PaySheetShortWindowUiTest.openingTheSheetTakesTheKeyboardFromTheComposer`
+- **Origin:** 2026-10-06 Android screenshot: "Send bitcoin · Cody" with the
+  keyboard up and a label-less purple bar for the Send button. The app root
+  applies `imePadding()`, so the sheet got about 500 dp. Its plain Column
+  needs about 575 dp (the #614 fee line added a row) and squeezed its last
+  children: the Send label measured 0 dp tall. The floating lavender
+  waveform square in that screenshot is not Sonar UI.
+
 ### QA-114 — Two Sonars in Bluetooth range, both with a wallet
 - **Platforms:** Android (two emulators share the virtual Bluetooth medium,
   so any second running Sonar emulator is a mesh peer); iOS sends no offer in
