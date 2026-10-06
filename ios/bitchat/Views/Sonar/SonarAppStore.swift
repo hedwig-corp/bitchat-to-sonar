@@ -10349,9 +10349,10 @@ final class SonarAppStore: ObservableObject {
         case .pending:
             // In flight (Cashu `Pending`): NOT failed and never re-sent. The
             // ⚡PAY receipt + PAYDONE (with the preimage) go out when the
-            // wallet reports the same payment complete.
+            // wallet reports the same payment complete. No toast: the chat's
+            // "Sending to …" bubble (the ledger row) already says it.
             catchUpEarlyUpdate(for: payment, from: sender)
-            return String(localized: "Payment is on its way — the chat shows it as Sending until it settles.")
+            return nil
         case .paid(_, let receiptDue):
             guard receiptDue, let entry = paymentActivityLedger.entries[activityId] else { return nil }
             // Wallet settled — record locally before sending receipts so the

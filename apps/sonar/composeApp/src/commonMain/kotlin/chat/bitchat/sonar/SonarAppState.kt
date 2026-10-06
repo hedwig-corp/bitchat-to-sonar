@@ -92,7 +92,6 @@ import chat.bitchat.sonar.resources.amount_plus_fee_exceeds_your_balance
 import chat.bitchat.sonar.resources.mint_offline_retrying_nothing_was_sent
 import chat.bitchat.sonar.resources.old_lightning_wallet_removed
 import chat.bitchat.sonar.resources.payment_failed_you_were_not_charged
-import chat.bitchat.sonar.resources.payment_is_on_its_way_the_chat_shows_it
 import chat.bitchat.sonar.resources.their_payment_address_is_from_an_older
 import chat.bitchat.sonar.resources.couldn_t_reach_the_relays_for_their
 import chat.bitchat.sonar.resources.they_haven_t_published_a_payment
@@ -3963,9 +3962,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (result.pending) {
                 // In flight, NOT failed. The ⚡PAY receipt (PAY + PAYDONE with
                 // the preimage) goes out when the wallet reports it settled —
-                // see settlePendingWalletSend. Never re-sent.
+                // see settlePendingWalletSend. Never re-sent. No toast: the
+                // chat's Sending bubble (the pending activity row) says it.
                 trackPendingWalletSend(payId, result)
-                toast = getString(Res.string.payment_is_on_its_way_the_chat_shows_it)
                 return@launch
             }
             if (result.ok) {

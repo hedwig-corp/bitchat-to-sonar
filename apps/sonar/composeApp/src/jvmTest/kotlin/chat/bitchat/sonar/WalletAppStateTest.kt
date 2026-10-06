@@ -135,7 +135,8 @@ class WalletAppStateTest {
             callIdentity = "",
             bolt12Offer = offer,
             paymentReceipts = emptyList(),
-            publishedAtSecs = 0,
+            // After the Cashu switch: an older offer is refused as legacy.
+            publishedAtSecs = SONAR_PAYMENT_OFFER_CUTOVER_SECS + 86_400,
         ),
     )
 
@@ -741,14 +742,19 @@ class WalletAppStateTest {
                 callIdentity = "",
                 bolt12Offer = "lno1peeroffer",
                 paymentReceipts = emptyList(),
-                publishedAtSecs = 0,
+                // After the Cashu switch: an older offer is refused as legacy.
+                publishedAtSecs = SONAR_PAYMENT_OFFER_CUTOVER_SECS + 86_400,
             ),
         )
         assertNull(s.sendPay(chatId, 700, maxFeeSats = null))
-        // The pending branch's last step: everything it does has happened.
-        waitUntil("pending branch done") { s.toast == "Payment is on its way — it shows in the chat once it settles." }
+        // The pending branch links the wallet payment to the row, and that is
+        // all it does: the chat's Sending bubble is the feedback, no toast.
+        waitUntil("pending branch done") {
+            PaymentActivityStore.sorted().any { it.peerKey == chatId && it.walletPaymentId != null }
+        }
         val row = PaymentActivityStore.sorted().first { it.peerKey == chatId && it.walletPaymentId != null }
         assertEquals(SonarPaymentActivity.Status.Pending, row.status)
+        assertNull(s.toast, "an in-flight chat payment raises no toast")
         assertNull(s.payStatus(row.id), "no ⚡PAY receipt while the payment is only in flight")
 
         native.emit(

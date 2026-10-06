@@ -983,9 +983,9 @@ real mint and need the maintainer's approval of the amounts.
   every reason, which is why the gate now words and logs each reason. The
   pending bubble itself was never missing
   (`PaymentPendingRowTests`, both chat kinds; a 40 s `mint-proxy.py
-  delay-melt` showed "Sending to …" the whole time), but the toast said the
-  chat would show the payment "once it settles"; it now says it shows as
-  Sending. Reproduced headlessly: `cdk-mintd` fakewallet on 8085 (`[ln]`
+  delay-melt` showed "Sending to …" the whole time), but a toast said the
+  chat would show the payment "once it settles". The toast is gone on both
+  platforms: the bubble is the in-flight feedback. Reproduced headlessly: `cdk-mintd` fakewallet on 8085 (`[ln]`
   needs `min_mint/max_mint/min_melt/max_melt`), `mint-proxy.py` on 8095,
   iOS DEBUG `sonar.debug.cashuMintURL` written by plist path while the
   simulator is shut down, payee = `sonar-cli` + `sonar-cashu-cli` offer,
