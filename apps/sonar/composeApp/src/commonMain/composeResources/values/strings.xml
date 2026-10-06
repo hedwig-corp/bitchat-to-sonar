@@ -316,7 +316,6 @@
     <string name="pay_anyone_or_move_the_sats_to_your">Pay anyone, or move the sats to your wallet</string>
     <string name="payment_address">Payment address</string>
     <string name="payment_failed_you_were_not_charged">Payment failed — you were not charged.</string>
-    <string name="payment_is_on_its_way_the_chat_shows_it">Payment is on its way — the chat shows it as Sending until it settles.</string>
     <string name="payments_need_your_wallet_to_finish">Payments need your wallet to finish opening on this Mac. It starts once your Sonar identity is ready.</string>
     <string name="payments_to_this_address_go_to_your">Payments to this address go to your wallet at mint.hedwig.sh.</string>
     <string name="payments_to_will_go_to_your_new_wallet">Payments to %1$s will go to your new wallet, held as ecash at mint.hedwig.sh. Your old wallet stays spendable. Deleting the new wallet does not move the address back.</string>
