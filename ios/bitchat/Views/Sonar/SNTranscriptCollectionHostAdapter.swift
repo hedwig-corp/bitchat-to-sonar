@@ -434,6 +434,9 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     /// Search / deep-link jump target; wins over unread/live-edge open (#372).
     var jumpMessageId: String? = nil
     var onJumpSettled: (() -> Void)? = nil
+    /// Advances on every outgoing send (text, sticker, voice, media): the
+    /// host snaps to the live edge once the sent row lands.
+    var ownSendRevision: UInt64? = nil
     var composerVersion: UInt64? = nil
     @ViewBuilder var composer: () -> Composer
 
@@ -465,6 +468,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
+            ownSendRevision: ownSendRevision,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             transcriptBackgroundColor: UIColor(SonarTheme.bg),

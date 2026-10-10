@@ -599,7 +599,12 @@ final class SNTextBubbleContentView: UIView {
         var parts: [String] = []
         if let author = model.author { parts.append(author) }
         parts.append(model.accessibilityText)
-        parts.append("Sent at \(model.time)")
+        parts.append(snBubbleDeliveryAccessibilityLabel(
+            stateText: model.state?.text,
+            isPending: model.state?.isPending ?? false,
+            isFailed: model.state?.isFailed ?? false,
+            time: model.time
+        ))
         accessibilityLabel = parts.joined(separator: ", ")
         var custom: [UIAccessibilityCustomAction] = []
         if model.canReply {
