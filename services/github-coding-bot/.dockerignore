@@ -1,0 +1,10 @@
+target/
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+**/*.pem
+**/*.key
+.git/
