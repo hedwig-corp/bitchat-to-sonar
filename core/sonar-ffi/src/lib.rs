@@ -1115,11 +1115,21 @@ impl SonarNode {
                 _ = interrupted.wait_for(|suspending| *suspending) => Err(
                     SonarFfiError::Core(format!("connect {SUSPEND_INTERRUPT_MARKER}"))
                 ),
-                result = SonarClient::connect(
+                // The app host is the one caller that spreads the account's
+                // relay lists and profile to the public indexers (#626).
+                // `SONAR_LOOKUP_RELAYS` in the process environment overrides
+                // (simulator launches and the desktop app inherit it), so QA
+                // harnesses and benchmarks keep throwaway identities off the
+                // public directory. Android emulators get no environment; see
+                // docs/RELAY-ROUTES.md.
+                result = SonarClient::connect_with_routes(
                     identity.inner.clone(),
                     relays,
                     &db_path,
                     db_key,
+                    sonar_core::relay_routes::RelayRoutesConfig::from_env(
+                        sonar_core::relay_routes::RelayRoutesConfig::public(),
+                    ),
                 ) => result.map_err(Into::into),
             }
         })?;
