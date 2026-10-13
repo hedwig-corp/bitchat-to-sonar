@@ -12,6 +12,7 @@
 //
 
 import Darwin
+import notify
 import Foundation
 
 /// Advisory `flock` on `sonar-marmot/marmot.store.lock` in the App Group.
@@ -61,13 +62,34 @@ final class MarmotStoreLock: @unchecked Sendable {
         #endif
     }
 
+    /// Darwin notification the main app posts right before it blocks on
+    /// `acquireExclusive()`. The NSE registers for it and yields: it
+    /// interrupts the suspend latch it passed to its `SonarNode.connect`, so
+    /// the relay quorum wait and the wake drain abort and the lock is
+    /// released within a moment. Without this, a wake that landed on a slow
+    /// cellular link holds the store for its full timeouts (5 s connect +
+    /// 8 s drain, more under retries) and the app sits on its launch surface
+    /// for that long — the "it does not open unless I am on Wi-Fi" report.
+    /// Posting is cheap and goes nowhere when no NSE is alive.
+    static let hostWantsStoreNotification = "sh.hedwig.sonar.marmot.store.host-wants"
+
+    /// Ask any live NSE to release the store. Fire-and-forget.
+    static func signalHostWantsStore() {
+        #if os(iOS)
+        notify_post(hostWantsStoreNotification)
+        #endif
+    }
+
     /// Blocking exclusive lock — used by the main app around `SonarNode.connect`.
     /// Waits if the NSE currently holds the wake lock (bounded by NSE lifetime).
+    /// Signals the NSE first so that wait is the NSE's abort latency, not its
+    /// relay timeouts.
     static func acquireExclusive(fileManager: FileManager = .default) throws -> MarmotStoreLock {
         #if os(iOS)
         guard let url = lockFileURL(fileManager: fileManager, createDirectory: true) else {
             throw StoreLockError.appGroupUnavailable
         }
+        signalHostWantsStore()
         do {
             return try openAndLock(url: url, nonBlocking: false)
         } catch StoreLockError.busy {

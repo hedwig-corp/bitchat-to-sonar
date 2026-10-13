@@ -46,7 +46,9 @@ actual object SonarCore {
     // picker/transcript reads while still allowing unrelated images in parallel.
     private val stickerOperationLock = ReentrantReadWriteLock(true)
     private val installedStickerMutationLock = ReentrantLock(true)
-    private var node: SonarNode? = null
+    // Volatile: every read path (`node ?: return`) and the `start()` fast path
+    // below read it without [lock]; writes happen under [lock] after `npub`.
+    @Volatile private var node: SonarNode? = null
     @Volatile private var relayConnected = false
     private val relayEpoch = AtomicLong(0)
 
@@ -68,7 +70,23 @@ actual object SonarCore {
     actual fun lastImportBackupOutcome(): AccountBackupRestoreOutcome = lastImportBackupOutcomeValue
 
     actual suspend fun start(): String = withContext(Dispatchers.IO) {
+        // Local-first paint must never queue behind a relay attach. Push
+        // registration (`SonarApp.onCreate` → `registerTransponder`) and the
+        // FCM wake sync both open the node and then hold [lock] across the
+        // whole `connectRelays()` attach: `RELAY_CONNECT_TIMEOUT` (5 s) per
+        // try on a slow cellular link, plus subscribe + outbox retry, times
+        // three retries. `boot()` gates the first frame on this call, so on
+        // Wi-Fi (attach ≈ 1 s) nobody noticed and on cellular the launch
+        // window stayed up for 5–15 s. The node, once opened, is the same
+        // object this call would hand back, so answer from the published
+        // state and let the attach finish on its own.
+        if (node != null && npub.isNotEmpty()) return@withContext npub
+        val waitStartNs = System.nanoTime()
         lock.withLock {
+            val waitedMs = (System.nanoTime() - waitStartNs) / 1_000_000
+            if (waitedMs >= 500) {
+                sonarLog("Core", "start: waited $waitedMs ms for the core lock")
+            }
             if (node == null) {
                 val identity = loadOrCreateIdentity()
                 npub = identity.npub()
