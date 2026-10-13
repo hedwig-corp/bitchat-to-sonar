@@ -845,7 +845,18 @@ share a zone with the app and report the zone the app shared with it.
   advertiser, main-thread time went 68 → 32 ticks/60 s after the fix.
 
 ### QA-164 — Cold launch on cellular while a push wake is in flight
-- **Platforms:** both.
+- **Platforms:** both. Android is scripted; iOS is manual, with the app-side
+  hand-off pinned by a unit test.
+- **How (Android):** `android-smoke.sh` QA-164 (emulator only). It turns the
+  emulator's Wi-Fi off and sets the console link to GSM bandwidth, then
+  cold-starts the app three times and reads `am start -W` TotalTime (launch
+  to first frame, which `MainActivity` defers until `boot()`'s
+  `SonarCore.start()` returns). A launch counts only when push
+  registration's relay attach began before the first frame and took 4 s or
+  more on the shaped link; if none does, the step FAILs as inconclusive
+  rather than passing. Budget 4000 ms (`QA164_BUDGET_MS`). The console's
+  latency setting is a no-op on current images and shaping never applies
+  to the emulated Wi-Fi, which is why the step uses bandwidth on mobile data.
 - **Steps:** account with a few active chats. Put the phone on cellular
   (Wi-Fi off), kill the app, have a `sonar-cli` peer send 3–5 messages so
   the push wakes fire, then tap the app icon while the banners are still
@@ -863,10 +874,26 @@ share a zone with the app and report the zone the app shared with it.
     with N in the thousands. `boot()`'s `SonarCore.start()` answers from the
     node push registration already opened instead of queueing behind its
     `connectRelays()` attach.
-- **Guarding test:** `latched_collect_after_wake_refuses_instead_of_syncing`
-  (`core/sonar-ffi`) pins the core half (a latched node refuses the wake
-  drain at once). The Android fast path and the iOS `notify_post` hand-off
-  are host plumbing with no unit seam; this scenario is their check.
+- **Guarding tests:**
+  - `latched_collect_after_wake_refuses_instead_of_syncing` (`core/sonar-ffi`):
+    a latched node refuses the wake drain at once.
+  - `MarmotStoreLockTests.acquireExclusiveAsksHolderToYield` (iOS): the app's
+    blocking acquire posts the yield notification before it parks, and a
+    holder that releases on it lets the acquire through.
+  - Not unit-pinned: the NSE's observer wiring and the Android `start()` fast
+    path. The scripted step above is the Android check; iOS needs the manual
+    steps on a device.
+- **Last run (2026-10-13, Sonar_QA_API_36 emulator, shaped link):**
+
+  | Build | TotalTime per launch | Core lock wait logged |
+  |---|---|---|
+  | Fix (#665) | 2128, 2095, 2064 ms: PASS | none |
+  | Fast path removed | 6812, 6936, 6862 ms: FAIL | 4722, 4641, 4622 ms |
+
+  The iOS yield check, run as a plain process on an iOS 26.5 simulator
+  (the test target could not build while `breez-sdk-liquid-swift` was
+  unresolvable): with the fix the acquire got the lock at once; with
+  `signalHostWantsStore()` removed it stayed parked until the 3 s limit.
 - **Origin:** 2026-10-13 tester report "quando non sono in Wi-Fi non si
   apre". Both hosts gate first paint on the local store open, and both let a
   push-driven relay attach hold the store lock across its network timeouts:
