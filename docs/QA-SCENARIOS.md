@@ -844,6 +844,37 @@ share a zone with the app and report the zone the app shared with it.
   ANRs and 23–26 % idle CPU on Home, the same on a `main` build. With one
   advertiser, main-thread time went 68 → 32 ticks/60 s after the fix.
 
+### QA-164 — Cold launch on cellular while a push wake is in flight
+- **Platforms:** both.
+- **Steps:** account with a few active chats. Put the phone on cellular
+  (Wi-Fi off), kill the app, have a `sonar-cli` peer send 3–5 messages so
+  the push wakes fire, then tap the app icon while the banners are still
+  arriving. Repeat on Wi-Fi as the control.
+- **Expect:** the chat list paints within the normal cold-start budget on
+  both networks (`docs/PERFORMANCE.md`, `t0→t1_local_paint`). It must not sit
+  on the launch surface (iOS black "sonar" screen, Android starting window)
+  for the length of the wake's relay timeouts.
+  - iOS log: the NSE diagnostics stamp `yield:hostWantsStore` followed by
+    `yield:abandonedHydrate`, and the app's `marmot workQueue op=connectLocal`
+    line shows `ran_ms` well under 1000 — the open no longer waits for the
+    NSE's 5 s relay quorum + 8 s drain. The banner that wake was decorating
+    stays generic and silent; the app paints the message itself.
+  - Android logcat: no `Core: start: waited N ms for the core lock` line
+    with N in the thousands. `boot()`'s `SonarCore.start()` answers from the
+    node push registration already opened instead of queueing behind its
+    `connectRelays()` attach.
+- **Guarding test:** `latched_collect_after_wake_refuses_instead_of_syncing`
+  (`core/sonar-ffi`) pins the core half (a latched node refuses the wake
+  drain at once). The Android fast path and the iOS `notify_post` hand-off
+  are host plumbing with no unit seam; this scenario is their check.
+- **Origin:** 2026-10-13 tester report "quando non sono in Wi-Fi non si
+  apre". Both hosts gate first paint on the local store open, and both let a
+  push-driven relay attach hold the store lock across its network timeouts:
+  Android's `SonarPushRegistration` holds the `SonarCore` mutex across
+  `connectRelays()`, iOS's NSE holds the App Group `flock` across
+  `SonarNode.connect` + `collectNotificationsAfterWake`. On Wi-Fi the attach
+  finishes in about a second, so only cellular users saw it.
+
 ## Wallet (Cashu)
 
 Money scenarios never need real sats: point a DEBUG iOS build at a local

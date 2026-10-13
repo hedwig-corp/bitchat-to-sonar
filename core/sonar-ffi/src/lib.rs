@@ -1654,9 +1654,19 @@ impl SonarNode {
         max_wait_ms: u64,
     ) -> FfiResult<Vec<DrainNotificationInfo>> {
         let wait = std::time::Duration::from_millis(max_wait_ms.max(1));
-        let notifications = self
-            .runtime
-            .block_on(self.client.collect_notifications_after_wake(wait))?;
+        // Latched, not a bare `block_on`: the NSE holds the cross-process
+        // store lock for the whole of this call, and on a slow cellular link
+        // the relay quorum (5 s) plus this wait (8 s) is how long the host
+        // app's own local open then blocks on `flock`. When the host signals
+        // that it wants the store, the NSE interrupts the latch it passed to
+        // `connect`, and this call must return at once so the lock is
+        // released. `sync_force` is already an abort-safe call (see
+        // `interrupt_for_suspend`); an aborted drain only means the banner
+        // stays generic, and the host is about to paint the message itself.
+        let notifications = self.block_on_suspendable(
+            "collect_notifications_after_wake",
+            self.client.collect_notifications_after_wake(wait),
+        )?;
         Ok(notifications
             .into_iter()
             .map(|n| DrainNotificationInfo {
@@ -4064,6 +4074,31 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "in-flight connect must abort on latch ({}s)",
             elapsed.as_secs()
+        );
+    }
+
+    /// The NSE passes the host-yield latch to `connect` and holds the
+    /// cross-process store lock across `collect_notifications_after_wake`.
+    /// A latched node must refuse the drain instead of running the relay
+    /// sync to its timeout, or the host app's local open stays blocked on
+    /// `flock` for the whole wait (the "does not open on cellular" report).
+    #[test]
+    fn latched_collect_after_wake_refuses_instead_of_syncing() {
+        let node = local_test_node(vec![]);
+        node.interrupt_for_suspend();
+        let started = std::time::Instant::now();
+        let err = node
+            .collect_notifications_after_wake(8_000)
+            .err()
+            .expect("a latched node must not run the wake drain");
+        assert!(
+            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "latched drain must fail fast ({}s)",
+            started.elapsed().as_secs()
         );
     }
 
