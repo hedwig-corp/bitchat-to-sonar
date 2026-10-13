@@ -77,6 +77,8 @@ while IFS= read -r f; do
   case "$b" in *Screen.kt|*View.swift|*Sheet*) ui=1 ;; esac
   case "$f" in *Localizable.xcstrings|scripts/i18n/*|*/composeResources/*strings*) i18n=1; ui=1 ;; esac
   case "$b" in *startup*|*coldstart*|*bench*|*relay*|*sync*|*background*) perf=1 ;; esac
+  # The first-paint store lock and whoever can hold it at launch (QA-164).
+  case "$b" in SonarCore.android.kt|MarmotStoreLock.swift|NotificationService.swift|SonarPushRegistration.kt|SonarApp.kt|MainActivity.kt|SonarRootView.swift) perf=1 ;; esac
 done <<< "$changed"
 
 # --- environment -----------------------------------------------------------
@@ -222,7 +224,7 @@ if (( mesh )); then
 fi
 (( localtime )) && WALK+=("Private local time (QA-070…077, QA-093)")
 (( ui )) && WALK+=("Accessibility (QA-040…043)" "Settings (QA-060)")
-(( perf )) && WALK+=("Performance (QA-050…053) — and docs/PERFORMANCE.md when startup changed")
+(( perf )) && WALK+=("Performance (QA-050…053, QA-160, QA-164) — and docs/PERFORMANCE.md when startup changed")
 if (( wallet )); then
   WALK+=("Wallet (Cashu) (QA-107…126) — money code: a maintainer reviews it by hand")
   (( ios && xcode )) && ! have cdk-mintd &&
