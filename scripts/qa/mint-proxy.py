@@ -16,6 +16,8 @@ sats only: use it with a `cdk-mintd` fakewallet mint, never a real one.
     scripts/qa/mint-proxy.py arm delay-melt 12         # forward after 12 s (the app waits)
     scripts/qa/mint-proxy.py arm delay-mint-answer 20  # mint issues at once, answer after 20 s
     scripts/qa/mint-proxy.py arm inflate-melt-fee 40   # next melt quote answers a 40-sat fee reserve
+    scripts/qa/mint-proxy.py arm short-melt-ttl 5      # next melt quote reads as expiring in 5 s
+    scripts/qa/mint-proxy.py arm short-melt-ttl 5x3    # ...the next 3 melt quotes
     scripts/qa/mint-proxy.py status | disarm
 
 Each fault fires once, on the next matching request, then the proxy is back
@@ -94,6 +96,19 @@ def with_fee_reserve(answer: bytes, fee: int) -> bytes:
     return ("\r\n".join(lines) + f"\r\nContent-Length: {len(body)}\r\n\r\n").encode("latin-1") + body
 
 
+def with_expiry(answer: bytes, expiry: int) -> bytes:
+    """The same HTTP answer with the JSON body's expiry replaced."""
+    sep = answer.find(b"\r\n\r\n")
+    head, body = answer[:sep].decode("latin-1"), answer[sep + 4:]
+    if "transfer-encoding: chunked" in head.lower():
+        raise ValueError("chunked melt quote answer: not rewritten")
+    data = json.loads(body)
+    data["expiry"] = expiry
+    body = json.dumps(data).encode()
+    lines = [l for l in head.split("\r\n") if not l.lower().startswith("content-length:")]
+    return ("\r\n".join(lines) + f"\r\nContent-Length: {len(body)}\r\n\r\n").encode("latin-1") + body
+
+
 def take(fault: str):
     if state["fault"] != fault:
         return None
@@ -128,6 +143,14 @@ async def handle(reader, writer, upstream: int):
         if is_melt_quote and (fee := take("inflate-melt-fee")):
             answer = with_fee_reserve(answer, int(fee))
             log(f"inflate-melt-fee: {path} answered with fee_reserve {fee}")
+        if is_melt_quote and (ttl := take("short-melt-ttl")):
+            # "<secs>" fires once; "<secs>x<n>" on the next n melt quotes.
+            secs, _, times = str(ttl).partition("x")
+            left = int(times or 1) - 1
+            if left > 0:
+                state["fault"], state["arg"] = "short-melt-ttl", f"{secs}x{left}"
+            answer = with_expiry(answer, int(time.time()) + int(secs))
+            log(f"short-melt-ttl: {path} answered expiring in {secs} s ({left} more armed)")
         if is_mint and (delay := take("delay-mint-answer")):
             log(f"delay-mint-answer: {path} issued by the mint, answer held {delay} s")
             await asyncio.sleep(float(delay))

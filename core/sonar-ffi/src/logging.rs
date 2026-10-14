@@ -143,11 +143,15 @@ static LOG_SINK: Mutex<LogState> = Mutex::new(LogState::Uninit);
 
 fn filter_for(verbose: bool) -> EnvFilter {
     // Default is the redaction boundary: `sonar_core` debug logs are where
-    // peer npubs appear, so they are excluded unless the user opts in.
+    // peer npubs appear, so they are excluded unless the user opts in. The
+    // Cashu wallet's info lines are a payment's lifecycle (quote, fees,
+    // expiry, prepare, confirm) by quote-id prefix and amounts only — the
+    // record a failed send needs. CDK's own info logs carry full quote ids
+    // and stay behind the opt-in.
     let directives = if verbose {
         "info,sonar_core=debug,sonar_ffi=debug"
     } else {
-        "warn,sonar_core=info,sonar_ffi=info"
+        "warn,sonar_core=info,sonar_ffi=info,sonar_wallet_cdk=info"
     };
     EnvFilter::new(directives)
 }

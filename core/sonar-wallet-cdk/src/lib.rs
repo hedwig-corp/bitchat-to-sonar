@@ -31,7 +31,7 @@ pub mod test_mint;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cdk::amount::SplitTarget;
 use cdk::nuts::nut00::KnownMethod;
@@ -382,7 +382,23 @@ impl CdkWallet {
             recovery: budget,
             send: budget,
             melt_grace: budget,
+            melt_ttl_floor: budget,
+            confirm_ttl_floor: budget,
         };
+    }
+
+    /// Shrink only how long `send` waits before it reports the melt Pending.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_test_send_budget(&mut self, budget: Duration) {
+        self.budgets.send = budget;
+    }
+
+    /// Set the quote lifetime `send` needs left to start a melt, and to
+    /// confirm one (see [`Budgets::melt_ttl_floor`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_test_ttl_floors(&mut self, start: Duration, confirm: Duration) {
+        self.budgets.melt_ttl_floor = start;
+        self.budgets.confirm_ttl_floor = confirm;
     }
 
     /// Shrink only the grace an ambiguous, compensated melt waits before it
@@ -404,6 +420,32 @@ impl CdkWallet {
         let mut wallet = Self::new(config, mint_url)?;
         wallet.connector = Some(connector);
         Ok(wallet)
+    }
+
+    /// Wait up to `remaining` for a send task whose melt is confirming.
+    /// `None`: still running, so the caller stops listening and the task
+    /// reports the outcome as an event. Money may be moving: the caller
+    /// reports Pending, never an error, which would invite a retry that pays
+    /// twice.
+    fn await_confirm(
+        &self,
+        task: &mut tokio::task::JoinHandle<Result<Payment>>,
+        handoff: &Mutex<SendHandoff>,
+        remaining: Duration,
+    ) -> Option<std::result::Result<Result<Payment>, tokio::task::JoinError>> {
+        let waited = self
+            .rt()
+            .block_on(async { tokio::time::timeout(remaining, &mut *task).await });
+        if let Ok(joined) = waited {
+            return Some(joined);
+        }
+        let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
+        if h.finished {
+            drop(h);
+            return Some(self.rt().block_on(task));
+        }
+        h.caller_gone = true;
+        None
     }
 
     /// Restore-completion marker for THIS mint (`cashu.restored.<hash8>`),
@@ -560,10 +602,13 @@ impl CdkWallet {
             Ok(Some(_)) => {}
             Ok(None) => {
                 if let Err(e) = self.adopt_offer(wallet, &pointer) {
-                    tracing::warn!("re-adopting offer quote {}: {e}", pointer.quote_id);
+                    tracing::warn!(
+                        "re-adopting offer quote {}: {e}",
+                        quote_tag(&pointer.quote_id)
+                    );
                 }
             }
-            Err(e) => tracing::warn!("reading offer quote {}: {e}", pointer.quote_id),
+            Err(e) => tracing::warn!("reading offer quote {}: {e}", quote_tag(&pointer.quote_id)),
         }
     }
 
@@ -825,10 +870,12 @@ impl CdkWallet {
                 destination: classify_destination(&local.request),
                 amount_sats: u64::from(local.amount),
                 fees_sats: Some(u64::from(local.fee_reserve)),
+                expires_at_secs: (local.expiry != 0).then_some(local.expiry),
                 token: PreparedSendToken::Opaque(local.id.clone()),
             };
             let pending = || Ok(Some(pending_payment(quote_id, &prepared, None)));
-            if reconciler.is_unsettled(quote_id) {
+            // A send still preparing or confirming this quote reports it.
+            if reconciler.is_unsettled(quote_id) || reconciler.is_sending(quote_id) {
                 return pending();
             }
             // A running send reports its own melt; and unknown is not safe:
@@ -908,7 +955,10 @@ impl CdkWallet {
             }
             match self.adopt_offer(&wallet, pointer) {
                 Ok(()) => adopted += 1,
-                Err(e) => tracing::warn!("adopting backed-up offer {}: {e}", pointer.quote_id),
+                Err(e) => tracing::warn!(
+                    "adopting backed-up offer {}: {e}",
+                    quote_tag(&pointer.quote_id)
+                ),
             }
         }
         Ok(adopted)
@@ -1059,7 +1109,7 @@ impl CdkWallet {
                 match bounded(budgets.mint_call, wallet.check_melt_quote_status(&quote_id)).await {
                     Ok(quote) => quote,
                     Err(e) => {
-                        errors.push(format!("melt {quote_id}: {e}"));
+                        errors.push(format!("melt {}: {e}", quote_tag(&quote_id)));
                         continue;
                     }
                 };
@@ -1080,12 +1130,13 @@ impl CdkWallet {
                         Ok(InputsRetired::NotYet) => continue,
                         Ok(InputsRetired::Unknown) => {
                             tracing::warn!(
-                                "melt {quote_id}: inputs unknown (no history row); \
-                                 believing Unpaid after the grace window"
+                                "melt {}: inputs unknown (no history row); believing Unpaid \
+                                 after the grace window",
+                                quote_tag(&quote_id)
                             );
                         }
                         Err(e) => {
-                            errors.push(format!("melt {quote_id}: {e}"));
+                            errors.push(format!("melt {}: {e}", quote_tag(&quote_id)));
                             continue;
                         }
                     }
@@ -1098,7 +1149,7 @@ impl CdkWallet {
                         {
                             Ok(quote) => quote,
                             Err(e) => {
-                                errors.push(format!("melt {quote_id}: {e}"));
+                                errors.push(format!("melt {}: {e}", quote_tag(&quote_id)));
                                 continue;
                             }
                         };
@@ -1120,7 +1171,11 @@ impl CdkWallet {
                 preimage: quote.payment_proof.clone(),
                 ..pending_payment(&quote_id, &melt.prepared, melt.note.clone())
             };
-            tracing::info!("ambiguous melt {quote_id} settled {:?}", payment.status);
+            tracing::info!(
+                "ambiguous melt {} settled {:?}",
+                quote_tag(&quote_id),
+                payment.status
+            );
             let _ = events.send(payment_event(payment));
         }
         if errors.is_empty() {
@@ -1168,7 +1223,10 @@ impl CdkWallet {
             };
             if let Some(saga_id) = open_issue {
                 if let Some(payment) = completed_issue_payment(wallet, saga_id, &updated).await {
-                    tracing::info!("issue {saga_id} recovered for quote {}", updated.id);
+                    tracing::info!(
+                        "issue {saga_id} recovered for quote {}",
+                        quote_tag(&updated.id)
+                    );
                     minted += 1;
                     let _ = events.send(WalletEvent::PaymentReceived { payment });
                 }
@@ -1178,7 +1236,7 @@ impl CdkWallet {
                     // An unpaid invoice well past its expiry can never be
                     // paid; stop polling it on every pass forever.
                     if let Err(e) = wallet.localstore.remove_mint_quote(&updated.id).await {
-                        tracing::warn!("prune expired mint quote {}: {e}", updated.id);
+                        tracing::warn!("prune expired mint quote {}: {e}", quote_tag(&updated.id));
                     }
                 }
                 continue;
@@ -1291,7 +1349,7 @@ impl CdkWallet {
             let quote = match bounded(budget, wallet.check_melt_quote_status(&quote_id)).await {
                 Ok(quote) => quote,
                 Err(e) => {
-                    errors.push(format!("melt {quote_id}: {e}"));
+                    errors.push(format!("melt {}: {e}", quote_tag(&quote_id)));
                     continue;
                 }
             };
@@ -1423,6 +1481,18 @@ struct Budgets {
     /// started on a melt request still on its way, so it is only believed
     /// once that request can no longer be arriving.
     melt_grace: Duration,
+    /// The least lifetime a melt quote must have left for `send` to start
+    /// on it. Before the melt request reaches the mint the wallet still
+    /// selects proofs (local), may refresh keyset metadata (one mint call)
+    /// and may swap first (one mint call); a quote that expires on the way
+    /// is refused by the mint. Less than this left, `send` answers
+    /// `QuoteExpired` at once — nothing sent — and the caller re-quotes.
+    melt_ttl_floor: Duration,
+    /// The least lifetime left when a prepared melt is confirmed: the swap
+    /// and the melt request are still to go. A preparation that finishes
+    /// later is cancelled — no melt request was made — instead of confirmed
+    /// into a quote about to expire.
+    confirm_ttl_floor: Duration,
 }
 
 impl Budgets {
@@ -1432,6 +1502,12 @@ impl Budgets {
         recovery: Duration::from_secs(30),
         send: Duration::from_secs(60),
         melt_grace: Duration::from_secs(60),
+        // Two mint calls at `mint_call` (15 s) would be 30 s, but a mint that
+        // slow fails the call on its own; 20 s covers the healthy path with
+        // a wide margin and leaves 100 s of a 120 s production quote usable.
+        melt_ttl_floor: Duration::from_secs(20),
+        // The swap and the melt request: two healthy round trips with slack.
+        confirm_ttl_floor: Duration::from_secs(10),
     };
 }
 
@@ -1455,6 +1531,14 @@ struct Reconciler {
     unanswered: Arc<connector::UnansweredMelts>,
     /// Melt operations whose confirm a send task is awaiting right now.
     confirming: Mutex<std::collections::HashSet<uuid::Uuid>>,
+    /// Melt quotes a send task owns, from before its preparation until it
+    /// ends: a lookup must not resume (and compensate) a melt the task is
+    /// still preparing.
+    sending: Mutex<std::collections::HashSet<String>>,
+    /// Serializes melt preparations — `send`'s and `prepare_send`'s dry run
+    /// — with each other and with balance reads, so a dry run's short-lived
+    /// reservation is never seen as money leaving.
+    prepare: tokio::sync::Mutex<()>,
     /// The connector the current wallet talks through, for the one mint call
     /// CDK's wallet does not offer: proof states by Y, for proofs the local
     /// store no longer holds. Set on every build.
@@ -1469,8 +1553,26 @@ impl Default for Reconciler {
             journal: None,
             unanswered: Arc::new(connector::UnansweredMelts::default()),
             confirming: Mutex::new(std::collections::HashSet::new()),
+            sending: Mutex::new(std::collections::HashSet::new()),
+            prepare: tokio::sync::Mutex::new(()),
             mint: Mutex::new(None),
         }
+    }
+}
+
+/// Marks a melt quote as owned by a running send until dropped.
+struct Sending {
+    reconciler: Arc<Reconciler>,
+    quote_id: String,
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        self.reconciler
+            .sending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.quote_id);
     }
 }
 
@@ -1587,6 +1689,24 @@ impl Reconciler {
         }
     }
 
+    fn sending(self: &Arc<Self>, quote_id: &str) -> Sending {
+        self.sending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(quote_id.to_string());
+        Sending {
+            reconciler: self.clone(),
+            quote_id: quote_id.to_string(),
+        }
+    }
+
+    fn is_sending(&self, quote_id: &str) -> bool {
+        self.sending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(quote_id)
+    }
+
     fn is_confirming(&self, operation_id: uuid::Uuid) -> bool {
         self.confirming
             .lock()
@@ -1633,6 +1753,7 @@ impl UnsettledMelt {
                 destination: classify_destination(value.get("request")?.as_str()?),
                 amount_sats: value.get("amount_sats")?.as_u64()?,
                 fees_sats: value.get("fees_sats").and_then(|v| v.as_u64()),
+                expires_at_secs: None,
                 token: PreparedSendToken::Opaque(quote_id.clone()),
             },
             note: value
@@ -1712,19 +1833,417 @@ struct OfferPointer {
     index: u32,
 }
 
-/// Who reports a send's outcome when the caller stops waiting (see `send`).
+/// Who reports a send's outcome, and whether the melt may still be
+/// confirmed, once the caller stops waiting (see `send`). Every transition is
+/// made under its lock, so the caller's decision and the task's never race.
 #[derive(Default)]
 struct SendHandoff {
-    /// The caller returned (Timeout or Pending) and is no longer listening.
+    /// The caller returned and is no longer listening: the task reports the
+    /// outcome as an event.
     caller_gone: bool,
+    /// The caller reported the send as not made (`QuoteExpired`): the task
+    /// must cancel instead of confirming, and reports nothing.
+    abandoned: bool,
     /// The melt reached `confirm` — the irreversible step.
     confirming: bool,
+    /// The task ended while the caller was still waiting: the caller joins
+    /// it for the result (the task emitted nothing).
+    finished: bool,
 }
 
 fn map_melt_error(e: cdk::Error) -> WalletError {
     match e {
         cdk::Error::InsufficientFunds => WalletError::InsufficientFunds,
+        // CDK checks the stored expiry before it reserves anything.
+        cdk::Error::ExpiredQuote(..) => WalletError::QuoteExpired,
         other => WalletError::Backend(other.to_string()),
+    }
+}
+
+/// A melt quote id as logs show it: a prefix that tells quotes apart in one
+/// log without handing the mint-side record (amount, invoice) to whoever
+/// reads the log.
+pub(crate) fn quote_tag(quote_id: &str) -> &str {
+    quote_id
+        .char_indices()
+        .nth(8)
+        .map_or(quote_id, |(i, _)| &quote_id[..i])
+}
+
+/// How long a quote expiring at `expiry` (unix seconds) has left.
+fn ttl_left(expiry: u64) -> Duration {
+    Duration::from_millis(expiry.saturating_mul(1_000).saturating_sub(now_ms()))
+}
+
+/// What paying a melt quote costs on top of its amount, priced by CDK's own
+/// melt preparation — the proof selection the send itself will make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MeltPrice {
+    /// The Lightning fee reserve; what the payment does not use comes back.
+    fee_reserve: u64,
+    /// NUT-02 input fee of the melt's own inputs.
+    input_fee: u64,
+    /// NUT-02 input fee of the pre-melt swap's inputs; zero without a swap.
+    swap_fee: u64,
+    /// No exact, fee-free set of proofs exists, so the selected proofs are
+    /// swapped before the melt. (Proofs on a retired, fee-charging keyset
+    /// are melted directly instead when CDK's selection would not pay for
+    /// its own swap — see [`prepare_funded_melt`].)
+    swap: bool,
+    /// Proofs the melt (or its swap) spends.
+    inputs: usize,
+    /// The unreserved proofs cover the amount and every fee.
+    affordable: bool,
+}
+
+impl MeltPrice {
+    fn of(melt: &cdk::wallet::PreparedMelt<'_>) -> Self {
+        Self {
+            fee_reserve: u64::from(melt.quote().fee_reserve),
+            input_fee: u64::from(melt.input_fee()),
+            swap_fee: u64::from(melt.swap_fee()),
+            swap: melt.requires_swap(),
+            inputs: melt.proofs().len() + melt.proofs_to_swap().len(),
+            affordable: true,
+        }
+    }
+
+    /// The most the payment can cost on top of its amount.
+    fn max_fee(&self) -> u64 {
+        self.fee_reserve
+            .saturating_add(self.input_fee)
+            .saturating_add(self.swap_fee)
+    }
+}
+
+/// Keyset metadata, fresh, under a mint-call deadline. CDK's melt
+/// preparation refreshes stale metadata itself, with no deadline; doing it
+/// here first keeps the preparation local, so a hung mint fails this call
+/// instead of stalling a payment.
+async fn warm_keysets(wallet: &Wallet, budget: Duration) -> Result<()> {
+    bounded(budget, wallet.keysets(Default::default()))
+        .await
+        .map(|_| ())
+}
+
+/// CDK 0.18.1's `MeltSaga::prepare` reserves the melt quote before it
+/// selects proofs, and a saga has no `Drop` compensation: when the
+/// selection fails (`InsufficientFunds`, a store error) the quote stays
+/// reserved by an operation that never wrote a saga, and every later
+/// preparation of it fails `QuoteAlreadyInUse`. Release such a reservation.
+/// With no saga under its operation id nothing can be using the quote;
+/// callers hold the reconciler's `prepare` lock, so no other preparation in
+/// this wallet is between its reservation and its saga.
+async fn release_orphaned_quote_reservation(wallet: &Wallet, quote_id: &str) {
+    let Ok(Some(quote)) = wallet.localstore.get_melt_quote(quote_id).await else {
+        return;
+    };
+    let Some(operation) = quote
+        .used_by_operation
+        .as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+    else {
+        return;
+    };
+    if !matches!(wallet.localstore.get_saga(&operation).await, Ok(None)) {
+        return;
+    }
+    match wallet.localstore.release_melt_quote(&operation).await {
+        Ok(()) => tracing::info!(
+            "melt {}: released the quote reservation a failed preparation left",
+            quote_tag(quote_id)
+        ),
+        Err(e) => tracing::warn!(
+            "melt {}: releasing an orphaned quote reservation: {e}",
+            quote_tag(quote_id)
+        ),
+    }
+}
+
+/// Whether a prepared melt's inputs pay for it: the proofs it melts as they
+/// are, plus what its swap yields after the swap's own fee, must cover the
+/// amount, the fee reserve and the melt's input fee.
+fn melt_is_funded(melt: &cdk::wallet::PreparedMelt<'_>) -> bool {
+    use cdk::nuts::nut00::ProofsMethods;
+    let total = |proofs: &cdk::nuts::Proofs| proofs.total_amount().map_or(0, u64::from);
+    let available = total(melt.proofs())
+        .saturating_add(total(melt.proofs_to_swap()).saturating_sub(u64::from(melt.swap_fee())));
+    let owed = u64::from(melt.quote().amount)
+        .saturating_add(u64::from(melt.quote().fee_reserve))
+        .saturating_add(u64::from(melt.input_fee()));
+    available >= owed
+}
+
+/// Prepare a melt CDK can actually confirm.
+///
+/// CDK 0.18.1's proof selection (`Wallet::select_proofs_with_derivation_
+/// indices`) takes every proof on an INACTIVE keyset first, and when those
+/// alone cover the amount it returns early — without the `include_fees`
+/// step every other path runs. Proofs on a retired, fee-charging keyset
+/// (mint.hedwig.sh keeps one at 1000 ppk) are then selected as if free:
+/// `prepare_melt` succeeds, prices the swap's real fee, and the confirm's
+/// swap cannot produce the amount — the payment fails before any melt
+/// request, leaving an UNPAID quote at the mint. That is the 2026-10-13
+/// incident. When the selection does not pay for itself, keep CDK's choice
+/// (it retires the inactive proofs), top it up with the largest other
+/// unspent proofs until it covers its own input fee, and melt it directly.
+async fn prepare_funded_melt<'a>(
+    wallet: &'a Wallet,
+    quote_id: &str,
+    metadata: HashMap<String, String>,
+) -> std::result::Result<cdk::wallet::PreparedMelt<'a>, cdk::Error> {
+    use cdk::nuts::nut00::ProofsMethods;
+    let melt = wallet.prepare_melt(quote_id, metadata.clone()).await?;
+    if melt_is_funded(&melt) {
+        return Ok(melt);
+    }
+    let owed = melt
+        .quote()
+        .amount
+        .checked_add(melt.quote().fee_reserve)
+        .ok_or(cdk::Error::AmountOverflow)?;
+    let mut picked: cdk::nuts::Proofs = melt
+        .proofs()
+        .iter()
+        .chain(melt.proofs_to_swap())
+        .cloned()
+        .collect();
+    tracing::warn!(
+        "melt {}: CDK selected {} proofs that do not cover their own input fee (swap fee {}); \
+         topping the selection up and melting it directly",
+        quote_tag(quote_id),
+        picked.len(),
+        melt.swap_fee()
+    );
+    melt.cancel().await?;
+    let mut rest: cdk::nuts::Proofs = wallet
+        .get_unspent_proofs()
+        .await?
+        .into_iter()
+        .filter(|p| !picked.contains(p))
+        .collect();
+    // Largest first: the fewest extra proofs, so the least extra fee.
+    rest.sort_by_key(|p| std::cmp::Reverse(p.amount));
+    let mut rest = rest.into_iter();
+    loop {
+        let fee = wallet.get_proofs_fee(&picked).await?.total;
+        let needed = owed.checked_add(fee).ok_or(cdk::Error::AmountOverflow)?;
+        if picked.total_amount()? >= needed {
+            break;
+        }
+        match rest.next() {
+            Some(proof) => picked.push(proof),
+            None => return Err(cdk::Error::InsufficientFunds),
+        }
+    }
+    wallet.prepare_melt_proofs(quote_id, picked, metadata).await
+}
+
+/// The price of a melt CDK cannot fund from the unreserved proofs: as if it
+/// spent all of them, through a swap. That is what a caller's balance check
+/// needs to refuse it with real figures, and what a "send max" subtracts.
+async fn unfunded_melt_price(
+    wallet: &Wallet,
+    quote: &cdk::wallet::MeltQuote,
+) -> std::result::Result<MeltPrice, cdk::Error> {
+    let needed = quote
+        .amount
+        .checked_add(quote.fee_reserve)
+        .ok_or(cdk::Error::AmountOverflow)?;
+    let unspent = wallet.get_unspent_proofs().await?;
+    let swap_fee = u64::from(wallet.get_proofs_fee(&unspent).await?.total);
+    let active = wallet.active_keyset().await?;
+    let amounts = wallet.get_keyset_fees_and_amounts_by_id(active.id).await?;
+    let outputs = u64::try_from(needed.split(&amounts)?.len()).unwrap_or(u64::MAX);
+    let input_fee = u64::from(wallet.get_keyset_count_fee(&active.id, outputs).await?);
+    Ok(MeltPrice {
+        fee_reserve: u64::from(quote.fee_reserve),
+        input_fee,
+        swap_fee,
+        swap: true,
+        inputs: unspent.len(),
+        affordable: false,
+    })
+}
+
+/// Price `quote` by running CDK's melt preparation dry: select and reserve
+/// the proofs exactly as `send` will, read the fees, cancel. Nothing reaches
+/// the mint, and the reservation lives only under the `prepare` lock.
+async fn price_melt(
+    wallet: &Wallet,
+    reconciler: &Reconciler,
+    budgets: Budgets,
+    quote: &cdk::wallet::MeltQuote,
+) -> Result<MeltPrice> {
+    warm_keysets(wallet, budgets.mint_call).await?;
+    let _prepare = reconciler.prepare.lock().await;
+    match prepare_funded_melt(wallet, &quote.id, HashMap::new()).await {
+        Ok(melt) => {
+            let price = MeltPrice::of(&melt);
+            if let Err(e) = melt.cancel().await {
+                tracing::warn!("melt {}: cancelling the dry run: {e}", quote_tag(&quote.id));
+            }
+            Ok(price)
+        }
+        Err(cdk::Error::InsufficientFunds) => {
+            release_orphaned_quote_reservation(wallet, &quote.id).await;
+            unfunded_melt_price(wallet, quote)
+                .await
+                .map_err(|e| WalletError::Backend(format!("price melt: {e}")))
+        }
+        Err(e) => {
+            release_orphaned_quote_reservation(wallet, &quote.id).await;
+            Err(map_melt_error(e))
+        }
+    }
+}
+
+/// One `send`'s melt, run as its own task (see `CdkWallet::send`).
+struct MeltJob {
+    wallet: Arc<Wallet>,
+    reconciler: Arc<Reconciler>,
+    quote_id: String,
+    prepared: PreparedSend,
+    note: Option<String>,
+    metadata: HashMap<String, String>,
+    budgets: Budgets,
+    /// The quote's stored expiry (unix seconds), when it has one.
+    expiry: Option<u64>,
+}
+
+impl MeltJob {
+    /// Prepare the melt, decide under the handoff lock whether it may still
+    /// be confirmed, then confirm it. Every error is raised before confirm,
+    /// with the melt cancelled: no melt request was made. From confirm on
+    /// the result is always a payment, Pending when ambiguous.
+    async fn run(
+        &self,
+        handoff: &Mutex<SendHandoff>,
+        confirm_started: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Payment> {
+        let wallet = &*self.wallet;
+        let reconciler = &*self.reconciler;
+        let quote_id = &self.quote_id;
+        let tag = quote_tag(quote_id);
+
+        if let Err(e) = warm_keysets(wallet, self.budgets.mint_call).await {
+            tracing::warn!("melt {tag}: keyset metadata unavailable, nothing sent: {e}");
+            return Err(e);
+        }
+        let prepare = reconciler.prepare.lock().await;
+        let started = Instant::now();
+        let melt = match prepare_funded_melt(wallet, quote_id, self.metadata.clone()).await {
+            Ok(melt) => melt,
+            Err(e) => {
+                tracing::warn!(
+                    "melt {tag}: preparation failed after {} ms, nothing sent: {e}",
+                    started.elapsed().as_millis()
+                );
+                release_orphaned_quote_reservation(wallet, quote_id).await;
+                return Err(map_melt_error(e));
+            }
+        };
+        let price = MeltPrice::of(&melt);
+        tracing::info!(
+            "melt {tag}: prepared in {} ms: {} input proofs, swap first: {}, fee up to {} \
+             (reserve {} + input fee {} + swap fee {})",
+            started.elapsed().as_millis(),
+            price.inputs,
+            price.swap,
+            price.max_fee(),
+            price.fee_reserve,
+            price.input_fee,
+            price.swap_fee,
+        );
+        let operation_id = melt.operation_id();
+        // Until this task ends, the watcher leaves this melt to it.
+        let _confirming = reconciler.confirming(operation_id);
+        let refusal = {
+            let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
+            let lifetime = self.expiry.map(ttl_left);
+            if h.abandoned {
+                Some(WalletError::QuoteExpired)
+            } else if lifetime.is_some_and(|left| left < self.budgets.confirm_ttl_floor) {
+                tracing::warn!(
+                    "melt {tag}: {} s of quote left after preparing, under the {} s a confirm \
+                     needs",
+                    lifetime.unwrap_or_default().as_secs(),
+                    self.budgets.confirm_ttl_floor.as_secs()
+                );
+                Some(WalletError::QuoteExpired)
+            } else if self
+                .prepared
+                .fees_sats
+                .is_some_and(|agreed| price.max_fee() > agreed)
+            {
+                // The fee the caller agreed to is a promise: proofs that
+                // changed since the quote (or a costlier selection) must not
+                // raise it silently.
+                Some(WalletError::FeeChanged {
+                    fees_sats: price.max_fee(),
+                })
+            } else {
+                h.confirming = true;
+                None
+            }
+        };
+        if let Some(refusal) = refusal {
+            tracing::warn!("melt {tag}: cancelled before confirm, nothing sent: {refusal}");
+            if let Err(e) = melt.cancel().await {
+                tracing::warn!("melt {tag}: cancel: {e}");
+            }
+            return Err(refusal);
+        }
+        drop(prepare);
+        let _ = confirm_started.send(());
+        // From here on the payment is reported with what it can really cost.
+        let prepared = PreparedSend {
+            fees_sats: Some(price.max_fee()),
+            ..self.prepared.clone()
+        };
+        let note = self.note.clone();
+        tracing::info!("melt {tag}: confirming (swap first: {})", price.swap);
+        // Prefer async: a mint that accepts the payment and keeps routing it
+        // answers Pending at once instead of holding the request open; the
+        // watcher finalizes it.
+        let outcome = melt.confirm_prefer_async().await;
+        // Read (and forget) whether the melt request went unanswered: CDK
+        // reports a lost answer the mint then reads as Unpaid as
+        // PaymentFailed too, after compensating the proofs.
+        let request_lost = reconciler.unanswered.take(quote_id);
+        let payment = match outcome {
+            // The mint itself said the payment failed; CDK has compensated
+            // the proofs.
+            Err(cdk::Error::PaymentFailed) if !request_lost => {
+                melt_outcome_payment(quote_id, &prepared, outcome, note)
+            }
+            // Anything else may be a request the mint has, or will have,
+            // applied. A Failed here that the melt later contradicts invites
+            // a second payment, so only a melt proven closed locally and
+            // settled at the mint is called Failed; the rest is Pending, and
+            // the watcher reports how it ends. Never re-quoted: the request
+            // may have reached the mint.
+            Err(e) => {
+                tracing::warn!(
+                    "melt {tag}: confirm error (request lost: {request_lost}), checking the \
+                     mint: {e}"
+                );
+                settle_ambiguous_confirm(
+                    wallet,
+                    reconciler,
+                    quote_id,
+                    operation_id,
+                    &prepared,
+                    note,
+                    request_lost,
+                    self.budgets,
+                )
+                .await
+            }
+            outcome => melt_outcome_payment(quote_id, &prepared, outcome, note),
+        };
+        tracing::info!("melt {tag}: confirm ended {:?}", payment.status);
+        Ok(payment)
     }
 }
 
@@ -1767,7 +2286,10 @@ fn melt_outcome_payment(
             };
         }
         Err(e) => {
-            tracing::warn!("melt {quote_id} confirm is ambiguous, reporting Pending: {e}");
+            tracing::warn!(
+                "melt {} confirm is ambiguous, reporting Pending: {e}",
+                quote_tag(quote_id)
+            );
             return pending_payment(quote_id, prepared, note);
         }
     };
@@ -2008,11 +2530,14 @@ async fn account_late_melt(
     match wallet.get_unspent_proofs().await {
         Ok(unspent) if !unspent.is_empty() => {
             if let Err(e) = bounded(budgets.mint_call, wallet.check_proofs_spent(unspent)).await {
-                tracing::warn!("late melt {quote_id}: proof states not synced: {e}");
+                tracing::warn!(
+                    "late melt {}: proof states not synced: {e}",
+                    quote_tag(quote_id)
+                );
             }
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!("late melt {quote_id}: read proofs: {e}"),
+        Err(e) => tracing::warn!("late melt {}: read proofs: {e}", quote_tag(quote_id)),
     }
     let rows = match wallet
         .list_transactions(Some(TransactionDirection::Outgoing))
@@ -2020,7 +2545,7 @@ async fn account_late_melt(
     {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::warn!("late melt {quote_id}: read history: {e}");
+            tracing::warn!("late melt {}: read history: {e}", quote_tag(quote_id));
             return;
         }
     };
@@ -2032,7 +2557,10 @@ async fn account_late_melt(
             tx.payment_proof = preimage.clone();
         }
         if let Err(e) = wallet.localstore.add_transaction(tx).await {
-            tracing::warn!("late melt {quote_id}: history row not updated: {e}");
+            tracing::warn!(
+                "late melt {}: history row not updated: {e}",
+                quote_tag(quote_id)
+            );
         }
     }
 }
@@ -2404,6 +2932,8 @@ impl WalletBackend for CdkWallet {
     fn balance(&self) -> Result<Balance> {
         let wallet = self.wallet()?;
         self.rt().block_on(async {
+            // Never read a fee preview's dry-run reservation as money leaving.
+            let _prepare = self.reconciler.prepare.lock().await;
             let confirmed = wallet
                 .total_balance()
                 .await
@@ -2486,7 +3016,10 @@ impl WalletBackend for CdkWallet {
             Some(_) => Ok(pointer.offer),
             None => {
                 if let Err(e) = self.adopt_offer(&wallet, &pointer) {
-                    tracing::warn!("re-adopting offer quote {}: {e}", pointer.quote_id);
+                    tracing::warn!(
+                        "re-adopting offer quote {}: {e}",
+                        quote_tag(&pointer.quote_id)
+                    );
                 }
                 Ok(pointer.offer)
             }
@@ -2596,10 +3129,44 @@ impl WalletBackend for CdkWallet {
                 )));
             }
         }
+        // The fee reserve is not the whole fee. The melt also pays the
+        // mint's input fees on the proofs it spends — and on a swap first,
+        // which CDK makes whenever no exact fee-free set exists (always,
+        // with proofs left on a fee-charging retired keyset). Pricing only
+        // the reserve let hosts approve a send CDK then refused with
+        // InsufficientFunds after the quote existed: no melt, an UNPAID
+        // quote at the mint, and "amount plus fee exceeds your balance" for
+        // a send the sheet had shown as affordable.
+        let price =
+            self.rt()
+                .block_on(price_melt(&wallet, &self.reconciler, self.budgets, &quote))?;
+        let spendable = self
+            .rt()
+            .block_on(wallet.get_unspent_proofs())
+            .ok()
+            .and_then(|p| cdk::nuts::nut00::ProofsMethods::total_amount(&p).ok())
+            .map_or(0, u64::from);
+        let expires_at_secs = (quote.expiry != 0).then_some(quote.expiry);
+        tracing::info!(
+            "melt {}: quoted {} {quoted_amount} sats, fee up to {} (reserve {} + input fee {} + \
+             swap fee {}), {} input proofs, swap first: {}, spendable {spendable}, affordable: {}, \
+             expires in {} s",
+            quote_tag(&quote.id),
+            destination.kind.label(),
+            price.max_fee(),
+            price.fee_reserve,
+            price.input_fee,
+            price.swap_fee,
+            price.inputs,
+            price.swap,
+            price.affordable,
+            expires_at_secs.map_or(0, |e| ttl_left(e).as_secs()),
+        );
         Ok(PreparedSend {
             destination: destination.clone(),
             amount_sats: quoted_amount,
-            fees_sats: Some(u64::from(quote.fee_reserve)),
+            fees_sats: Some(price.max_fee()),
+            expires_at_secs,
             // The melt quote is persisted by CDK under this id and is
             // single-use by state — the store IS the parked-quote map.
             token: PreparedSendToken::Opaque(quote.id),
@@ -2613,6 +3180,7 @@ impl WalletBackend for CdkWallet {
                 "this prepared send did not come from the CDK backend".into(),
             ));
         };
+        let tag = quote_tag(quote_id).to_string();
         let note = (!note.is_empty()).then(|| note.to_string());
         let mut metadata = HashMap::new();
         if let Some(note) = &note {
@@ -2621,113 +3189,157 @@ impl WalletBackend for CdkWallet {
             metadata.insert("memo".to_string(), note.clone());
         }
 
+        // The quote's expiry as stored when the mint issued it. A host's
+        // `expires_at_secs` is a copy for display; this one is enforced.
+        let expiry = self
+            .rt()
+            .block_on(wallet.localstore.get_melt_quote(quote_id))
+            .map_err(|e| WalletError::Backend(format!("read melt quote: {e}")))?
+            .map(|q| q.expiry)
+            .filter(|&e| e != 0);
+        let lifetime = expiry.map(ttl_left);
+        if let Some(left) = lifetime {
+            if left < self.budgets.melt_ttl_floor {
+                // Nothing has been asked of the mint for this quote; the
+                // caller re-quotes the same destination and amount.
+                tracing::warn!(
+                    "melt {tag}: {} s of quote left, under the {} s needed: not starting, \
+                     QuoteExpired",
+                    left.as_secs(),
+                    self.budgets.melt_ttl_floor.as_secs()
+                );
+                return Err(WalletError::QuoteExpired);
+            }
+            tracing::info!(
+                "melt {tag}: send started, quote expires in {} s",
+                left.as_secs()
+            );
+        }
+
         // The melt runs as its own task, so a caller that stops waiting does
         // not cancel it: dropping a melt mid-flight is a crash as far as CDK
         // is concerned, and the payment may already be on its way. The
         // handoff decides who reports the outcome — see `SendHandoff`.
         let handoff = Arc::new(Mutex::new(SendHandoff::default()));
-        let task = {
-            let wallet = wallet.clone();
+        let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<()>();
+        let job = MeltJob {
+            wallet: wallet.clone(),
+            reconciler: self.reconciler.clone(),
+            quote_id: quote_id.clone(),
+            prepared: prepared.clone(),
+            note: note.clone(),
+            metadata,
+            budgets: self.budgets,
+            expiry,
+        };
+        let mut task = {
             let handoff = handoff.clone();
             let events = self.events_tx.clone();
-            let quote_id = quote_id.clone();
-            let note = note.clone();
-            let prepared = prepared.clone();
-            let budgets = self.budgets;
-            let reconciler = self.reconciler.clone();
             self.rt().spawn(async move {
-                let melt = wallet
-                    .prepare_melt(&quote_id, metadata)
-                    .await
-                    .map_err(map_melt_error)?;
-                let operation_id = melt.operation_id();
-                // Until this task ends, the watcher leaves this melt to it.
-                let _confirming = reconciler.confirming(operation_id);
-                let abandoned = {
+                let _sending = job.reconciler.sending(&job.quote_id);
+                let result = job.run(&handoff, confirm_tx).await;
+                let report = {
                     let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
-                    h.confirming = !h.caller_gone;
-                    h.caller_gone
+                    if !h.caller_gone {
+                        h.finished = true;
+                    }
+                    h.caller_gone && !h.abandoned
                 };
-                if abandoned {
-                    // The caller already reported a timeout; paying now would
-                    // be a payment nobody is waiting for.
-                    if let Err(e) = melt.cancel().await {
-                        tracing::warn!("cancel abandoned melt {quote_id}: {e}");
-                    }
-                    return Err(WalletError::Timeout);
+                if report {
+                    // The caller was told Pending: every ending is an event.
+                    // An error here was raised before confirm — nothing left
+                    // the wallet.
+                    let payment = match &result {
+                        Ok(payment) => payment.clone(),
+                        Err(e) => {
+                            tracing::warn!(
+                                "melt {}: ended before confirm after the caller stopped \
+                                 waiting ({e}); reporting it Failed",
+                                quote_tag(&job.quote_id)
+                            );
+                            Payment {
+                                status: PaymentStatus::Failed,
+                                ..pending_payment(&job.quote_id, &job.prepared, job.note.clone())
+                            }
+                        }
+                    };
+                    let _ = events.send(payment_event(payment));
                 }
-                // Prefer async: a mint that accepts the payment and keeps
-                // routing it answers Pending at once instead of holding the
-                // request open; the watcher finalizes it.
-                let outcome = melt.confirm_prefer_async().await;
-                // Read (and forget) whether the melt request went unanswered:
-                // CDK reports a lost answer the mint then reads as Unpaid as
-                // PaymentFailed too, after compensating the proofs.
-                let request_lost = reconciler.unanswered.take(&quote_id);
-                let payment = match outcome {
-                    // The mint itself said the payment failed; CDK has
-                    // compensated the proofs.
-                    Err(cdk::Error::PaymentFailed) if !request_lost => {
-                        melt_outcome_payment(&quote_id, &prepared, outcome, note)
-                    }
-                    // Anything else may be a request the mint has, or will
-                    // have, applied. A Failed here that the melt later
-                    // contradicts invites a second payment, so only a melt
-                    // proven closed locally and settled at the mint is
-                    // called Failed; the rest is Pending, and the watcher
-                    // reports how it ends.
-                    Err(e) => {
-                        tracing::warn!(
-                            "melt {quote_id} confirm error (request lost: {request_lost}), \
-                             checking the mint: {e}"
-                        );
-                        settle_ambiguous_confirm(
-                            &wallet,
-                            &reconciler,
-                            &quote_id,
-                            operation_id,
-                            &prepared,
-                            note,
-                            request_lost,
-                            budgets,
-                        )
-                        .await
-                    }
-                    outcome => melt_outcome_payment(&quote_id, &prepared, outcome, note),
-                };
-                let h = handoff.lock().unwrap_or_else(|e| e.into_inner());
-                if h.caller_gone {
-                    let _ = events.send(payment_event(payment.clone()));
-                }
-                Ok(payment)
+                result
             })
         };
 
-        let mut task = task;
-        let waited = self
-            .rt()
-            .block_on(async { tokio::time::timeout(self.budgets.send, &mut task).await });
-        let joined = match waited {
-            Ok(joined) => joined,
-            Err(_) => {
-                let confirming = {
-                    let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
-                    h.caller_gone = true;
-                    h.confirming
-                };
-                if task.is_finished() {
-                    // It finished between the deadline and the handoff lock
-                    // and did not emit (it saw us still waiting): report it.
-                    self.rt().block_on(&mut task)
-                } else if confirming {
-                    // Money may be moving. Never an error here — an error
-                    // invites a retry that pays twice. The task emits the
-                    // terminal event; the watcher also finalizes the melt.
+        // Preparation is local and normally takes milliseconds; the caller
+        // waits for it as long as the quote can still be confirmed, capped
+        // by the send budget. Sonar's own budget never cancels a melt that
+        // can still be paid: past it the send is reported Pending and the
+        // task carries on, confirming only while the quote allows.
+        let started = Instant::now();
+        let budget = self.budgets.send;
+        let confirmable = lifetime.map(|l| l.saturating_sub(self.budgets.confirm_ttl_floor));
+        let preparing = confirmable.map_or(budget, |c| c.min(budget));
+        let mut confirm_rx = confirm_rx;
+        let prepared_phase = self.rt().block_on(async {
+            tokio::time::timeout(preparing, async {
+                tokio::select! {
+                    biased;
+                    joined = &mut task => Some(joined),
+                    _ = &mut confirm_rx => None,
+                }
+            })
+            .await
+        });
+        let joined = match prepared_phase {
+            Ok(Some(joined)) => joined,
+            Ok(None) => match self.await_confirm(
+                &mut task,
+                &handoff,
+                budget.saturating_sub(started.elapsed()),
+            ) {
+                Some(joined) => joined,
+                None => {
+                    tracing::info!("melt {tag}: confirm still running at the send budget; Pending");
                     return Ok(pending_payment(quote_id, prepared, note));
+                }
+            },
+            Err(_) => {
+                let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
+                if h.finished {
+                    drop(h);
+                    self.rt().block_on(&mut task)
+                } else if h.confirming {
+                    drop(h);
+                    match self.await_confirm(
+                        &mut task,
+                        &handoff,
+                        budget.saturating_sub(started.elapsed()),
+                    ) {
+                        Some(joined) => joined,
+                        None => return Ok(pending_payment(quote_id, prepared, note)),
+                    }
+                } else if confirmable.is_some_and(|c| c <= budget) {
+                    // The quote can no longer be confirmed in time. The task
+                    // cancels when its preparation returns; no melt request
+                    // was made, so the caller may re-quote.
+                    h.caller_gone = true;
+                    h.abandoned = true;
+                    tracing::warn!(
+                        "melt {tag}: still preparing {} ms in, past the quote's confirm \
+                         deadline: cancelled before any melt request, QuoteExpired",
+                        started.elapsed().as_millis()
+                    );
+                    return Err(WalletError::QuoteExpired);
                 } else {
-                    // Still before the irreversible step: the task will
-                    // cancel instead of confirming.
-                    return Err(WalletError::Timeout);
+                    // Sonar's wait budget, not the quote, ran out. The send
+                    // goes on: it confirms while the quote allows and reports
+                    // how it ends as an event.
+                    h.caller_gone = true;
+                    tracing::info!(
+                        "melt {tag}: still preparing at the {} s send budget; reporting \
+                         Pending, the send continues within the quote's lifetime",
+                        budget.as_secs()
+                    );
+                    return Ok(pending_payment(quote_id, prepared, note));
                 }
             }
         };
@@ -4465,5 +5077,485 @@ mod tests {
         assert!(!is_our_artifact("cashu.offer.xyz"));
         assert!(!is_our_artifact("cashu.offer.00c0ffee.bak"));
         assert!(!is_our_artifact("cashu.offer"));
+    }
+
+    // ---- melt quote lifetime, fees and the send budget (2026-10-13) ----
+    //
+    // A 12,027-sat BOLT11 send through mint.hedwig.sh left two UNPAID melt
+    // quotes and no melt request. That mint keeps a RETIRED keyset charging
+    // 1000 ppk; CDK spends every proof on a retired keyset first, so each
+    // one costs a sat the fee preview did not count.
+
+    /// A wallet funded on a mint whose keyset charged `fee_ppk`, which has
+    /// since been retired for a free one: every proof it holds is on the
+    /// retired, fee-charging keyset. Each receive of 255 sats is 8 proofs.
+    fn wallet_with_retired_fee_proofs(
+        dir: &Path,
+        fee_ppk: u64,
+        receives: usize,
+    ) -> (CdkWallet, Arc<test_mint::FakeMint>) {
+        let mint = Arc::new(test_mint::FakeMint::with_input_fee(fee_ppk));
+        let mut cfg = config();
+        cfg.working_dir = dir.to_path_buf();
+        let w = CdkWallet::with_connector(cfg, "https://mint.example.com", mint.clone()).unwrap();
+        w.connect().unwrap();
+        for _ in 0..receives {
+            receive_paid_bolt11(&w, &mint, 255);
+        }
+        mint.rotate_keyset(0);
+        // Re-read keysets on every use, so the wallet sees the rotation.
+        w.wallet()
+            .unwrap()
+            .set_metadata_cache_ttl(Some(Duration::ZERO));
+        (w, mint)
+    }
+
+    /// A valid BOLT12 offer (LDK's parse test vectors); CDK parses offers
+    /// before quoting them.
+    const OFFER: &str =
+        "lno1pgx9getnwss8vetrw3hhyuc5qqtzzqhwcuj966ma9n9nqwqtl032xeyv6755yeflt235pmww58egx6rxry";
+
+    fn unspent_proofs(w: &CdkWallet) -> usize {
+        let wallet = w.wallet().unwrap();
+        w.rt().block_on(wallet.get_unspent_proofs()).unwrap().len()
+    }
+
+    fn local_melt_quote(w: &CdkWallet, id: &str) -> cdk::wallet::MeltQuote {
+        let wallet = w.wallet().unwrap();
+        w.rt()
+            .block_on(wallet.localstore.get_melt_quote(id))
+            .unwrap()
+            .expect("the melt quote is stored")
+    }
+
+    fn quote_id_of(prepared: &PreparedSend) -> &str {
+        match &prepared.token {
+            PreparedSendToken::Opaque(id) => id,
+            PreparedSendToken::None => panic!("a CDK prepared send carries its quote id"),
+        }
+    }
+
+    /// Nothing of a refused send may linger: no proof reserved or pending,
+    /// no quote held by an operation, no open saga.
+    fn assert_nothing_held(w: &CdkWallet, quote_id: &str, balance_before: u64) {
+        let balance = w.balance().unwrap();
+        assert_eq!(balance.confirmed_sats, balance_before, "{balance:?}");
+        assert_eq!(balance.pending_send_sats, 0, "{balance:?}");
+        assert_eq!(
+            local_melt_quote(w, quote_id).used_by_operation,
+            None,
+            "the quote must not stay reserved"
+        );
+        let wallet = w.wallet().unwrap();
+        let sagas = w
+            .rt()
+            .block_on(wallet.localstore.get_incomplete_sagas())
+            .unwrap();
+        assert!(sagas.is_empty(), "{} open sagas", sagas.len());
+    }
+
+    /// The incident, BOLT11: amount + fee reserve fits the balance with a
+    /// ~20-sat margin, but the 40 proofs on the retired keyset cost 40 sats
+    /// to spend. The fee preview used to be the reserve alone, the hosts'
+    /// balance check passed, and CDK refused the melt after the quote
+    /// existed. Now the preview carries the input fees, so the hosts refuse
+    /// up front with the real figures — and a send attempted anyway fails
+    /// typed, before any melt request, leaving nothing reserved.
+    #[test]
+    fn incident_near_exact_balance_with_retired_fee_proofs_is_refused_up_front() {
+        let dir = scratch("incident-fee-keyset");
+        let (w, mint) = wallet_with_retired_fee_proofs(&dir, 1_000, 5);
+        let balance = w.balance().unwrap().confirmed_sats;
+        assert_eq!(balance, 1_275);
+        let proofs = u64::try_from(unspent_proofs(&w)).unwrap();
+        assert!(proofs > 20, "{proofs} proofs");
+        // reserve 2: amount + reserve is 20 sats under the balance, fewer
+        // than the 1-sat-per-proof cost of the retired-keyset proofs.
+        let amount = balance - 2 - 20;
+        let prepared = prepare(&w, &test_invoice(Some(amount * 1_000)), None).unwrap();
+        let fee = prepared.fees_sats.expect("a fee is quoted");
+        assert!(
+            fee > 2 + 20,
+            "the fee must count the retired-keyset proofs' input fees, got {fee}"
+        );
+        // The hosts' affordability check (CashuWalletService / Engine).
+        assert!(
+            prepared.amount_sats + fee > balance,
+            "amount {} + fee {fee} must not look affordable from {balance}",
+            prepared.amount_sats
+        );
+        let quote_id = quote_id_of(&prepared).to_string();
+        assert_nothing_held(&w, &quote_id, balance);
+
+        // A host that sends anyway gets a typed refusal, before any melt.
+        let sent = w.send(&prepared, "");
+        assert!(
+            matches!(sent, Err(WalletError::InsufficientFunds)),
+            "{sent:?}"
+        );
+        assert_eq!(mint.calls("post_melt"), 0, "no melt request was made");
+        assert_eq!(mint.calls("post_swap"), 0, "no swap either");
+        assert_eq!(
+            mint.melt_quote_state(&quote_id),
+            Some(MeltQuoteState::Unpaid)
+        );
+        // CDK 0.18.1 leaves the quote reserved after a failed preparation;
+        // the wallet releases it.
+        assert_nothing_held(&w, &quote_id, balance);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With room for the input fees the same wallet pays: CDK swaps the
+    /// retired-keyset proofs (paying their fee) and melts fresh ones. The
+    /// fake mint refuses any swap or melt that underpays a fee, so a paid
+    /// melt proves the quoted fee covered the real cost.
+    #[test]
+    fn retired_fee_proofs_are_swapped_then_paid_when_the_fee_fits() {
+        let dir = scratch("fee-keyset-pays");
+        let (w, mint) = wallet_with_retired_fee_proofs(&dir, 1_000, 5);
+        let balance = w.balance().unwrap().confirmed_sats;
+        let proofs = u64::try_from(unspent_proofs(&w)).unwrap();
+        // Room for the reserve and a sat for every proof, plus 10.
+        let amount = balance - 2 - proofs - 10;
+        let prepared = prepare(&w, &test_invoice(Some(amount * 1_000)), None).unwrap();
+        let fee = prepared.fees_sats.unwrap();
+        assert!(prepared.amount_sats + fee <= balance, "fee {fee}");
+        assert!(fee > 2, "input fees are part of the fee, got {fee}");
+
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete);
+        assert_eq!(mint.calls("post_melt"), 1, "exactly one payment");
+        assert_eq!(
+            w.balance().unwrap().pending_send_sats,
+            0,
+            "nothing left reserved"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Proofs a send in flight holds are not spendable. A second send that
+    /// only the TOTAL could cover is refused by the hosts' check, because
+    /// the balance and the price both count unreserved proofs only.
+    #[test]
+    fn proofs_held_by_a_send_in_flight_are_not_spendable() {
+        let dir = scratch("reserved-not-spendable");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        mint.set_melt_outcome(test_mint::MeltOutcome::Pending);
+        let first = prepare(&w, &test_invoice(Some(600_000)), None).unwrap();
+        assert_eq!(w.send(&first, "").unwrap().status, PaymentStatus::Pending);
+
+        let balance = w.balance().unwrap();
+        // 1,000 - 600 - 2 reserve; the fake mint returns no change.
+        assert_eq!(balance.confirmed_sats, 398, "{balance:?}");
+        assert!(balance.pending_send_sats >= 600, "{balance:?}");
+        // 397 + 2 fits the 1,000 total but not the 398 unreserved sats.
+        let second = prepare(&w, &test_invoice(Some(397_000)), None).unwrap();
+        assert!(
+            second.amount_sats + second.fees_sats.unwrap() > balance.confirmed_sats,
+            "397 sats cannot be paid from {} unreserved sats",
+            balance.confirmed_sats
+        );
+        assert!(matches!(
+            w.send(&second, ""),
+            Err(WalletError::InsufficientFunds)
+        ));
+        assert_eq!(mint.calls("post_melt"), 1, "only the first send melted");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fee preview runs CDK's preparation dry: it must leave no trace.
+    #[test]
+    fn a_fee_preview_holds_nothing() {
+        let dir = scratch("preview-holds-nothing");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        assert_eq!(
+            prepared.fees_sats,
+            Some(2),
+            "reserve only on a fee-free keyset"
+        );
+        assert_nothing_held(&w, quote_id_of(&prepared), 1_000);
+        // An unaffordable preview (CDK's selection fails) holds nothing either.
+        let too_much = prepare(&w, &test_invoice(Some(5_000_000)), None).unwrap();
+        assert_nothing_held(&w, quote_id_of(&too_much), 1_000);
+        assert_eq!(mint.calls("post_melt"), 0);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prepared_send_carries_its_quote_expiry() {
+        let dir = scratch("quote-expiry");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        mint.set_melt_quote_ttl(120);
+        let before = now_secs();
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        let expiry = prepared.expires_at_secs.expect("a melt quote expires");
+        assert!(
+            (before + 119..=now_secs() + 120).contains(&expiry),
+            "expiry {expiry}"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A quote with less life left than a melt needs is not started on:
+    /// typed `QuoteExpired`, no melt request, nothing held — the caller
+    /// re-quotes. BOLT11 and BOLT12 alike.
+    #[test]
+    fn a_quote_too_close_to_expiry_is_refused_before_any_melt() {
+        for (kind, destination, sats) in [
+            ("bolt11", test_invoice(Some(300_000)), None),
+            ("bolt12", OFFER.to_string(), Some(300)),
+        ] {
+            let dir = scratch(&format!("near-expiry-{kind}"));
+            let (mut w, mint) = fake_wallet(&dir);
+            // A melt needs 20 s of quote to start (the default); a 1 s
+            // confirm floor isolates that check from the confirm deadline.
+            w.set_test_ttl_floors(Duration::from_secs(20), Duration::from_secs(1));
+            w.connect().unwrap();
+            receive_paid_bolt11(&w, &mint, 1_000);
+            // This mint's quotes live 5 s.
+            mint.set_melt_quote_ttl(5);
+            let prepared = prepare(&w, &destination, sats).unwrap();
+            let quote_id = quote_id_of(&prepared).to_string();
+            assert!(
+                matches!(w.send(&prepared, ""), Err(WalletError::QuoteExpired)),
+                "{kind}"
+            );
+            assert_eq!(mint.calls("post_melt"), 0, "{kind}");
+            assert_eq!(
+                mint.melt_quote_state(&quote_id),
+                Some(MeltQuoteState::Unpaid),
+                "{kind}"
+            );
+            assert_nothing_held(&w, &quote_id, 1_000);
+            drop(w);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// An already expired quote (the app slept on the sheet) is refused
+    /// before CDK sees it; CDK's own refusal maps to the same typed error.
+    #[test]
+    fn an_expired_quote_is_refused_before_any_melt() {
+        let dir = scratch("expired-quote");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        let quote_id = quote_id_of(&prepared).to_string();
+        let wallet = w.wallet().unwrap();
+        let mut quote = local_melt_quote(&w, &quote_id);
+        quote.expiry = now_secs() - 1;
+        w.rt()
+            .block_on(wallet.localstore.add_melt_quote(quote))
+            .unwrap();
+        assert!(matches!(
+            w.send(&prepared, ""),
+            Err(WalletError::QuoteExpired)
+        ));
+        assert_eq!(mint.calls("post_melt"), 0);
+        assert_nothing_held(&w, &quote_id, 1_000);
+        assert!(matches!(
+            map_melt_error(cdk::Error::ExpiredQuote(1, 2)),
+            WalletError::QuoteExpired
+        ));
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The old shape of the incident's other suspect: a preparation slower
+    /// than the send budget made `send` answer Timeout and CANCEL a melt the
+    /// quote still allowed. Now the budget only stops the waiting: the send
+    /// is Pending, the melt is confirmed once prepared, and its outcome
+    /// arrives as an event.
+    #[test]
+    fn a_preparation_slower_than_the_send_budget_still_pays() {
+        let dir = scratch("slow-prepare-pays");
+        let (mut w, mint) = fake_wallet(&dir);
+        w.set_test_send_budget(Duration::from_millis(300));
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        mint.set_melt_outcome(test_mint::MeltOutcome::Paid {
+            preimage: Some(PREIMAGE.into()),
+        });
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        // Stale keyset metadata the mint is slow to give: the preparation
+        // takes ~1 s, past the budget.
+        w.wallet()
+            .unwrap()
+            .set_metadata_cache_ttl(Some(Duration::ZERO));
+        mint.delay_next("get_mint_keysets", Duration::from_secs(1));
+
+        let payment = w
+            .send(&prepared, "")
+            .expect("a slow preparation is not an error");
+        assert_eq!(payment.status, PaymentStatus::Pending);
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id)
+            .is_some_and(
+                |p| p.status == PaymentStatus::Complete && p.preimage.as_deref() == Some(PREIMAGE)
+            )));
+        assert_eq!(mint.calls("post_melt"), 1, "exactly one payment");
+        assert_eq!(mint.calls("post_melt_quote"), 1, "never re-quoted");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lookup while that slow preparation runs must not resume — and
+    /// compensate — the melt under the send.
+    #[test]
+    fn a_lookup_during_a_slow_preparation_is_pending_and_leaves_it_alone() {
+        let dir = scratch("slow-prepare-lookup");
+        let (mut w, mint) = fake_wallet(&dir);
+        w.set_test_send_budget(Duration::from_millis(200));
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        w.wallet()
+            .unwrap()
+            .set_metadata_cache_ttl(Some(Duration::ZERO));
+        mint.delay_next("get_mint_keysets", Duration::from_millis(1_500));
+
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Pending);
+        let looked_up = w.outgoing_payment_outcome(&payment.id).unwrap().unwrap();
+        assert_eq!(looked_up.status, PaymentStatus::Pending);
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id)
+            .is_some_and(|p| p.status == PaymentStatus::Complete)));
+        assert_eq!(mint.calls("post_melt"), 1);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A preparation that outlives the quote's confirm deadline is cancelled,
+    /// never confirmed into an expiring quote: the caller gets
+    /// `QuoteExpired` (re-quote) and no melt request is ever made.
+    #[test]
+    fn a_preparation_past_the_quote_deadline_is_cancelled_not_melted() {
+        let dir = scratch("slow-prepare-expires");
+        let (mut w, mint) = fake_wallet(&dir);
+        // Confirming needs 4 s of quote left. The quote lives 6 s and the
+        // preparation takes 3 s: at confirm time the mint would still take
+        // the melt, but the wallet must not bet the payment on it.
+        w.set_test_ttl_floors(Duration::from_secs(1), Duration::from_secs(4));
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        mint.set_melt_quote_ttl(6);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        let quote_id = quote_id_of(&prepared).to_string();
+        w.wallet()
+            .unwrap()
+            .set_metadata_cache_ttl(Some(Duration::ZERO));
+        mint.delay_next("get_mint_keysets", Duration::from_secs(3));
+
+        assert!(matches!(
+            w.send(&prepared, ""),
+            Err(WalletError::QuoteExpired)
+        ));
+        // Let the abandoned task finish its (cancelled) preparation.
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(mint.calls("post_melt"), 0, "never melted");
+        assert_nothing_held(&w, &quote_id, 1_000);
+        assert!(
+            sent_outcome(&recorder, &quote_id).is_none(),
+            "a send reported as not made raises no event"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `fees_sats` on the prepared send is the fee the caller agreed to. A
+    /// melt that would cost more is cancelled before confirm, with the new
+    /// fee to ask about.
+    #[test]
+    fn a_melt_costing_more_than_the_agreed_fee_is_refused_before_confirm() {
+        let dir = scratch("fee-above-consent");
+        let (w, mint) = wallet_with_retired_fee_proofs(&dir, 1_000, 2);
+        let balance = w.balance().unwrap().confirmed_sats;
+        let mut prepared = prepare(&w, &test_invoice(Some(100_000)), None).unwrap();
+        let real = prepared.fees_sats.unwrap();
+        prepared.fees_sats = Some(2); // the reserve alone: the old preview
+        let quote_id = quote_id_of(&prepared).to_string();
+        match w.send(&prepared, "") {
+            Err(WalletError::FeeChanged { fees_sats }) => assert_eq!(fees_sats, real),
+            other => panic!("expected FeeChanged, got {other:?}"),
+        }
+        assert_eq!(mint.calls("post_melt"), 0);
+        assert_eq!(mint.calls("post_swap"), 0);
+        assert_nothing_held(&w, &quote_id, balance);
+        // Agreeing to the real fee pays it.
+        prepared.fees_sats = Some(real);
+        assert_eq!(
+            w.send(&prepared, "").unwrap().status,
+            PaymentStatus::Complete
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After the melt request may have reached the mint, nothing is retried
+    /// or re-quoted: the send is Pending, and sending the same prepared
+    /// send again cannot make a second melt request.
+    #[test]
+    fn an_ambiguous_melt_is_never_requoted_or_sent_twice() {
+        let dir = scratch("ambiguous-no-requote");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        // The mint applied the melt and is still routing it; its answer is
+        // lost and it cannot be asked: the outcome is unknown.
+        mint.set_melt_outcome(test_mint::MeltOutcome::Pending);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        mint.lose_next_melt_response(true);
+        mint.fail_next("get_melt_quote_status", 50);
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Pending);
+        assert!(w.send(&prepared, "").is_err(), "the quote is in use");
+        assert_eq!(mint.calls("post_melt"), 1, "one melt request");
+        assert_eq!(mint.calls("post_melt_quote"), 1, "never re-quoted");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BOLT12 keeps working: priced, expiring, paid once.
+    #[test]
+    fn a_bolt12_send_is_priced_and_paid_once() {
+        let dir = scratch("bolt12-send");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let prepared = prepare(&w, OFFER, Some(300)).unwrap();
+        assert_eq!(prepared.amount_sats, 300);
+        assert_eq!(prepared.fees_sats, Some(2));
+        assert!(prepared.expires_at_secs.is_some());
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete);
+        assert_eq!(mint.calls("post_melt"), 1);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logs_name_a_quote_by_a_short_prefix() {
+        assert_eq!(
+            quote_tag("8f3a1c2d-9b7e-4c1a-a5d2-0e9f8b7c6d5e"),
+            "8f3a1c2d"
+        );
+        assert_eq!(quote_tag("melt1"), "melt1");
     }
 }

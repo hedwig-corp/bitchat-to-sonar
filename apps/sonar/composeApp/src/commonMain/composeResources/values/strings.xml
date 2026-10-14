@@ -396,6 +396,7 @@
     <string name="the_network_fee_is_now_up_to_nothing">The network fee is now up to %1$s. Nothing was sent — try again to pay it.</string>
     <string name="the_old_wallet_couldn_t_be_removed">The old wallet couldn't be removed. Restart Sonar and try again.</string>
     <string name="the_old_wallet_has_a_refund_waiting_to">The old wallet has a refund waiting to be claimed.</string>
+    <string name="the_payment_quote_expired_before_it">The payment quote expired before it could be sent. Nothing was sent — try again.</string>
     <string name="their_payment_address_is_from_an_older">Their payment address is from an older Sonar. Ask them to open the latest Sonar to pay them here.</string>
     <string name="they_haven_t_published_a_payment">They haven't published a payment address in Sonar yet.</string>
     <string name="this">This </string>

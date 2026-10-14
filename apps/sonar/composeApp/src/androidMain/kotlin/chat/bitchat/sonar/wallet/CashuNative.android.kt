@@ -49,7 +49,10 @@ private class AndroidCashuNative(private val w: SonarCashuWallet) : CashuNative 
     }
     override fun prepareSend(destination: String, amountSats: Long?): CashuPreparedSend = ffi {
         w.prepareSend(destination, amountSats?.toULong()).let {
-            CashuPreparedSend(it.quoteId, it.destination, it.kind.common(), it.amountSats.toLong(), it.feesSats?.toLong())
+            CashuPreparedSend(
+                it.quoteId, it.destination, it.kind.common(), it.amountSats.toLong(), it.feesSats?.toLong(),
+                it.expiresAtSecs?.toLong(),
+            )
         }
     }
     override fun send(prepared: CashuPreparedSend, note: String): CashuPayment = ffi {
@@ -60,6 +63,7 @@ private class AndroidCashuNative(private val w: SonarCashuWallet) : CashuNative 
                 kind = prepared.kind.ffi(),
                 amountSats = prepared.amountSats.toULong(),
                 feesSats = prepared.feesSats?.toULong(),
+                expiresAtSecs = prepared.expiresAtSecs?.toULong(),
             ),
             note,
         ).common()
@@ -139,4 +143,6 @@ internal fun WalletFfiException.common(): CashuWalletException = when (this) {
     is WalletFfiException.Network -> CashuWalletException.Network(reason)
     is WalletFfiException.Timeout -> CashuWalletException.Timeout()
     is WalletFfiException.Backend -> CashuWalletException.Backend(reason)
+    is WalletFfiException.QuoteExpired -> CashuWalletException.QuoteExpired()
+    is WalletFfiException.FeeChanged -> CashuWalletException.FeeChanged(feesSats.toLong())
 }

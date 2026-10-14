@@ -748,6 +748,8 @@ impl WalletBackend for BreezWallet {
             destination: destination.clone(),
             amount_sats: quoted_amount,
             fees_sats,
+            // Parked quotes are evicted by count, not by time.
+            expires_at_secs: None,
             token: PreparedSendToken::Opaque(token),
         })
     }

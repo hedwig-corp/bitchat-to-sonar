@@ -1266,6 +1266,74 @@ real mint and need the maintainer's approval of the amounts.
   the amount never on screen; Compose ignored that amount and paid the typed
   one.
 
+### QA-165 — A near-exact balance is priced with the mint's input fees
+- **Platforms:** both (one Rust core; iOS on the fake mint, headless with
+  `sonar-cashu-cli`; Android manual against a mint the maintainer approves).
+- **Setup:** a `cdk-mintd` 0.18 fakewallet mint whose keyset charges an input
+  fee (`[info] input_fee_ppk = 1000`, 1 sat per proof — the fee mint.hedwig.sh's
+  retired keyset `0197ebd2…` still charges). Fund the wallet with several
+  small receives so it holds many proofs (5 × 255 sats is ~50 proofs).
+- **Steps:** `sonar-cashu-cli --mint <mint> quote <foreign invoice>` for
+  balance − reserve − 20 sats; then Send the same invoice from the app and
+  read the fee line; then the same send with **Max**.
+- **Expect:** the quote's `fees_sats` is the reserve PLUS about one sat per
+  proof spent, and `affordable` is false; the app's fee line says the same
+  "up to N", and Send is refused up front with "Amount plus fee exceeds your
+  balance" and the real figures. Nothing is sent: the mint has the UNPAID
+  quote and no melt request, the balance is unchanged and nothing reads as
+  pending. Max pays the largest amount the fees allow. A send that fits pays
+  once, and the mint's fee check passes (it refuses a melt that underpays).
+- **Not covered end to end:** proofs on a keyset the mint has since RETIRED
+  (the incident's exact shape, where CDK 0.18.1 skips fees in its selection)
+  need a mint rotated after funding; cdk-mintd only creates retired keysets
+  at build (`[[fake_wallet.keyset_rotations]]`), so the guard is the unit
+  test against `FakeMint::rotate_keyset`.
+- **Guard:** `incident_near_exact_balance_with_retired_fee_proofs_is_refused_up_front`,
+  `retired_fee_proofs_are_swapped_then_paid_when_the_fee_fits`,
+  `proofs_held_by_a_send_in_flight_are_not_spendable`, `a_fee_preview_holds_nothing`,
+  `a_melt_costing_more_than_the_agreed_fee_is_refused_before_confirm`;
+  app side `CashuWalletEngineTest.theWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`,
+  `CashuWalletServiceTests.testTheWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`
+- **Origin:** 2026-10-13 incident — a 12,027-sat BOLT11 send (reserve 240)
+  from a balance ~20 sats above 12,267 left two UNPAID quotes and no melt
+  request. The fee preview was the reserve alone; CDK then could not pay
+  for the proofs' input fees and failed before the melt.
+
+### QA-166 — A quote that expires before it is sent is re-quoted, never orphaned
+- **Platforms:** both (one Rust core; iOS on the fake mint through
+  `scripts/qa/mint-proxy.py`; headless with `sonar-cashu-cli --mint <proxy>`).
+- **Steps:** fund the wallet, get a foreign invoice from the second fake mint.
+  `mint-proxy.py arm short-melt-ttl 5` (the next melt quote reads as expiring
+  in 5 s, under the 20 s a melt needs), then pay the invoice — from the app,
+  and with `sonar-cashu-cli --mint <proxy> send <invoice>`. Repeat with
+  `short-melt-ttl 5x3` (every quote of one send is short-lived). Then, with
+  the mint's own `[info.quote_ttl] melt_ttl = 120` (production's value), open
+  the send sheet, wait out the quote (over 2 minutes), and tap Send.
+- **Expect:** first run: paid once, on a second quote — the CLI prints
+  `{"requote":1,…}` before the payment; the mint shows the first quote
+  UNPAID with no melt request and the second PAID; exactly one melt request.
+  The log has `melt <8 chars>: … not starting, QuoteExpired` and
+  `re-quoting (1/2)`; no full quote id, invoice or proof in it. `5x3`: "The
+  payment quote expired before it could be sent. Nothing was sent — try
+  again." — never "Payment failed", no melt request, balance unchanged. The
+  sheet left past 120 s pays on a fresh quote within the fee it showed (a
+  dearer fresh quote is refused with "The network fee is now up to…").
+- **Guard:** `a_quote_too_close_to_expiry_is_refused_before_any_melt` (BOLT11
+  and BOLT12), `an_expired_quote_is_refused_before_any_melt`,
+  `a_preparation_past_the_quote_deadline_is_cancelled_not_melted`,
+  `a_preparation_slower_than_the_send_budget_still_pays`,
+  `a_lookup_during_a_slow_preparation_is_pending_and_leaves_it_alone`,
+  `an_ambiguous_melt_is_never_requoted_or_sent_twice`,
+  `a_near_expiry_quote_is_refused_typed_and_a_fresh_one_pays` (sonar-ffi);
+  app side `CashuWalletEngineTest.aQuoteThatExpiresUnsentIsRequotedAndTheFreshQuotePays`,
+  `aRequoteAboveTheAgreedFeeStopsWithTheNewFee`,
+  `requotingIsBoundedAndEndsInATypedQuoteExpired`, `aPendingSendIsNeverRequoted`,
+  and the `CashuWalletServiceTests` mirrors.
+- **Origin:** 2026-10-13 incident review. Melt quotes live 120 s on
+  mint.hedwig.sh; the wallet never looked at the expiry, and a preparation
+  slower than its 60 s wait was cancelled (answering "Mint offline") instead
+  of confirmed.
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs

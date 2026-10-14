@@ -7,6 +7,12 @@
 //! and `dhke::sign_message` — so minted proofs pass CDK's unblinding and
 //! NUT-09 restore returns signatures the wallet can use. Quote state, melt
 //! outcomes, failures, and hangs are scripted per test.
+//!
+//! Like a real mint it charges NUT-02 input fees per keyset, refuses a swap
+//! or melt whose inputs do not cover them, can rotate its keyset (the old one
+//! stays redeemable, inactive, at its old fee — the shape of mint.hedwig.sh,
+//! whose retired keyset charges 1000 ppk), and refuses a melt whose quote has
+//! expired.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -60,6 +66,53 @@ struct FakeMeltQuote {
     fee_reserve: u64,
     state: MeltQuoteState,
     preimage: Option<String>,
+    /// Unix seconds; fixed when the quote is created, like a real mint's.
+    expiry: u64,
+}
+
+/// One signing keyset: its keys and what `/v1/keysets` says about it.
+#[derive(Debug, Clone)]
+struct FakeKeyset {
+    keys: BTreeMap<u64, SecretKey>,
+    keyset: KeySet,
+}
+
+impl FakeKeyset {
+    /// Deterministic keys per `generation`; generation 0 keeps the keys this
+    /// fake has always used.
+    fn new(generation: u32, input_fee_ppk: u64) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut keys = BTreeMap::new();
+        let mut public = BTreeMap::new();
+        for power in 0..21u32 {
+            let amount = 1u64 << power;
+            let label = if generation == 0 {
+                format!("sonar-fake-mint-key-{amount}")
+            } else {
+                format!("sonar-fake-mint-key-{generation}-{amount}")
+            };
+            let digest = Sha256::digest(label.as_bytes());
+            let secret = SecretKey::from_slice(&digest).expect("sha256 output is a valid scalar");
+            public.insert(Amount::from(amount), secret.public_key());
+            keys.insert(amount, secret);
+        }
+        let public = Keys::new(public);
+        Self {
+            keys,
+            keyset: KeySet {
+                id: Id::v1_from_keys(&public),
+                unit: CurrencyUnit::Sat,
+                active: Some(true),
+                keys: public,
+                input_fee_ppk,
+                final_expiry: None,
+            },
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.keyset.active.unwrap_or(false)
+    }
 }
 
 #[derive(Default)]
@@ -67,6 +120,8 @@ struct FakeState {
     calls: Vec<&'static str>,
     hang: HashSet<&'static str>,
     delay: HashMap<&'static str, std::time::Duration>,
+    /// Like `delay`, for the next call only.
+    delay_next: HashMap<&'static str, std::time::Duration>,
     fail: HashMap<&'static str, u32>,
     mint_quotes: HashMap<String, FakeMintQuote>,
     melt_quotes: HashMap<String, FakeMeltQuote>,
@@ -85,12 +140,14 @@ struct FakeState {
     in_transit_melt: Option<(String, Vec<PublicKey>)>,
     /// The next `post_mint` is processed and then never answers.
     lose_mint: bool,
+    /// Every keyset this mint ever signed with; exactly one is active.
+    keysets: Vec<FakeKeyset>,
+    /// Lifetime of a new melt quote, in seconds.
+    melt_quote_ttl: u64,
 }
 
 #[derive(Debug)]
 pub struct FakeMint {
-    keys: BTreeMap<u64, SecretKey>,
-    keyset: KeySet,
     state: Mutex<FakeStateDebug>,
 }
 
@@ -118,30 +175,16 @@ impl Default for FakeMint {
 
 impl FakeMint {
     pub fn new() -> Self {
-        use sha2::{Digest, Sha256};
-        let mut keys = BTreeMap::new();
-        let mut public = BTreeMap::new();
-        for power in 0..21u32 {
-            let amount = 1u64 << power;
-            let digest = Sha256::digest(format!("sonar-fake-mint-key-{amount}").as_bytes());
-            let secret = SecretKey::from_slice(&digest).expect("sha256 output is a valid scalar");
-            public.insert(Amount::from(amount), secret.public_key());
-            keys.insert(amount, secret);
-        }
-        let public = Keys::new(public);
-        let keyset = KeySet {
-            id: Id::v1_from_keys(&public),
-            unit: CurrencyUnit::Sat,
-            active: Some(true),
-            keys: public,
-            input_fee_ppk: 0,
-            final_expiry: None,
-        };
+        Self::with_input_fee(0)
+    }
+
+    /// A mint whose (first) keyset charges `input_fee_ppk` per input proof.
+    pub fn with_input_fee(input_fee_ppk: u64) -> Self {
         Self {
-            keys,
-            keyset,
             state: Mutex::new(FakeStateDebug(FakeState {
                 fee_reserve: 2,
+                keysets: vec![FakeKeyset::new(0, input_fee_ppk)],
+                melt_quote_ttl: 3_600,
                 ..FakeState::default()
             })),
         }
@@ -163,7 +206,11 @@ impl FakeMint {
                 }
                 _ => false,
             };
-            (s.hang.contains(method), fail, s.delay.get(method).copied())
+            let delay = s
+                .delay_next
+                .remove(method)
+                .or_else(|| s.delay.get(method).copied());
+            (s.hang.contains(method), fail, delay)
         });
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
@@ -201,6 +248,13 @@ impl FakeMint {
     pub fn delay(&self, method: &'static str, delay: std::time::Duration) {
         self.with(|s| {
             s.delay.insert(method, delay);
+        });
+    }
+
+    /// Answer only the next `method` call after `delay`.
+    pub fn delay_next(&self, method: &'static str, delay: std::time::Duration) {
+        self.with(|s| {
+            s.delay_next.insert(method, delay);
         });
     }
 
@@ -297,6 +351,64 @@ impl FakeMint {
         });
     }
 
+    /// Retire every keyset and sign from now on with a new one charging
+    /// `input_fee_ppk`. Proofs on the old keysets stay redeemable at their
+    /// old fee, as on a real mint.
+    pub fn rotate_keyset(&self, input_fee_ppk: u64) {
+        self.with(|s| {
+            for k in &mut s.keysets {
+                k.keyset.active = Some(false);
+            }
+            let generation = u32::try_from(s.keysets.len()).expect("few keysets");
+            s.keysets.push(FakeKeyset::new(generation, input_fee_ppk));
+        });
+    }
+
+    /// Lifetime of melt quotes created from now on (the production mint
+    /// runs `melt_ttl = 120`).
+    pub fn set_melt_quote_ttl(&self, secs: u64) {
+        self.with(|s| s.melt_quote_ttl = secs);
+    }
+
+    /// Fee reserve of melt quotes created from now on.
+    pub fn set_fee_reserve(&self, sats: u64) {
+        self.with(|s| s.fee_reserve = sats);
+    }
+
+    /// Melt quote ids, oldest first.
+    pub fn melt_quote_ids(&self) -> Vec<String> {
+        self.with(|s| {
+            let mut ids: Vec<String> = s.melt_quotes.keys().cloned().collect();
+            ids.sort_by_key(|id| {
+                id.trim_start_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<u64>()
+                    .unwrap_or(0)
+            });
+            ids
+        })
+    }
+
+    pub fn melt_quote_state(&self, quote_id: &str) -> Option<MeltQuoteState> {
+        self.with(|s| s.melt_quotes.get(quote_id).map(|q| q.state))
+    }
+
+    /// The NUT-02 fee for spending `inputs`: the sum of their keysets'
+    /// `input_fee_ppk`, rounded up to whole sats.
+    fn input_fee(&self, inputs: &cdk::nuts::Proofs) -> Result<u64, Error> {
+        self.with(|s| {
+            let mut ppk = 0u64;
+            for proof in inputs {
+                let keyset = s
+                    .keysets
+                    .iter()
+                    .find(|k| k.keyset.id == proof.keyset_id)
+                    .ok_or(Error::UnknownKeySet)?;
+                ppk += keyset.keyset.input_fee_ppk;
+            }
+            Ok(ppk.div_ceil(1_000))
+        })
+    }
+
     fn fresh_id(&self, prefix: &str) -> String {
         self.with(|s| {
             s.next_id += 1;
@@ -308,7 +420,20 @@ impl FakeMint {
         let mut signatures = Vec::with_capacity(outputs.len());
         for output in outputs {
             let amount = u64::from(output.amount);
-            let key = self
+            // Like a real mint: sign only with the keyset the output names,
+            // and only while it is active.
+            let keyset = self
+                .with(|s| {
+                    s.keysets
+                        .iter()
+                        .find(|k| k.keyset.id == output.keyset_id)
+                        .cloned()
+                })
+                .ok_or(Error::UnknownKeySet)?;
+            if !keyset.active() {
+                return Err(Error::InactiveKeyset);
+            }
+            let key = keyset
                 .keys
                 .get(&amount)
                 .ok_or_else(|| Error::Custom(format!("fake mint: no key for {amount}")))?;
@@ -316,7 +441,7 @@ impl FakeMint {
                 .map_err(|e| Error::Custom(e.to_string()))?;
             let signature = BlindSignature {
                 amount: output.amount,
-                keyset_id: self.keyset.id,
+                keyset_id: keyset.keyset.id,
                 c,
                 dleq: None,
             };
@@ -387,7 +512,7 @@ impl FakeMint {
                     amount: Amount::from(q.amount),
                     fee_reserve: Amount::from(q.fee_reserve),
                     state: q.state,
-                    expiry: now() + 3_600,
+                    expiry: q.expiry,
                     payment_preimage: q.preimage.clone(),
                     change: None,
                     request: Some(q.request.clone()),
@@ -400,7 +525,7 @@ impl FakeMint {
                 amount: Amount::from(q.amount),
                 fee_reserve: Amount::from(q.fee_reserve),
                 state: q.state,
-                expiry: now() + 3_600,
+                expiry: q.expiry,
                 payment_preimage: q.preimage.clone(),
                 change: None,
                 request: Some(q.request.clone()),
@@ -483,28 +608,41 @@ impl MintConnector for FakeMint {
 
     async fn get_mint_keys(&self) -> Result<Vec<KeySet>, Error> {
         self.enter("get_mint_keys").await?;
-        Ok(vec![self.keyset.clone()])
+        Ok(self.with(|s| {
+            s.keysets
+                .iter()
+                .filter(|k| k.active())
+                .map(|k| k.keyset.clone())
+                .collect()
+        }))
     }
 
     async fn get_mint_keyset(&self, keyset_id: Id) -> Result<KeySet, Error> {
         self.enter("get_mint_keyset").await?;
-        if keyset_id == self.keyset.id {
-            Ok(self.keyset.clone())
-        } else {
-            Err(Error::UnknownKeySet)
-        }
+        self.with(|s| {
+            s.keysets
+                .iter()
+                .find(|k| k.keyset.id == keyset_id)
+                .map(|k| k.keyset.clone())
+        })
+        .ok_or(Error::UnknownKeySet)
     }
 
     async fn get_mint_keysets(&self) -> Result<KeysetResponse, Error> {
         self.enter("get_mint_keysets").await?;
         Ok(KeysetResponse {
-            keysets: vec![KeySetInfo {
-                id: self.keyset.id,
-                unit: CurrencyUnit::Sat,
-                active: true,
-                input_fee_ppk: 0,
-                final_expiry: None,
-            }],
+            keysets: self.with(|s| {
+                s.keysets
+                    .iter()
+                    .map(|k| KeySetInfo {
+                        id: k.keyset.id,
+                        unit: CurrencyUnit::Sat,
+                        active: k.active(),
+                        input_fee_ppk: k.keyset.input_fee_ppk,
+                        final_expiry: None,
+                    })
+                    .collect()
+            }),
         })
     }
 
@@ -645,7 +783,7 @@ impl MintConnector for FakeMint {
             _ => return Err(Error::UnsupportedPaymentMethod),
         };
         let id = self.fresh_id("melt");
-        let fee_reserve = self.with(|s| s.fee_reserve);
+        let (fee_reserve, ttl) = self.with(|s| (s.fee_reserve, s.melt_quote_ttl));
         self.with(|s| {
             s.melt_quotes.insert(
                 id.clone(),
@@ -656,6 +794,7 @@ impl MintConnector for FakeMint {
                     fee_reserve,
                     state: MeltQuoteState::Unpaid,
                     preimage: None,
+                    expiry: now() + ttl,
                 },
             );
         });
@@ -708,6 +847,26 @@ impl MintConnector for FakeMint {
             self.with(|s| s.in_transit_melt = Some((quote_id.clone(), ys.clone())));
             return Err(transport_error());
         }
+        // A real mint checks the quote and the inputs before paying: an
+        // expired quote, or inputs short of amount + reserve + input fees,
+        // is refused and nothing moves.
+        let (expiry, owed) = self
+            .with(|s| {
+                s.melt_quotes
+                    .get(&quote_id)
+                    .map(|q| (q.expiry, q.amount + q.fee_reserve))
+            })
+            .ok_or(Error::UnknownQuote)?;
+        if now() >= expiry {
+            return Err(Error::ExpiredQuote(expiry, now()));
+        }
+        let inputs_total: u64 = request.inputs().iter().map(|p| u64::from(p.amount)).sum();
+        let fee = self.input_fee(request.inputs())?;
+        if inputs_total < owed + fee {
+            return Err(Error::Custom(format!(
+                "fake mint: melt inputs {inputs_total} < amount + reserve {owed} + input fee {fee}"
+            )));
+        }
         let method = self.with(|s| {
             let q = s.melt_quotes.get_mut(&quote_id)?;
             match &outcome {
@@ -746,6 +905,15 @@ impl MintConnector for FakeMint {
             .map_err(|e| Error::Custom(e.to_string()))?;
         if self.with(|s| ys.iter().any(|y| s.spent.contains(y))) {
             return Err(Error::TokenAlreadySpent);
+        }
+        // NUT-02: inputs pay for outputs plus the input fee, exactly.
+        let inputs_total: u64 = request.inputs().iter().map(|p| u64::from(p.amount)).sum();
+        let outputs_total: u64 = request.outputs().iter().map(|o| u64::from(o.amount)).sum();
+        let fee = self.input_fee(request.inputs())?;
+        if inputs_total != outputs_total + fee {
+            return Err(Error::Custom(format!(
+                "fake mint: unbalanced swap: inputs {inputs_total} != outputs {outputs_total} + fee {fee}"
+            )));
         }
         let signatures = self.sign(request.outputs())?;
         self.with(|s| s.spent.extend(ys));
