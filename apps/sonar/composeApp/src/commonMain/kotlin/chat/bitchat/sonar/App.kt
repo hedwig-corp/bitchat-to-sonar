@@ -346,9 +346,14 @@ fun App(
         }
         val handler: (PendingOpenConversation) -> Unit = { req ->
             val target = req.accountPubkeyHex
-            if (target != null && target != state.activeAccount?.pubkeyHex &&
-                state.accounts.any { it.pubkeyHex == target }
+            // Resolve against the registry, not the UI list: on a cold launch
+            // from the tap `state.accounts` may not have been refreshed yet.
+            val registry = if (target != null) SonarCore.accounts() else null
+            if (target != null && registry != null &&
+                target != registry.active?.pubkeyHex &&
+                registry.accounts.any { it.pubkeyHex == target }
             ) {
+                state.refreshAccounts()
                 // Another registered account's banner: switch first, then open
                 // on the account that owns the chat.
                 state.switchAccount(target) { result ->

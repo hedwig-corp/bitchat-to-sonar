@@ -3414,6 +3414,20 @@ final class SonarAppStore: ObservableObject {
     var canAddAccount: Bool { SonarAccountRegistry.snapshot().canAdd }
     var maxAccounts: Int { SonarAccountRegistry.snapshot().maxAccounts }
 
+    /// One account mutation at a time. Switch, add and remove all take this;
+    /// a removal that lands while a switch's `performConnect` is suspended
+    /// would otherwise wipe the store being opened.
+    private var accountChangeInFlight = false
+
+    private func beginAccountChange() throws {
+        guard !accountChangeInFlight else {
+            throw SonarAccountRestoreError.accountSwitchFailed(String(localized: "Another account change is still finishing."))
+        }
+        accountChangeInFlight = true
+    }
+
+    private func endAccountChange() { accountChangeInFlight = false }
+
     /// Re-read the registry. Cheap: the facade caches until a write.
     func refreshAccounts() {
         let snap = SonarAccountRegistry.snapshot()
@@ -3438,7 +3452,9 @@ final class SonarAppStore: ObservableObject {
     /// target's store opens local-first. On failure the previous account is
     /// already reopened by the chat model and its wallets restart here.
     func switchAccount(to pubkeyHex: String) async throws {
-        guard activeAccount?.pubkeyHex != pubkeyHex else { return }
+        guard SonarAccountRegistry.snapshot().active?.pubkeyHex != pubkeyHex else { return }
+        try beginAccountChange()
+        defer { endAccountChange() }
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
         defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
         try await releaseWalletsForAccountChange()
@@ -3471,6 +3487,8 @@ final class SonarAppStore: ObservableObject {
     func addAccount(nsec: String?, label: String? = nil) async throws {
         let key = nsec?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let key { _ = try SonarIdentity.import(nsec: key) }
+        try beginAccountChange()
+        defer { endAccountChange() }
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
         defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
         try await releaseWalletsForAccountChange()
@@ -3500,13 +3518,18 @@ final class SonarAppStore: ObservableObject {
     /// its Cashu wallet directory stays (it may hold funds). The active
     /// account is switched away from first; the last account is refused.
     func removeAccount(_ pubkeyHex: String) async throws {
-        if activeAccount?.pubkeyHex == pubkeyHex {
-            guard let next = accounts
+        // The DURABLE active pointer decides, never the UI list: a switch
+        // that has not refreshed the list yet must not make this wipe the
+        // store it is opening.
+        if SonarAccountRegistry.snapshot().active?.pubkeyHex == pubkeyHex {
+            guard let next = SonarAccountRegistry.snapshot().accounts
                 .filter({ $0.pubkeyHex != pubkeyHex })
                 .max(by: { $0.lastActiveAt < $1.lastActiveAt })
             else { throw SonarAccountRegistry.RegistryError.lastAccount }
             try await switchAccount(to: next.pubkeyHex)
         }
+        try beginAccountChange()
+        defer { endAccountChange() }
         _ = try SonarAccountRegistry.remove(pubkey: pubkeyHex, keychain: keychain)
         refreshAccounts()
     }
@@ -11250,10 +11273,15 @@ final class SonarAppStore: ObservableObject {
         guard !id.isEmpty else { return }
         // A banner the NSE drained from another registered account: switch
         // first, then open on the account that owns the chat. An unknown or
-        // already-active account falls through to the plain open.
+        // already-active account falls through to the plain open. Resolve
+        // against the REGISTRY, not the UI list: on a cold launch from the
+        // tap `accounts` is still empty.
+        if let accountPubkeyHex {
+            if accounts.isEmpty { refreshAccounts() }
+        }
         if let accountPubkeyHex,
-           accountPubkeyHex != activeAccount?.pubkeyHex,
-           accounts.contains(where: { $0.pubkeyHex == accountPubkeyHex }) {
+           accountPubkeyHex != SonarAccountRegistry.snapshot().active?.pubkeyHex,
+           SonarAccountRegistry.snapshot().accounts.contains(where: { $0.pubkeyHex == accountPubkeyHex }) {
             let jump = jumpMessageId
             Task { @MainActor in
                 do {

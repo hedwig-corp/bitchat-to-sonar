@@ -4936,6 +4936,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     val activeAccount: SonarAccount? get() = accounts.firstOrNull { it.isActive }
 
+    /** One account mutation at a time at the host (the core lock serializes
+     *  the store side); a second tap while a switch is mid-flight is refused
+     *  instead of queued behind a half-torn-down UI. */
+    private var accountChangeInFlight = false
+
+    private fun beginAccountChange() {
+        check(!accountChangeInFlight) { "Another account change is still finishing." }
+        accountChangeInFlight = true
+    }
+
     /** Re-read the registry. Cheap: the core actual caches until a write. */
     fun refreshAccounts() {
         val snap = SonarCore.accounts()
@@ -4957,7 +4967,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             var marmotDeliveryGeneration: Long? = null
             val result = runCatching {
-                if (activeAccount?.pubkeyHex == pubkeyHex) return@runCatching
+                if (SonarCore.accounts().active?.pubkeyHex == pubkeyHex) return@runCatching
+                beginAccountChange()
                 Notifier.prepareForAccountReplacement()
                 setAsideWalletsForAccountChange()
                 marmotDeliveryGeneration = tearDownAccountBoundState()
@@ -4974,6 +4985,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 finishAccountChange(newNpub)
             }
+            accountChangeInFlight = false
             marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
             onResult(result)
         }
@@ -5007,6 +5019,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         getString(Res.string.you_can_keep_up_to_accounts_on_this, maxAccounts.toString()),
                     )
                 }
+                beginAccountChange()
                 Notifier.prepareForAccountReplacement()
                 setAsideWalletsForAccountChange()
                 marmotDeliveryGeneration = tearDownAccountBoundState()
@@ -5029,6 +5042,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     AccountBackupRestoreOutcome.Unchanged -> Unit
                 }
             }
+            accountChangeInFlight = false
             marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
             onResult(result)
         }
@@ -5040,8 +5054,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun removeAccount(pubkeyHex: String, onResult: (Result<Unit>) -> Unit = {}) {
         scope.launch {
             val result = runCatching {
-                if (activeAccount?.pubkeyHex == pubkeyHex) {
-                    val next = nextActiveAfterRemoving(accounts, pubkeyHex)
+                // The DURABLE pointer decides, never the UI list.
+                val registry = SonarCore.accounts()
+                if (registry.active?.pubkeyHex == pubkeyHex) {
+                    val next = nextActiveAfterRemoving(registry.accounts, pubkeyHex)
                         ?: throw SonarAccountRestoreException(
                             getString(Res.string.this_is_your_only_account_use_emergency),
                         )
@@ -5049,7 +5065,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                     switchAccount(next.pubkeyHex) { switched.complete(it) }
                     switched.await().getOrThrow()
                 }
-                SonarCore.removeAccount(pubkeyHex)
+                beginAccountChange()
+                try {
+                    SonarCore.removeAccount(pubkeyHex)
+                } finally {
+                    accountChangeInFlight = false
+                }
                 refreshAccounts()
             }
             onResult(result)

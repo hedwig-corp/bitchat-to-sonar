@@ -31,6 +31,22 @@ exists; Cashu is the primary wallet), so the surface Sonar touches is small —
 see the compile notes in the PR that introduced this directory for the
 API differences that had to be adapted.
 
+## Known limitation: a wallet store last opened by 0.12.4
+
+The Rust engine inside the 0.11.13 xcframework carries older SQLite
+migrations than 0.12.4 (`core/vendor/breez-sdk-liquid` adds
+`payment_details.settled_at` and replaces `wallet_updates` with
+`wallet_cache_kv`). Breez's persister runs `Migrations::to_latest`, which
+refuses a database that is AHEAD of the engine (`DatabaseTooFarAhead`). So a
+legacy Breez wallet directory that a 0.12.4 build (TestFlight ≤ 1.15.4) already
+opened will not open under this package: `LegacyBreezWallet` logs the connect
+failure and shows the wallet as unavailable; nothing is deleted, the seed stays
+in the keychain, and the same nsec restores the wallet on Android (still on
+the 0.12.4 KMP package) or on an iOS build with a 0.12.4 engine. Fresh installs
+and users who never had the legacy wallet (Cashu is the primary wallet) are
+unaffected. The durable fix is to build a 0.12.4 xcframework from the vendored
+Rust sources — tracked as a follow-up.
+
 ## If the mirror disappears too
 
 Download the asset while it is up, verify the checksum above, and either host

@@ -1257,6 +1257,17 @@ actual object SonarCore {
      *  latest backup. */
     @Volatile private var sealedForPubkeyHex: String = ""
 
+    /** Store whose backup is being recorded: the one the seal ran for, which
+     *  is the active one unless a switch happened while the upload was out.
+     *  Bookkeeping must land on the account that was uploaded. */
+    private fun sealedAccountDbPath(): String {
+        val sealed = sealedForPubkeyHex
+        if (sealed.isNotEmpty()) {
+            accounts().accounts.firstOrNull { it.pubkeyHex == sealed }?.let { return it.dbPath }
+        }
+        return marmotDbPath()
+    }
+
     actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
         check(sealedForPubkeyHex.isEmpty() || sealedForPubkeyHex == activeAccount().pubkeyHex) {
             "the sealed backup belongs to another account; seal again"
@@ -1322,12 +1333,12 @@ actual object SonarCore {
     actual fun recordBackupSuccess(sizeBytes: Long?) {
         SonarNativeLoader.ensureLoaded()
         val dbKeyHex = runCatching { loadOrCreateDbKey() }.getOrNull()
-        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong(), dbKeyHex)
+        uniffi.sonar_ffi.recordBackupSuccess(sealedAccountDbPath(), sizeBytes?.toULong(), dbKeyHex)
     }
 
     actual fun recordBackupFailure(error: String) {
         SonarNativeLoader.ensureLoaded()
-        uniffi.sonar_ffi.recordBackupFailure(marmotDbPath(), error)
+        uniffi.sonar_ffi.recordBackupFailure(sealedAccountDbPath(), error)
     }
 
     actual suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome = withContext(Dispatchers.IO) {

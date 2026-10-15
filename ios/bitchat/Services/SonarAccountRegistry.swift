@@ -92,6 +92,7 @@ enum SonarAccountRegistry {
         case notRegistered
         case lastAccount
         case faulted(String)
+        case activeAccount
 
         var errorDescription: String? {
             switch self {
@@ -103,6 +104,8 @@ enum SonarAccountRegistry {
                 return String(localized: "This is your only account. Use Emergency wipe to remove it.")
             case .faulted(let why):
                 return String(localized: "Account list unreadable: \(why)")
+            case .activeAccount:
+                return String(localized: "Switch to another account before removing this one.")
             }
         }
     }
@@ -150,17 +153,15 @@ enum SonarAccountRegistry {
     // MARK: Reads
 
     /// Current registry. Cached in-process; every writer below invalidates.
+    /// Load and publish happen under one lock, so a read that started before
+    /// a switch's invalidation can never republish the pre-switch snapshot
+    /// (the Compose actual holds the same monitor for the same reason).
     static func snapshot() -> Snapshot {
         lock.lock()
-        if let cached {
-            lock.unlock()
-            return cached
-        }
-        lock.unlock()
+        defer { lock.unlock() }
+        if let cached { return cached }
         let fresh = loadFromDisk()
-        lock.lock()
         cached = fresh
-        lock.unlock()
         return fresh
     }
 
@@ -306,6 +307,9 @@ enum SonarAccountRegistry {
         let snap = snapshot()
         if snap.accounts.count <= 1 { throw RegistryError.lastAccount }
         guard snap.accounts.contains(where: { $0.pubkeyHex == pubkey }) else { throw RegistryError.notRegistered }
+        // Never the account the durable pointer names: its store may be the
+        // one a connect is opening right now.
+        if snap.active?.pubkeyHex == pubkey { throw RegistryError.activeAccount }
         defer { invalidate() }
         let out = try accountRegistryRemove(dataDir: try dataDirectory().path, pubkey: pubkey)
         let removed = SonarAccount(out.removed)

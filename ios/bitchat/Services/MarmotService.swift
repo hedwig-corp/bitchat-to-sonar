@@ -2152,8 +2152,15 @@ final class MarmotService: @unchecked Sendable {
     /// Settings stats strip describes what was uploaded, so it comes from the
     /// bytes we actually pushed rather than a later measurement of a DB that has
     /// moved on.
-    func noteBackupSuccess(sizeBytes: UInt64? = nil) throws {
-        let (dbPath, dbKeyHex) = try Self.databaseConfig()
+    /// `dbPath` names the store the upload was SEALED from. Pass it from the
+    /// sealed bundle: an account switch while the upload is out would
+    /// otherwise record A's result against the now-active B.
+    func noteBackupSuccess(sizeBytes: UInt64? = nil, dbPath sealedDbPath: String? = nil) throws {
+        let (activePath, activeKey) = try Self.databaseConfig()
+        let dbPath = sealedDbPath ?? activePath
+        // The key is only needed for the message count; it must belong to
+        // the same store, so a foreign path records without a count.
+        let dbKeyHex: String? = dbPath == activePath ? activeKey : nil
         do {
             try recordBackupSuccess(dbPath: dbPath, sizeBytes: sizeBytes, dbKeyHex: dbKeyHex)
         } catch let error as SonarFfiError {
@@ -2161,8 +2168,8 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    func noteBackupFailure(_ message: String) throws {
-        let (dbPath, _) = try Self.databaseConfig()
+    func noteBackupFailure(_ message: String, dbPath sealedDbPath: String? = nil) throws {
+        let dbPath = try sealedDbPath ?? Self.databaseConfig().0
         do {
             try recordBackupFailure(dbPath: dbPath, error: message)
         } catch let error as SonarFfiError {

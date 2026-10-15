@@ -1706,10 +1706,10 @@ final class MarmotChatModel: ObservableObject {
                 nsec: sealedBundle.nsec,
                 sealed: sealedBundle.sealed
             )
-            try? service.noteBackupSuccess(sizeBytes: UInt64(sealedBundle.sealed.count))
+            try? service.noteBackupSuccess(sizeBytes: UInt64(sealedBundle.sealed.count), dbPath: sealedBundle.dbPath)
         } catch {
             uploadError = error
-            try? service.noteBackupFailure(error.localizedDescription)
+            try? service.noteBackupFailure(error.localizedDescription, dbPath: sealedBundle.dbPath)
         }
         let outcome = MarmotAccountBackupFlow.outcome(
             uploadSucceeded: uploadError == nil,
