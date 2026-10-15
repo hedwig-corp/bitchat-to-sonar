@@ -264,12 +264,20 @@ object SonarLifecycle {
     @Volatile private var onOpenConversation: ((PendingOpenConversation) -> Unit)? = null
     private val pendingOpenConversations = mutableListOf<PendingOpenConversation>()
 
-    fun submitOpenConversation(conversationId: String, jumpMessageId: String? = null) {
+    fun submitOpenConversation(
+        conversationId: String,
+        jumpMessageId: String? = null,
+        accountPubkeyHex: String? = null,
+    ) {
         val id = conversationId.trim()
-        if (id.isEmpty()) return
+        val account = accountPubkeyHex?.trim()?.lowercase()?.takeIf { it.length == 64 }
+        // A background-account banner may carry no chat at all: the tap is
+        // "switch to that account", nothing to open afterwards.
+        if (id.isEmpty() && account == null) return
         val req = PendingOpenConversation(
             conversationId = id,
             jumpMessageId = SonarNotificationHandoff.normalizeJumpMessageId(jumpMessageId),
+            accountPubkeyHex = account,
         )
         val handler = onOpenConversation
         if (handler != null) {
@@ -336,11 +344,26 @@ fun App(
             SonarLifecycle.clearOpenConversationHandler()
             return@LaunchedEffect
         }
-        val handler: (PendingOpenConversation) -> Unit = {
-            state.openConversationFromNotification(
-                conversationId = it.conversationId,
-                jumpMessageId = it.jumpMessageId,
-            )
+        val handler: (PendingOpenConversation) -> Unit = { req ->
+            val target = req.accountPubkeyHex
+            if (target != null && target != state.activeAccount?.pubkeyHex &&
+                state.accounts.any { it.pubkeyHex == target }
+            ) {
+                // Another registered account's banner: switch first, then open
+                // on the account that owns the chat.
+                state.switchAccount(target) { result ->
+                    result.onSuccess {
+                        if (req.conversationId.isNotEmpty()) {
+                            SonarLifecycle.submitOpenConversation(req.conversationId, req.jumpMessageId)
+                        }
+                    }.onFailure { state.toast = it.message }
+                }
+            } else if (req.conversationId.isNotEmpty()) {
+                state.openConversationFromNotification(
+                    conversationId = req.conversationId,
+                    jumpMessageId = req.jumpMessageId,
+                )
+            }
         }
         try {
             SonarLifecycle.installOpenConversationHandler(handler)
@@ -463,12 +486,15 @@ internal fun SonarScreenHost(state: SonarAppState) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun HomeScreen(state: SonarAppState) {
     val s = sonar
     var composeSheet by remember { mutableStateOf(false) }
     var connSheet by remember { mutableStateOf(false) }
     var wipeAsk by remember { mutableStateOf(false) }
+    var accountSwitcher by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { state.refreshAccounts() }
     var titleTaps by remember { mutableStateOf(0) }
     var pendingRowActions by remember { mutableStateOf<DeleteTarget?>(null) }
     var pendingMute by remember { mutableStateOf<DeleteTarget?>(null) }
@@ -488,10 +514,15 @@ private fun HomeScreen(state: SonarAppState) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 val settingsLabel = stringResource(Res.string.settings)
+                // Long-press: the account switcher (Telegram-style), only once a
+                // second account exists so single-account installs see no change.
                 Box(
                     Modifier.size(38.dp).clip(CircleShape)
                         .semantics { contentDescription = settingsLabel; role = Role.Button }
-                        .clickable { state.push(Screen.Settings) },
+                        .combinedClickable(
+                            onClick = { state.push(Screen.Settings) },
+                            onLongClick = { if (state.accounts.size > 1) accountSwitcher = true },
+                        ),
                     contentAlignment = Alignment.Center
                 ) { SonarAvatar(state.nick.ifBlank { "you" }, 32.dp) }
                 Row(
@@ -676,6 +707,13 @@ private fun HomeScreen(state: SonarAppState) {
     }
 
     if (composeSheet) ComposeSheet(state) { composeSheet = false }
+    if (accountSwitcher) {
+        chat.bitchat.sonar.screens.AccountSwitcherSheet(
+            state,
+            onClose = { accountSwitcher = false },
+            onAdd = { state.push(Screen.Settings) },
+        )
+    }
     if (connSheet) ConnectivitySheet(online = state.relayOnline, meshCount = meshCount) { connSheet = false }
     if (wipeAsk) WipeConfirmSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
     pendingInvite?.let { invite ->

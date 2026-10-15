@@ -23,17 +23,19 @@ import Foundation
 final class CashuWallet: SonarWalletProviding {
     let service: CashuWalletService
     private let keychain: KeychainManagerProtocol
-    private let nsecKey: String
+    /// Test override; nil resolves the active account's item per read.
+    private let nsecKeyOverride: String?
+    private var nsecKey: String { nsecKeyOverride ?? SonarAccountKeyExport.marmotNsecKey }
     private var startTask: Task<Void, Never>?
 
     init(
         keychain: KeychainManagerProtocol,
         service: CashuWalletService? = nil,
-        nsecKey: String = SonarAccountKeyExport.marmotNsecKey
+        nsecKey: String? = nil
     ) {
         self.keychain = keychain
         self.service = service ?? CashuWalletService()
-        self.nsecKey = nsecKey
+        self.nsecKeyOverride = nsecKey
     }
 
     // MARK: State

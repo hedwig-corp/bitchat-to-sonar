@@ -414,19 +414,26 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     /// Cold-launch taps can arrive before `bind` wires the store.
     private var pendingConversationId: String?
     private var pendingJumpMessageId: String?
+    private var pendingAccountPubkeyHex: String?
 
     func bind(chatViewModel: ChatViewModel, sonarStore: SonarAppStore) {
         self.chatViewModel = chatViewModel
         self.sonarStore = sonarStore
         if let pending = pendingConversationId {
             let jump = pendingJumpMessageId
+            let account = pendingAccountPubkeyHex
             pendingConversationId = nil
             pendingJumpMessageId = nil
-            openConversation(pending, jumpMessageId: jump)
+            pendingAccountPubkeyHex = nil
+            openConversation(pending, jumpMessageId: jump, accountPubkeyHex: account)
         }
     }
 
-    private func openConversation(_ conversationId: String, jumpMessageId: String? = nil) {
+    private func openConversation(
+        _ conversationId: String,
+        jumpMessageId: String? = nil,
+        accountPubkeyHex: String? = nil
+    ) {
         let id = conversationId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return }
         let jump = jumpMessageId?
@@ -435,10 +442,15 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         guard let store = sonarStore else {
             pendingConversationId = id
             pendingJumpMessageId = jumpOrNil
+            pendingAccountPubkeyHex = accountPubkeyHex
             return
         }
         DispatchQueue.main.async {
-            store.openConversationFromNotification(id, jumpMessageId: jumpOrNil)
+            store.openConversationFromNotification(
+                id,
+                jumpMessageId: jumpOrNil,
+                accountPubkeyHex: accountPubkeyHex
+            )
         }
     }
 
@@ -477,7 +489,8 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         if let conversationId = SonarNotificationHandoff.conversationId(from: userInfo) {
             openConversation(
                 conversationId,
-                jumpMessageId: SonarNotificationHandoff.messageId(from: userInfo)
+                jumpMessageId: SonarNotificationHandoff.messageId(from: userInfo),
+                accountPubkeyHex: SonarNotificationHandoff.accountPubkeyHex(from: userInfo)
             )
         } else if identifier.hasPrefix("private-"),
                   let peerID = userInfo[SonarNotificationKeys.peerID] as? String {

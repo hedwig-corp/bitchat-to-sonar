@@ -142,6 +142,7 @@ actual object Notifier {
         sound: SonarNotificationSound,
         conversationId: String?,
         messageId: String?,
+        accountPubkeyHex: String?,
     ) {
         if (!canNotify()) return
         val open = Intent(ctx, MainActivity::class.java).apply {
@@ -149,6 +150,9 @@ actual object Notifier {
                 Intent.FLAG_ACTIVITY_SINGLE_TOP
             if (!conversationId.isNullOrBlank()) {
                 putExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID, conversationId)
+            }
+            if (!accountPubkeyHex.isNullOrBlank()) {
+                putExtra(SonarNotificationHandoff.EXTRA_ACCOUNT_PUBKEY, accountPubkeyHex)
             }
             SonarNotificationHandoff.normalizeJumpMessageId(messageId)?.let {
                 putExtra(SonarNotificationHandoff.EXTRA_MESSAGE_ID, it)

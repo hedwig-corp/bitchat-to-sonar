@@ -30,6 +30,8 @@ struct SonarSettingsScreen: View {
     @State private var legacyDeleteSheet = false
     @State private var exportKeySheet = false
     @State private var restoreKeySheet = false
+    @State private var addAccountSheet = false
+    @State private var removeAccountAsk: SonarAccount?
     @State private var diagnosticsSheet = false
     @State private var dataUsageSheet = false
     @State private var transcriptSpikeB = false
@@ -43,6 +45,8 @@ struct SonarSettingsScreen: View {
             ScrollView {
                 VStack(spacing: 0) {
                     profileCard
+
+                    accountsSection
 
                     SNSectionLabel("App")
                     SNSettingsCard {
@@ -327,6 +331,24 @@ struct SonarSettingsScreen: View {
         .snSheet(isPresented: $restoreKeySheet, title: "Restore account") {
             SNRestoreAccountSheetContent(onClose: { restoreKeySheet = false })
         }
+        .snSheet(isPresented: $addAccountSheet, title: String(localized: "Add account")) {
+            SNAddAccountSheetContent(onClose: { addAccountSheet = false })
+        }
+        .snSheet(
+            isPresented: Binding(
+                get: { removeAccountAsk != nil },
+                set: { if !$0 { removeAccountAsk = nil } }
+            ),
+            title: String(localized: "Remove account")
+        ) {
+            if let account = removeAccountAsk {
+                SNRemoveAccountSheetContent(
+                    account: account,
+                    onClose: { removeAccountAsk = nil }
+                )
+            }
+        }
+        .onAppear { store.refreshAccounts() }
         .snSheet(isPresented: $diagnosticsSheet, title: "Diagnostics") {
             SNDiagnosticsSheetContent()
         }
@@ -380,6 +402,46 @@ struct SonarSettingsScreen: View {
     }
 
     // st-prof — profile card → Profile screen
+    /// Settings → Accounts: every account on this phone, the active one
+    /// checked. Tap switches; long-press removes; the last row adds.
+    @ViewBuilder
+    private var accountsSection: some View {
+        if !store.accounts.isEmpty {
+            SNSectionLabel(String(localized: "Accounts"))
+            SNSettingsCard {
+                ForEach(store.accounts) { account in
+                    SNSettingsRow(
+                        icon: .key,
+                        tone: account.isActive ? .cyan : .neutral,
+                        label: store.displayName(for: account),
+                        sub: account.shortNpub,
+                        trail: account.isActive ? .check : .none
+                    ) {
+                        store.switchAccountFromUI(account.pubkeyHex)
+                    }
+                    .contextMenu {
+                        if store.accounts.count > 1 {
+                            Button(role: .destructive) { removeAccountAsk = account } label: {
+                                Label(String(localized: "Remove from this phone"), systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+                SNSettingsRow(
+                    icon: .plus, tone: .cyan,
+                    label: String(localized: "Add account"),
+                    sub: store.canAddAccount
+                        ? String(localized: "Create a new key or sign in with an nsec")
+                        : String(localized: "You can keep up to \(String(store.maxAccounts)) accounts on this phone."),
+                    divider: false
+                ) {
+                    if store.canAddAccount { addAccountSheet = true }
+                }
+            }
+            settingsNote(String(localized: "Only the selected account is online. Others still get notifications; tap one to switch."))
+        }
+    }
+
     private var profileCard: some View {
         Button(action: { store.push(.profile) }) {
             HStack(spacing: 14) {
@@ -635,5 +697,168 @@ struct SNHeaderName: View {
             .font(SonarTheme.uiFont(size: 17, weight: .bold))
             .kerning(-17 * 0.01)
             .foregroundColor(SonarTheme.text)
+    }
+}
+
+
+/// Settings → Accounts → Add account: a fresh key, or sign in with an existing
+/// `nsec1…`. Nothing about the current account changes; the new one gets its
+/// own encrypted store and becomes the selected account.
+struct SNAddAccountSheetContent: View {
+    @EnvironmentObject private var store: SonarAppStore
+    var onClose: () -> Void
+
+    @State private var nsec = ""
+    @State private var label = ""
+    @State private var errorText: String?
+    @State private var inFlight = false
+
+    private var nsecOk: Bool {
+        let t = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.range(of: "^nsec1[0-9a-z]{20,}$", options: .regularExpression) != nil
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text(String(localized: "Your current account stays on this phone with all its chats. Only one account is online at a time; the others still receive notifications."))
+                .font(SonarTheme.uiFont(size: 13.5))
+                .lineSpacing(13.5 * 0.3)
+                .foregroundColor(SonarTheme.text2)
+                .multilineTextAlignment(.center)
+                .padding(EdgeInsets(top: 8, leading: 14, bottom: 10, trailing: 14))
+
+            TextField(String(localized: "Label (optional, e.g. Work)"), text: $label)
+                .font(SonarTheme.uiFont(size: 15))
+                .foregroundColor(SonarTheme.text)
+                .padding(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16))
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(SonarTheme.surface2))
+                .padding(.horizontal, 8)
+
+            SNPrimaryButton(
+                label: inFlight ? String(localized: "Adding...") : String(localized: "Create new account"),
+                disabled: inFlight
+            ) {
+                add(nsec: nil)
+            }
+            .padding(EdgeInsets(top: 10, leading: 8, bottom: 6, trailing: 8))
+
+            Text(String(localized: "or sign in with an existing key"))
+                .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                .foregroundColor(SonarTheme.text3)
+                .padding(.vertical, 6)
+
+            ZStack(alignment: .topLeading) {
+                if nsec.isEmpty {
+                    Text(verbatim: "nsec1\u{2026}")
+                        .font(SonarTheme.monoFont(size: 15))
+                        .foregroundColor(SonarTheme.text3)
+                        .padding(EdgeInsets(top: 14, leading: 16, bottom: 0, trailing: 16))
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: $nsec)
+                    .font(SonarTheme.monoFont(size: 15))
+                    .foregroundColor(SonarTheme.text)
+                    .frame(minHeight: 72)
+                    .scrollContentBackground(.hidden)
+                    .padding(EdgeInsets(top: 6, leading: 11, bottom: 6, trailing: 11))
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+            }
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(SonarTheme.surface2))
+            .padding(.horizontal, 8)
+
+            if let errorText {
+                Text(verbatim: errorText)
+                    .font(SonarTheme.uiFont(size: 13))
+                    .foregroundColor(SonarTheme.danger)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+            }
+
+            SNPrimaryButton(
+                label: inFlight ? String(localized: "Adding...") : String(localized: "Sign in with this key"),
+                disabled: !nsecOk || inFlight
+            ) {
+                add(nsec: nsec)
+            }
+            .padding(EdgeInsets(top: 10, leading: 8, bottom: 0, trailing: 8))
+            SNGhostButton(label: String(localized: "Cancel"), action: onClose)
+                .padding(.top, 4)
+        }
+    }
+
+    private func add(nsec: String?) {
+        guard !inFlight else { return }
+        inFlight = true
+        errorText = nil
+        let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task { @MainActor in
+            do {
+                try await store.addAccount(nsec: nsec, label: trimmedLabel.isEmpty ? nil : trimmedLabel)
+                onClose()
+            } catch {
+                errorText = error.localizedDescription
+                inFlight = false
+            }
+        }
+    }
+}
+
+/// Settings → Accounts → long-press → Remove: deletes that account's chats
+/// and keys from this phone only. Its wallet files stay (they may hold
+/// funds); the account itself lives on wherever its nsec is kept.
+struct SNRemoveAccountSheetContent: View {
+    @EnvironmentObject private var store: SonarAppStore
+    let account: SonarAccount
+    var onClose: () -> Void
+
+    @State private var errorText: String?
+    @State private var inFlight = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text(String(localized: "This removes \(store.displayName(for: account)) from this phone: its chats and keys here are deleted. The account still exists wherever you keep its nsec, and its wallet files stay on this phone."))
+                .font(SonarTheme.uiFont(size: 13.5))
+                .lineSpacing(13.5 * 0.3)
+                .foregroundColor(SonarTheme.text2)
+                .multilineTextAlignment(.center)
+                .padding(EdgeInsets(top: 8, leading: 14, bottom: 2, trailing: 14))
+            if let errorText {
+                Text(verbatim: errorText)
+                    .font(SonarTheme.uiFont(size: 13))
+                    .foregroundColor(SonarTheme.danger)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+            }
+            VStack(spacing: 6) {
+                SNPrimaryButton(
+                    label: inFlight ? String(localized: "Removing...") : String(localized: "Remove from this phone"),
+                    danger: true,
+                    disabled: inFlight
+                ) {
+                    remove()
+                }
+                SNGhostButton(label: String(localized: "Cancel"), action: onClose)
+            }
+            .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
+        }
+    }
+
+    private func remove() {
+        guard !inFlight else { return }
+        inFlight = true
+        errorText = nil
+        Task { @MainActor in
+            do {
+                try await store.removeAccount(account.pubkeyHex)
+                onClose()
+            } catch {
+                errorText = error.localizedDescription
+                inFlight = false
+            }
+        }
     }
 }

@@ -101,6 +101,11 @@ import chat.bitchat.sonar.resources.the_old_wallet_couldn_t_be_removed
 import chat.bitchat.sonar.resources.this_kind_of_payment_isn_t_supported_yet
 import chat.bitchat.sonar.resources.your_wallet_is_busy_try_again_in_a
 import chat.bitchat.sonar.resources.your_wallet_is_still_starting_try_again
+import chat.bitchat.sonar.resources.couldn_t_open_that_account
+import chat.bitchat.sonar.resources.you_can_keep_up_to_accounts_on_this
+import chat.bitchat.sonar.resources.account_added_chats_recovered_from
+import chat.bitchat.sonar.resources.account_added_chats_start_empty_on_this
+import chat.bitchat.sonar.resources.this_is_your_only_account_use_emergency
 import chat.bitchat.sonar.wallet.SendErrorKind
 import org.jetbrains.compose.resources.getString
 
@@ -4920,6 +4925,281 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun exportNsec(): String = SonarCore.identityNsec()
 
+    // ── Accounts (switcher) ─────────────────────────────────────────────
+
+    /** Registered accounts, active first then most recently active. */
+    var accounts by mutableStateOf<List<SonarAccount>>(emptyList())
+        private set
+    var maxAccounts by mutableStateOf(DEFAULT_MAX_ACCOUNTS)
+        private set
+    var canAddAccount by mutableStateOf(true)
+        private set
+    val activeAccount: SonarAccount? get() = accounts.firstOrNull { it.isActive }
+
+    /** Re-read the registry. Cheap: the core actual caches until a write. */
+    fun refreshAccounts() {
+        val snap = SonarCore.accounts()
+        accounts = snap.ordered
+        maxAccounts = snap.maxAccounts
+        canAddAccount = snap.canAdd
+    }
+
+    fun accountDisplayName(account: SonarAccount): String = accountDisplayName(account, nick)
+
+    /**
+     * Switch to another registered account. Same shape as [restoreAccount]
+     * minus every destructive step: wallets are set aside (Cashu is per
+     * account on disk; the legacy Breez store is archived under the old
+     * account id), host caches are cleared, the core closes the live store and
+     * opens the target's — never wiping either — and the app reboots on it.
+     */
+    fun switchAccount(pubkeyHex: String, onResult: (Result<Unit>) -> Unit = {}) {
+        scope.launch {
+            var marmotDeliveryGeneration: Long? = null
+            val result = runCatching {
+                if (activeAccount?.pubkeyHex == pubkeyHex) return@runCatching
+                Notifier.prepareForAccountReplacement()
+                setAsideWalletsForAccountChange()
+                marmotDeliveryGeneration = tearDownAccountBoundState()
+                val newNpub = try {
+                    SonarCore.switchAccount(pubkeyHex)
+                } catch (error: Throwable) {
+                    // The core has already reopened the previous account.
+                    boot()
+                    refreshAccounts()
+                    throw SonarAccountRestoreException(
+                        getString(Res.string.couldn_t_open_that_account, error.message ?: ""),
+                        error,
+                    )
+                }
+                finishAccountChange(newNpub)
+            }
+            marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
+            onResult(result)
+        }
+    }
+
+    /** Add an account (fresh key when [nsec] is null, else the pasted key) and
+     *  switch to it. The current account keeps everything. */
+    fun addAccount(nsec: String?, label: String?, onResult: (Result<Unit>) -> Unit = {}) {
+        scope.launch {
+            var marmotDeliveryGeneration: Long? = null
+            val result = runCatching {
+                val key = nsec?.trim()?.takeIf { it.isNotEmpty() }
+                if (key != null) {
+                    try {
+                        SonarCore.validateIdentity(key)
+                    } catch (error: Throwable) {
+                        throw SonarAccountRestoreException(
+                            "That key couldn't be imported. Check you pasted the full nsec1... key.",
+                            error,
+                        )
+                    }
+                }
+                // The key you already have is a switch (R-023) and never counts
+                // against the cap; anything else needs a free slot.
+                val alreadyRegistered = key
+                    ?.let { k -> runCatching { SonarCore.validateIdentity(k) }.getOrNull() }
+                    ?.let { np -> accounts.any { it.npub == np } }
+                    ?: false
+                if (!alreadyRegistered && !SonarCore.accounts().canAdd) {
+                    throw SonarAccountRestoreException(
+                        getString(Res.string.you_can_keep_up_to_accounts_on_this, maxAccounts.toString()),
+                    )
+                }
+                Notifier.prepareForAccountReplacement()
+                setAsideWalletsForAccountChange()
+                marmotDeliveryGeneration = tearDownAccountBoundState()
+                val newNpub = try {
+                    SonarCore.addAccount(key, label?.trim()?.takeIf { it.isNotEmpty() })
+                } catch (error: Throwable) {
+                    boot()
+                    refreshAccounts()
+                    throw SonarAccountRestoreException(
+                        getString(Res.string.couldn_t_open_that_account, error.message ?: ""),
+                        error,
+                    )
+                }
+                finishAccountChange(newNpub)
+                when (SonarCore.lastImportBackupOutcome()) {
+                    AccountBackupRestoreOutcome.Restored ->
+                        toast = getString(Res.string.account_added_chats_recovered_from)
+                    AccountBackupRestoreOutcome.Missing, AccountBackupRestoreOutcome.Failed ->
+                        if (key != null) toast = getString(Res.string.account_added_chats_start_empty_on_this)
+                    AccountBackupRestoreOutcome.Unchanged -> Unit
+                }
+            }
+            marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
+            onResult(result)
+        }
+    }
+
+    /** Remove an account from this phone: its store, sidecars and keys go; its
+     *  Cashu directory stays (it may hold funds). The active account is
+     *  switched away from first; the last account is refused. */
+    fun removeAccount(pubkeyHex: String, onResult: (Result<Unit>) -> Unit = {}) {
+        scope.launch {
+            val result = runCatching {
+                if (activeAccount?.pubkeyHex == pubkeyHex) {
+                    val next = nextActiveAfterRemoving(accounts, pubkeyHex)
+                        ?: throw SonarAccountRestoreException(
+                            getString(Res.string.this_is_your_only_account_use_emergency),
+                        )
+                    val switched = kotlinx.coroutines.CompletableDeferred<Result<Unit>>()
+                    switchAccount(next.pubkeyHex) { switched.complete(it) }
+                    switched.await().getOrThrow()
+                }
+                SonarCore.removeAccount(pubkeyHex)
+                refreshAccounts()
+            }
+            onResult(result)
+        }
+    }
+
+    /** Wallet half shared by restore / switch / add: strict, nothing below
+     *  mutates the identity unless the wallets are safely set aside. */
+    private suspend fun setAsideWalletsForAccountChange() {
+        try {
+            setAsideWalletsForAccountReplacement()
+        } catch (error: chat.bitchat.sonar.wallet.PaymentInFlightException) {
+            setupWallet()
+            throw SonarAccountRestoreException(
+                getString(Res.string.a_payment_is_still_in_flight_wait_for),
+                error,
+            )
+        } catch (error: Throwable) {
+            throw SonarAccountRestoreException(
+                "Wallet storage couldn't be cleared. Restart Sonar and try again.",
+                error,
+            )
+        }
+    }
+
+    /** Every account-bound host cache, cleared before the identity changes.
+     *  Returns the Marmot delivery generation to resume afterwards. Shared by
+     *  [restoreAccount], [switchAccount] and [addAccount]. */
+    private suspend fun tearDownAccountBoundState(): Long? {
+        endTranscriptSession()
+        UnifyRadio.stopScanning()
+        UnifyRadio.stopAdvertising()
+        unifyOffer = null; unifyPeers = emptyList()
+        // Match backupAccountNow: cancel AND join so wake/poll cannot race
+        // wipe + Blossom stage/commit under a live node.
+        val toJoin = listOfNotNull(pollJob, relayConnectJob, housekeepingJob, marmotWakeJob)
+        pollJob = null
+        relayConnectJob = null
+        housekeepingJob = null
+        marmotWakeJob = null
+        resetStartupFlags()
+        refreshRelayOnline()
+        toJoin.forEach { it.cancel() }
+        toJoin.forEach { job ->
+            runCatching { withTimeoutOrNull(3_000) { job.join() } }
+        }
+        resetCallState()
+        val marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
+        cancelPendingMarmotSetups()
+        cancelPendingMarmotGroupSetups()
+
+        MessageStore.wipe()
+        MeshRadio.discardPendingDeliverySignals()
+        meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+        persistMeshNames()
+        pendingMarmotChatNpubs = emptyMap()
+        pendingMarmotGroups = emptyMap()
+        pendingInviteTokens.clear()
+        linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+        persistLinks(); persistLinkCaps(); persistGroupFolds()
+        updateBleDiscoveryPolicy()
+        foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
+        sonarPeerProfiles = emptyMap()
+        // Generation first — see wipe(): the write below suspends.
+        sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
+        sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
+        publishedSonarDescriptor = false
+        publishedSonarDescriptorBolt12Offer = null
+        publishingSonarDescriptor = false
+        needsSonarDescriptorPublish = false
+        rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
+        profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCacheNow()
+        socialState = SonarSocialState(); persistSocialState()
+        bip353 = ""; SonarCore.saveBlob("bip353", "")
+        // "Back up over cellular" is consent from ONE account to spend
+        // the user's data plan. The restored account never gave it, so
+        // it must not inherit the previous account's answer — the same
+        // rule the panic wipe already follows.
+        SonarCore.saveBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF, "0")
+        backupOverCellular = false
+        coreClaimedHandle = null
+        handleClaimState = HandleClaimState.Idle
+        // setupWallet loads the restored account's record.
+        resetHandleAddressState()
+        // Drop the previous account's nickname. The restored identity's
+        // kind-0 on relays is authoritative; publishing the old nick
+        // would clobber it. hydrateOwnProfileFromRelays() fills this
+        // after relay connect.
+        SonarCore.setNickname("")
+        nick = ""
+        meshBroadcast = emptyList(); meshDmRows = emptyList()
+        verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
+        verifiedChatIds.clear(); verifiedVersion++
+        chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear(); channelMsgs = emptyList()
+        clearChatSnapshot()
+        lastWnGroups = -1; lastWnMsgs = -1
+        payLedger = SonarPayLedger(); persistPay(); payVersion++
+        PaymentActivityStore.wipe()
+        clearPaymentStatusState()
+        cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
+        mediaCache.clear(); clearStickerCaches()
+        callLogs.clear(); callVersion++
+        notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
+        scanWatermark.clear()
+        SonarCore.saveBlob(NPUB_BLOB_KEY, "")
+        npub = ""
+        started = false
+        connecting = false
+        localCoreReady = false
+        homeMessagesHydrated = false
+        return marmotDeliveryGeneration
+    }
+
+    /** Once the new account's store is open: wallet check, prefs, reboot.
+     *  Shared by [restoreAccount], [switchAccount] and [addAccount]. */
+    private fun finishAccountChange(newNpub: String) {
+        npub = newNpub
+        // This account gets ONE background check for an old Breez
+        // wallet derived from its key (runs after local paint).
+        // Keyed like the wallet store: on the nsec the app exports.
+        runCatching { SonarCore.identityNsec() }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?.let { LegacyBreezStore.restoreCheckKey(cashuAccountId(it)) }
+            ?.let { checkKey ->
+                if (CoreWalletPrefs.get(checkKey) == null) {
+                    CoreWalletPrefs.put(checkKey, LegacyBreezStore.CHECK_PENDING)
+                }
+            }
+        // Keep the persisted npub consistent with the restored identity
+        // now, so a crash before start()'s re-save can't restore the OLD
+        // npub as "me" on the next launch's local-first paint.
+        SonarCore.saveBlob(NPUB_BLOB_KEY, newNpub)
+        SonarCore.setOnboardingComplete(true)
+        retryPushRegistrationAfterAccountReady()
+        val needsExplicitBoot = onboarded
+        onboarded = true
+        nick = SonarCore.nickname()
+        stack = listOf(Screen.Home)
+        walletState = WalletState.NotConfigured
+        walletOnline = false; walletBalanceDetails = null; cashuOffer = null
+        lastIncomingWalletPayment = null
+        legacyWallet = LegacyWalletSnapshot(); legacyDeleteGate = null
+        refreshMeshIdentity()
+        // From Settings, onboarded was already true so LaunchedEffect(onboarded)
+        // will not re-fire — boot explicitly. From onboarding, false→true
+        // triggers App.kt's LaunchedEffect; avoid a concurrent double boot.
+        if (needsExplicitBoot) boot()
+        refreshAccounts()
+    }
+
     fun restoreAccount(nsec: String, onResult: (Result<Unit>) -> Unit) {
         scope.launch {
             var marmotDeliveryGeneration: Long? = null
@@ -4967,106 +5247,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Legacy Breez: delete only if its gate passes, else archive it
                 // under the old account. Strict: nothing below mutates the
                 // identity unless the wallets are safely set aside.
-                try {
-                    setAsideWalletsForAccountReplacement()
-                } catch (error: chat.bitchat.sonar.wallet.PaymentInFlightException) {
-                    // Nothing was replaced: keep the current account's wallet.
-                    setupWallet()
-                    throw SonarAccountRestoreException(
-                        getString(Res.string.a_payment_is_still_in_flight_wait_for),
-                        error,
-                    )
-                } catch (error: Throwable) {
-                    throw SonarAccountRestoreException(
-                        "Wallet storage couldn't be cleared. Restart Sonar and try again.",
-                        error,
-                    )
-                }
+                setAsideWalletsForAccountChange()
 
                 // Clear every account-bound host cache before committing the new
                 // nsec. A crash after import must never paint the previous account's
                 // chats, contacts, payment rows, offers, or local-first snapshot.
-                endTranscriptSession()
-                UnifyRadio.stopScanning()
-                UnifyRadio.stopAdvertising()
-                unifyOffer = null; unifyPeers = emptyList()
-                // Match backupAccountNow: cancel AND join so wake/poll cannot race
-                // wipe + Blossom stage/commit under a live node.
-                val toJoin = listOfNotNull(pollJob, relayConnectJob, housekeepingJob, marmotWakeJob)
-                pollJob = null
-                relayConnectJob = null
-                housekeepingJob = null
-                marmotWakeJob = null
-                resetStartupFlags()
-                refreshRelayOnline()
-                toJoin.forEach { it.cancel() }
-                toJoin.forEach { job ->
-                    runCatching { withTimeoutOrNull(3_000) { job.join() } }
-                }
-                resetCallState()
-                marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
-                cancelPendingMarmotSetups()
-                cancelPendingMarmotGroupSetups()
+                marmotDeliveryGeneration = tearDownAccountBoundState()
 
-                MessageStore.wipe()
-                MeshRadio.discardPendingDeliverySignals()
-                meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
-                persistMeshNames()
-                pendingMarmotChatNpubs = emptyMap()
-                pendingMarmotGroups = emptyMap()
-                pendingInviteTokens.clear()
-                linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-                persistLinks(); persistLinkCaps(); persistGroupFolds()
-                updateBleDiscoveryPolicy()
-                foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
-                sonarPeerProfiles = emptyMap()
-                // Generation first — see wipe(): the write below suspends.
-                sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
-                sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
-                publishedSonarDescriptor = false
-                publishedSonarDescriptorBolt12Offer = null
-                publishingSonarDescriptor = false
-                needsSonarDescriptorPublish = false
-                rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
-                profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCacheNow()
-                socialState = SonarSocialState(); persistSocialState()
-                bip353 = ""; SonarCore.saveBlob("bip353", "")
-                // "Back up over cellular" is consent from ONE account to spend
-                // the user's data plan. The restored account never gave it, so
-                // it must not inherit the previous account's answer — the same
-                // rule the panic wipe already follows.
-                SonarCore.saveBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF, "0")
-                backupOverCellular = false
-                coreClaimedHandle = null
-                handleClaimState = HandleClaimState.Idle
-                // setupWallet loads the restored account's record.
-                resetHandleAddressState()
-                // Drop the previous account's nickname. The restored identity's
-                // kind-0 on relays is authoritative; publishing the old nick
-                // would clobber it. hydrateOwnProfileFromRelays() fills this
-                // after relay connect.
-                SonarCore.setNickname("")
-                nick = ""
-                meshBroadcast = emptyList(); meshDmRows = emptyList()
-                verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
-                verifiedChatIds.clear(); verifiedVersion++
-                chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear(); channelMsgs = emptyList()
-                clearChatSnapshot()
-                lastWnGroups = -1; lastWnMsgs = -1
-                payLedger = SonarPayLedger(); persistPay(); payVersion++
-                PaymentActivityStore.wipe()
-                clearPaymentStatusState()
-                cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
-                mediaCache.clear(); clearStickerCaches()
-                callLogs.clear(); callVersion++
-                notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
-                scanWatermark.clear()
-                SonarCore.saveBlob(NPUB_BLOB_KEY, "")
-                npub = ""
-                started = false
-                connecting = false
-                localCoreReady = false
-                homeMessagesHydrated = false
 
                 val restoredNpub = try {
                     SonarCore.importIdentity(key)
@@ -5086,37 +5273,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     )
                 }
 
-                npub = restoredNpub
-                // This account gets ONE background check for an old Breez
-                // wallet derived from its key (runs after local paint).
-                // Keyed like the wallet store: on the nsec the app exports.
-                runCatching { SonarCore.identityNsec() }.getOrNull()
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { LegacyBreezStore.restoreCheckKey(cashuAccountId(it)) }
-                    ?.let { checkKey ->
-                        if (CoreWalletPrefs.get(checkKey) == null) {
-                            CoreWalletPrefs.put(checkKey, LegacyBreezStore.CHECK_PENDING)
-                        }
-                    }
-                // Keep the persisted npub consistent with the restored identity
-                // now, so a crash before start()'s re-save can't restore the OLD
-                // npub as "me" on the next launch's local-first paint.
-                SonarCore.saveBlob(NPUB_BLOB_KEY, restoredNpub)
-                SonarCore.setOnboardingComplete(true)
-                retryPushRegistrationAfterAccountReady()
-                val needsExplicitBoot = onboarded
-                onboarded = true
-                nick = SonarCore.nickname()
-                stack = listOf(Screen.Home)
-                walletState = WalletState.NotConfigured
-                walletOnline = false; walletBalanceDetails = null; cashuOffer = null
-                lastIncomingWalletPayment = null
-                legacyWallet = LegacyWalletSnapshot(); legacyDeleteGate = null
-                refreshMeshIdentity()
-                // From Settings, onboarded was already true so LaunchedEffect(onboarded)
-                // will not re-fire — boot explicitly. From onboarding, false→true
-                // triggers App.kt's LaunchedEffect; avoid a concurrent double boot.
-                if (needsExplicitBoot) boot()
+                finishAccountChange(restoredNpub)
                 when (SonarCore.lastImportBackupOutcome()) {
                     AccountBackupRestoreOutcome.Restored ->
                         toast = getString(Res.string.account_restored_chats_recovered_from)

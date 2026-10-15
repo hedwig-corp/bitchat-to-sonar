@@ -15,12 +15,17 @@ sealed class SonarNotificationOpenTarget {
 data class PendingOpenConversation(
     val conversationId: String,
     val jumpMessageId: String? = null,
+    /** Hex pubkey of the account the banner belongs to; absent for the active
+     *  account's own banners. A tap switches to it before opening. */
+    val accountPubkeyHex: String? = null,
 )
 
 object SonarNotificationHandoff {
     const val EXTRA_CONVERSATION_ID = "sonar_conversation_id"
     /** Stable local message id for Jump open-action (#372). Optional. */
     const val EXTRA_MESSAGE_ID = "sonar_message_id"
+    /** Registered account a background-account banner belongs to. Optional. */
+    const val EXTRA_ACCOUNT_PUBKEY = "sonar_account_pubkey"
     private const val MESH_CHAT_PREFIX = "mesh:"
 
     /** Stable local-notification id used by [Notifier] (matches router idKey.hashCode()). */

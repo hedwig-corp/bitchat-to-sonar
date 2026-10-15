@@ -15,6 +15,10 @@ import chat.bitchat.sonar.decodeMuteMap
 import chat.bitchat.sonar.decodeProfileCache
 import chat.bitchat.sonar.isMutedAt
 import chat.bitchat.sonar.resolvePushSenderName
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.new_messages_for
+import chat.bitchat.sonar.resources.tap_to_switch_to_this_account
+import org.jetbrains.compose.resources.getString
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeoutOrNull
@@ -30,6 +34,32 @@ import kotlinx.coroutines.withTimeoutOrNull
 internal object SonarWakeNotifications {
 
     private const val PROFILE_FETCH_BUDGET_MS = 5_000L
+    /** Per-account drain window for background accounts (iOS NSE uses 3 s). */
+    private const val INACTIVE_ACCOUNT_PEEK_MS = 3_000L
+
+    /**
+     * Background accounts (push-only): after the active account's drain, peek
+     * the other registered accounts and post ONE banner per account that
+     * received something. The banner names the account, never a sender or a
+     * preview — that store is not the live one — and its tap switches to it.
+     * Returns how many accounts were notified.
+     */
+    suspend fun notifyInactiveAccounts(prefs: SonarNotificationPrefs): Int {
+        if (!prefs.enabled) return 0
+        val hit = SonarCore.peekInactiveAccountsForWake(INACTIVE_ACCOUNT_PEEK_MS)
+        for (account in hit) {
+            val name = account.label?.takeIf { it.isNotBlank() } ?: account.shortNpub
+            Notifier.notify(
+                id = ("account:" + account.pubkeyHex).hashCode(),
+                title = getString(Res.string.new_messages_for, name),
+                body = getString(Res.string.tap_to_switch_to_this_account),
+                sound = SonarNotificationSound.Default,
+                conversationId = null,
+                accountPubkeyHex = account.pubkeyHex,
+            )
+        }
+        return hit.size
+    }
 
     /** Render titled notifications for every unread conversation from local
      *  storage. Returns how many conversations were notified.

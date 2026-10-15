@@ -1309,6 +1309,7 @@ struct SNVerifyInfo {
 enum SonarAccountRestoreError: LocalizedError {
     case walletCleanupFailed
     case accountReplacementFailed
+    case accountSwitchFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -1316,6 +1317,8 @@ enum SonarAccountRestoreError: LocalizedError {
             return "Wallet storage couldn't be cleared. Restart Sonar and try again."
         case .accountReplacementFailed:
             return "Account storage couldn't be replaced. Restart Sonar and try again."
+        case .accountSwitchFailed(let why):
+            return String(localized: "Couldn't open that account: \(why)")
         }
     }
 }
@@ -1346,7 +1349,7 @@ final class SonarAppStore: ObservableObject {
         static let shareLocalTime = "sonar.privacy.shareLocalTime"
         static let shareLocalTimeByChat = "sonar.privacy.shareLocalTimeByChat"
         static let bleKnownChatKeys = "sonar.ble.knownChatKeys.v1"
-        static let marmotNsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
+        static var marmotNsecKeychainKey: String { SonarAccountKeyExport.marmotNsecKey }
     }
 
     #if os(iOS)
@@ -1478,6 +1481,9 @@ final class SonarAppStore: ObservableObject {
     /// Replaced on each `showToast` so rapid toasts don't pile sleeping tasks.
     private var toastDismissTask: Task<Void, Never>?
     @Published private(set) var onboarded: Bool
+    /// Registered accounts, active first then most recently active. Refreshed
+    /// from the registry on every account change and when Settings appears.
+    @Published private(set) var accounts: [SonarAccount] = []
     @Published private(set) var mode: String
     @Published private(set) var discoverNewPeople: Bool
     @Published private(set) var batterySavingEnabled: Bool
@@ -3254,6 +3260,7 @@ final class SonarAppStore: ObservableObject {
             onboarded = true
             defaults.set(true, forKey: Keys.onboarded)
             ensureAutoBackupEnabledDefault()
+            refreshAccounts()
             path = []
             // A share that arrived through the extension before onboarding is
             // still staged and waiting: ingestPendingShares bails out while
@@ -3376,6 +3383,7 @@ final class SonarAppStore: ObservableObject {
         onboarded = true
         defaults.set(true, forKey: Keys.onboarded)
         path = []
+        refreshAccounts()
         // A staged share can also be waiting if the extension opened a fresh
         // install that then went through the restore flow — release it now.
         ingestPendingShares()
@@ -3390,6 +3398,142 @@ final class SonarAppStore: ObservableObject {
             // Same account, nothing replaced — no toast, because nothing happened.
             break
         }
+    }
+
+    // MARK: - Accounts (switcher)
+
+    var activeAccount: SonarAccount? { accounts.first { $0.isActive } }
+    var canAddAccount: Bool { SonarAccountRegistry.snapshot().canAdd }
+    var maxAccounts: Int { SonarAccountRegistry.snapshot().maxAccounts }
+
+    /// Re-read the registry. Cheap: the facade caches until a write.
+    func refreshAccounts() {
+        let snap = SonarAccountRegistry.snapshot()
+        let sorted = snap.accounts.sorted {
+            if $0.isActive != $1.isActive { return $0.isActive }
+            return $0.lastActiveAt > $1.lastActiveAt
+        }
+        if sorted != accounts { accounts = sorted }
+    }
+
+    /// Display name for a switcher row: label, else the active profile name
+    /// for the active account, else the shortened npub.
+    func displayName(for account: SonarAccount) -> String {
+        if let label = account.label, !label.isEmpty { return label }
+        if account.isActive, !nick.isEmpty { return nick }
+        return account.shortNpub
+    }
+
+    /// Switch to another registered account. Wallets are released, never
+    /// deleted (Cashu is per account on disk; the legacy Breez store is
+    /// archived under the old account id); host caches are cleared; the
+    /// target's store opens local-first. On failure the previous account is
+    /// already reopened by the chat model and its wallets restart here.
+    func switchAccount(to pubkeyHex: String) async throws {
+        guard activeAccount?.pubkeyHex != pubkeyHex else { return }
+        let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
+        defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+        try await releaseWalletsForAccountChange()
+        clearAccountBoundLocalStateForRestore()
+        do {
+            try await marmot.switchAccount(toPubkeyHex: pubkeyHex)
+        } catch {
+            wallet.start()
+            legacyWallets.refresh()
+            refreshAccounts()
+            throw SonarAccountRestoreError.accountSwitchFailed(error.localizedDescription)
+        }
+        finishAccountChange()
+    }
+
+    /// Fire-and-forget switch for rows and menus; failures surface as a toast.
+    func switchAccountFromUI(_ pubkeyHex: String) {
+        guard activeAccount?.pubkeyHex != pubkeyHex else { return }
+        Task { @MainActor in
+            do {
+                try await switchAccount(to: pubkeyHex)
+            } catch {
+                showToast(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Add an account (fresh key when `nsec` is nil, else the pasted key) and
+    /// switch to it. The current account keeps everything.
+    func addAccount(nsec: String?, label: String? = nil) async throws {
+        let key = nsec?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let key { _ = try SonarIdentity.import(nsec: key) }
+        let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
+        defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+        try await releaseWalletsForAccountChange()
+        clearAccountBoundLocalStateForRestore()
+        let outcome: AccountBackupRestoreOutcome
+        do {
+            outcome = try await marmot.addAccount(nsec: key, label: label).backup
+        } catch {
+            wallet.start()
+            legacyWallets.refresh()
+            refreshAccounts()
+            if let registryError = error as? SonarAccountRegistry.RegistryError { throw registryError }
+            throw SonarAccountRestoreError.accountSwitchFailed(error.localizedDescription)
+        }
+        finishAccountChange()
+        switch outcome {
+        case .restored:
+            showToast(String(localized: "Account added — chats recovered from backup"))
+        case .missing, .failed:
+            showToast(String(localized: "Account added — chats start empty on this phone"))
+        case .unchanged:
+            break
+        }
+    }
+
+    /// Remove an account from this phone: its store, sidecars and keys go;
+    /// its Cashu wallet directory stays (it may hold funds). The active
+    /// account is switched away from first; the last account is refused.
+    func removeAccount(_ pubkeyHex: String) async throws {
+        if activeAccount?.pubkeyHex == pubkeyHex {
+            guard let next = accounts
+                .filter({ $0.pubkeyHex != pubkeyHex })
+                .max(by: { $0.lastActiveAt < $1.lastActiveAt })
+            else { throw SonarAccountRegistry.RegistryError.lastAccount }
+            try await switchAccount(to: next.pubkeyHex)
+        }
+        _ = try SonarAccountRegistry.remove(pubkey: pubkeyHex, keychain: keychain)
+        refreshAccounts()
+    }
+
+    /// Shared prefix of restore / switch / add: stop push webhook state for
+    /// the outgoing wallet, release Cashu (files kept) and archive the legacy
+    /// Breez store. Reopens Cashu for the current account on failure.
+    private func releaseWalletsForAccountChange() async throws {
+        #if os(iOS)
+        await SonarPushRegistration.shared.prepareForAccountReplacement(wallet: legacyWallet?.walletService)
+        #endif
+        do {
+            try await wallet.prepareForIdentityReplacement()
+        } catch {
+            throw SonarAccountRestoreError.walletCleanupFailed
+        }
+        do {
+            try await legacyWallets.prepareForIdentityReplacement()
+        } catch {
+            wallet.start()
+            throw SonarAccountRestoreError.walletCleanupFailed
+        }
+        legacyWebhookOffer = nil
+    }
+
+    /// Shared suffix of restore / switch / add once the new store is open.
+    private func finishAccountChange() {
+        legacyWallets.armRestoreCheck()
+        wallet.start()
+        legacyWallets.refresh()
+        onboarded = true
+        defaults.set(true, forKey: Keys.onboarded)
+        path = []
+        refreshAccounts()
+        ingestPendingShares()
     }
 
     /// Settings → Chat backup: encrypt Marmot DB+key with nsec and upload to
@@ -11091,10 +11235,29 @@ final class SonarAppStore: ObservableObject {
     /// missing ids soft-fail to unread/live-edge inside the host.
     func openConversationFromNotification(
         _ conversationId: String,
-        jumpMessageId: String? = nil
+        jumpMessageId: String? = nil,
+        accountPubkeyHex: String? = nil
     ) {
         let id = conversationId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return }
+        // A banner the NSE drained from another registered account: switch
+        // first, then open on the account that owns the chat. An unknown or
+        // already-active account falls through to the plain open.
+        if let accountPubkeyHex,
+           accountPubkeyHex != activeAccount?.pubkeyHex,
+           accounts.contains(where: { $0.pubkeyHex == accountPubkeyHex }) {
+            let jump = jumpMessageId
+            Task { @MainActor in
+                do {
+                    try await self.switchAccount(to: accountPubkeyHex)
+                } catch {
+                    self.showToast(error.localizedDescription)
+                    return
+                }
+                self.openConversationFromNotification(id, jumpMessageId: jump)
+            }
+            return
+        }
         let jump: String? = {
             guard let raw = jumpMessageId?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty else { return nil }
@@ -11908,6 +12071,10 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func performWipe() async {
+        // Every account's keychain names, captured BEFORE the Marmot wipe
+        // removes the registry they are read from.
+        let accountNsecKeys = SonarAccountRegistry.allKeychainKeysForWipe()
+            .filter { $0.hasPrefix(SonarAccountRegistry.nsecKeyBase) }
         // Treat the user's tap as the privacy boundary: suspend and join every
         // Marmot text/media/setup task before wallet or host state changes.
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
@@ -11946,7 +12113,10 @@ final class SonarAppStore: ObservableObject {
         // that ordering ever changes.
         chatViewModel.panicClearAllData()
         MessageStore.shared.wipeAll()
-        _ = keychain.deleteIdentityKey(forKey: Keys.marmotNsecKeychainKey)
+        for key in Set(accountNsecKeys + [Keys.marmotNsecKeychainKey]) {
+            _ = keychain.deleteIdentityKey(forKey: key)
+        }
+        accounts = []
         // Drop diagnostics logs too: at verbose level they can contain peer
         // npubs, so a panic wipe must not leave them on disk.
         SonarDiagnostics.clearLogs()

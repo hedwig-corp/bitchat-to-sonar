@@ -298,10 +298,21 @@ class SonarPushProcessingService : Service() {
             // state, and only degrade to the generic fallback when nothing
             // unread actually landed AND the sync was cut short.
             val notified = notifyUnreadConversations(prefs)
+            // The wake names no account: when the active one has nothing new,
+            // the push may have been for a background account. Bounded peek.
+            val otherAccounts = if (notified == 0) {
+                runCatching { SonarWakeNotifications.notifyInactiveAccounts(prefs) }
+                    .onFailure { Log.w(TAG, "background-account peek failed", it) }
+                    .getOrDefault(0)
+            } else {
+                0
+            }
 
             when {
                 notified > 0 ->
                     Log.d(TAG, "Marmot wakeup: notified for $notified conversation(s) (synced=$synced)")
+                otherAccounts > 0 ->
+                    Log.d(TAG, "Marmot wakeup: notified $otherAccounts background account(s)")
                 synced ->
                     Log.d(TAG, "Marmot sync complete, no unread messages")
                 else -> {

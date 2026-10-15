@@ -84,6 +84,7 @@ actual object Notifier {
         sound: SonarNotificationSound,
         conversationId: String?,
         messageId: String?,
+        accountPubkeyHex: String?,
     ) {
         if (!conversationId.isNullOrBlank()) {
             lastConversationId.set(conversationId)
