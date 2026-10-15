@@ -71,11 +71,15 @@ actual object SonarCore {
     private fun marmotDir(): File = DesktopEnv.file("sonar-marmot").apply { mkdirs() }
 
     // ── Accounts (switcher) — mirror of the Android actual ──────────────
-    @Volatile private var registryCache: SonarAccountRegistrySnapshot? = null
-    private fun invalidateRegistry() { registryCache = null }
+    private val registryCacheLock = Any()
+    private var registryCache: SonarAccountRegistrySnapshot? = null
+    private fun invalidateRegistry() { synchronized(registryCacheLock) { registryCache = null } }
 
-    actual fun accounts(): SonarAccountRegistrySnapshot =
+    // Load and publish under one monitor so a load that started before a
+    // switch's invalidation cannot publish its stale snapshot after it.
+    actual fun accounts(): SonarAccountRegistrySnapshot = synchronized(registryCacheLock) {
         registryCache ?: loadRegistry().also { registryCache = it }
+    }
 
     private fun loadRegistry(): SonarAccountRegistrySnapshot = runCatching {
         SonarNativeLoader.ensureLoaded()
@@ -112,6 +116,19 @@ actual object SonarCore {
             .onFailure { sonarLog("Accounts", "legacy registration failed — staying single-account: ${it.message}") }
     }
 
+    /** The key that just opened the active store is the truth: a restore that
+     *  replaced this slot's key and died before repointing its row leaves the
+     *  row naming the old key. Repoint so switch and add address the right one. */
+    private fun healActiveRowIfNeeded(openedHex: String) {
+        val snap = accounts()
+        val active = snap.active ?: return
+        if (snap.fault != null || active.pubkeyHex == openedHex) return
+        sonarLog("Accounts", "active row ${active.pubkeyHex.take(8)}… does not match the opened key — repointing")
+        runCatching { uniffi.sonar_ffi.accountRegistryReplacePubkey(marmotDir().absolutePath, active.pubkeyHex, openedHex) }
+            .onFailure { sonarLog("Accounts", "could not repoint the active row: ${it.message}") }
+        invalidateRegistry()
+    }
+
     private fun uniffi.sonar_ffi.AccountInfo.toCommon() = SonarAccount(
         pubkeyHex = pubkeyHex, npub = npub, label = label, dbPath = dbPath,
         secretTag = secretTag, isLegacy = isLegacy, isActive = isActive,
@@ -127,22 +144,32 @@ actual object SonarCore {
         val previous = activeAccount()
         if (previous.pubkeyHex == target) return npub
         val dataDir = marmotDir().absolutePath
-        closeNode()
-        uniffi.sonar_ffi.accountRegistrySetActive(dataDir, target)
-        invalidateRegistry()
         try {
+            closeNode()
+            uniffi.sonar_ffi.accountRegistrySetActive(dataDir, target)
+            invalidateRegistry()
             openActiveAccountLocally()
             sonarLog("Accounts", "switched to ${target.take(8)}…")
             return npub
         } catch (switchError: Throwable) {
-            sonarLog("Accounts", "switch failed — rolling back: ${switchError.message}")
-            if (previous.pubkeyHex.isNotEmpty()) {
-                runCatching { uniffi.sonar_ffi.accountRegistrySetActive(dataDir, previous.pubkeyHex) }
-            }
-            invalidateRegistry()
-            runCatching { openActiveAccountLocally() }.onFailure { switchError.addSuppressed(it) }
-            throw switchError
+            throw rollBackAccountChange(previous, switchError)
         }
+    }
+
+    /** Point the registry back at [previous] and reopen it. The thrown error
+     *  carries both failures when the rollback itself fails, so a caller never
+     *  reports "reopened the previous account" for a device with no store open. */
+    private fun rollBackAccountChange(previous: SonarAccount, cause: Throwable): Throwable {
+        sonarLog("Accounts", "account change failed — rolling back: ${cause.message}")
+        val problems = mutableListOf(cause.message ?: cause.toString())
+        if (previous.pubkeyHex.isNotEmpty()) {
+            runCatching { uniffi.sonar_ffi.accountRegistrySetActive(marmotDir().absolutePath, previous.pubkeyHex) }
+                .onFailure { problems += "could not restore the previous account pointer: ${it.message}" }
+        }
+        invalidateRegistry()
+        runCatching { openActiveAccountLocally() }
+            .onFailure { problems += "the previous account could not be reopened: ${it.message}" }
+        return IllegalStateException(problems.joinToString("; "), cause)
     }
 
     private fun openActiveAccountLocally() {
@@ -167,12 +194,20 @@ actual object SonarCore {
                 val dataDir = marmotDir().absolutePath
                 val entry = uniffi.sonar_ffi.accountRegistryAdd(dataDir, hex, label).toCommon()
                 invalidateRegistry()
-                DesktopSecrets.put(entry.nsecSecretKey, identity.nsec())
-                val previous = activeAccount()
-                closeNode()
-                uniffi.sonar_ffi.accountRegistrySetActive(dataDir, hex)
-                invalidateRegistry()
+                // The key lands under the new account's own name BEFORE it
+                // becomes active; when it cannot be stored the row goes too.
                 try {
+                    DesktopSecrets.put(entry.nsecSecretKey, identity.nsec())
+                } catch (putError: Throwable) {
+                    runCatching { uniffi.sonar_ffi.accountRegistryRemove(dataDir, hex) }
+                    invalidateRegistry()
+                    throw putError
+                }
+                val previous = activeAccount()
+                try {
+                    closeNode()
+                    uniffi.sonar_ffi.accountRegistrySetActive(dataDir, hex)
+                    invalidateRegistry()
                     npub = identity.npub()
                     pubkeyHex = hex
                     lastImportBackupOutcomeValue =
@@ -181,13 +216,7 @@ actual object SonarCore {
                     openActiveAccountLocally()
                     npub
                 } catch (addError: Throwable) {
-                    sonarLog("Accounts", "add failed — reopening the previous account: ${addError.message}")
-                    if (previous.pubkeyHex.isNotEmpty()) {
-                        runCatching { uniffi.sonar_ffi.accountRegistrySetActive(dataDir, previous.pubkeyHex) }
-                    }
-                    invalidateRegistry()
-                    runCatching { openActiveAccountLocally() }.onFailure { addError.addSuppressed(it) }
-                    throw addError
+                    throw rollBackAccountChange(previous, addError)
                 }
             }
         }
@@ -216,6 +245,7 @@ actual object SonarCore {
                 npub = identity.npub()
                 pubkeyHex = identity.pubkeyHex()
                 registerLegacyIfNeeded(identity.pubkeyHex())
+                healActiveRowIfNeeded(identity.pubkeyHex())
 
                 val dbPath = marmotDbPath()
                 val dbKeyHex = loadOrCreateDbKey()
@@ -1208,13 +1238,22 @@ actual object SonarCore {
                     val nsec = DesktopSecrets.get(nsecKey()) ?: error("no identity to back up")
                     val dbPath = marmotDbPath()
                     val dbKeyHex = loadOrCreateDbKey()
+                    sealedForPubkeyHex = activeAccount().pubkeyHex
                     closeNode()
                     uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex)
                 }
             }
         }
 
+    /** Account the last [sealAccountBackup] ran for: an upload must use the
+     *  same nsec, or a switch in between would file A's ciphertext as B's
+     *  latest backup. */
+    @Volatile private var sealedForPubkeyHex: String = ""
+
     actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
+        check(sealedForPubkeyHex.isEmpty() || sealedForPubkeyHex == activeAccount().pubkeyHex) {
+            "the sealed backup belongs to another account; seal again"
+        }
         SonarNativeLoader.ensureLoaded()
         val nsec = DesktopSecrets.get(nsecKey()) ?: error("no identity to back up")
         val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)

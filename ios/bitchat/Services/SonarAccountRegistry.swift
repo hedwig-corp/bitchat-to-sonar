@@ -268,6 +268,36 @@ enum SonarAccountRegistry {
         }
     }
 
+    /// The key that just opened the active store is `openedNpub`. When the
+    /// registry's active row names another key, a restore replaced the slot
+    /// and died before repointing it; repoint now so switch, add and the
+    /// NSE address the right account. No-op before the registry exists.
+    static func healActiveRowIfNeeded(openedNpub: String) {
+        let snap = snapshot()
+        guard snap.fault == nil, let active = snap.active, !active.npub.isEmpty,
+              active.npub != openedNpub else { return }
+        SecureLogger.warning(
+            "Account registry: active row \(active.npub.prefix(12))… does not match the opened key — repointing",
+            category: .session
+        )
+        replacePubkey(old: active.pubkeyHex, new: openedNpub)
+    }
+
+    /// A row added moments ago whose key could not be stored and whose store
+    /// was never opened. Dropping it is the opposite of a wipe: nothing it
+    /// named ever existed.
+    static func discardUnopenedRow(pubkey: String, keychain: KeychainManagerProtocol) {
+        defer { invalidate() }
+        do {
+            _ = try accountRegistryRemove(dataDir: try dataDirectory().path, pubkey: pubkey)
+        } catch {
+            SecureLogger.warning(
+                "Account registry: could not drop the unopened row: \(error.localizedDescription)",
+                category: .session
+            )
+        }
+    }
+
     /// Remove `pubkey`: the core wipes its store and `accounts/<hex>/`, this
     /// clears its keychain items. Call with no live node on that store and
     /// never on the active account. The account's Cashu wallet directory is

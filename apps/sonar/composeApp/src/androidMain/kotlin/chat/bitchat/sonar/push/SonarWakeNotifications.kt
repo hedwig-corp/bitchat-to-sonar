@@ -46,6 +46,10 @@ internal object SonarWakeNotifications {
      */
     suspend fun notifyInactiveAccounts(prefs: SonarNotificationPrefs): Int {
         if (!prefs.enabled) return 0
+        // One account online at a time: with the UI visible the active node
+        // is live, so no second relay-connected store. The user is right
+        // there and can switch by hand.
+        if (chat.bitchat.sonar.SonarLifecycle.appVisible) return 0
         val hit = SonarCore.peekInactiveAccountsForWake(INACTIVE_ACCOUNT_PEEK_MS)
         for (account in hit) {
             val name = account.label?.takeIf { it.isNotBlank() } ?: account.shortNpub

@@ -66,7 +66,8 @@ enum SonarNotificationHandoff {
     static func accountPubkeyHex(from userInfo: [AnyHashable: Any]) -> String? {
         guard let hex = userInfo[SonarNotificationKeys.accountPubkey] as? String else { return nil }
         let trimmed = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return trimmed.count == 64 ? trimmed : nil
+        guard trimmed.count == 64, trimmed.allSatisfy({ $0.isHexDigit && $0.isASCII }) else { return nil }
+        return trimmed
     }
 
     static func isMarmotWake(from userInfo: [AnyHashable: Any]) -> Bool {

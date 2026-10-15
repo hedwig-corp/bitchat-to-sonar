@@ -327,9 +327,16 @@ class NotificationService: SDKNotificationService {
             dbKeychainKey: dbKeychainKey,
             isActive: true
         )
-        guard let info = try? accountRegistryLoad(dataDir: dataDir.path), !info.accounts.isEmpty else {
+        let info: AccountRegistryInfo
+        do {
+            info = try accountRegistryLoad(dataDir: dataDir.path)
+        } catch {
+            // A registry that exists but cannot be read: the app runs the
+            // legacy single-account path for this launch and so do we. Say so.
+            recordDiagnostic("registryUnreadable")
             return [legacy]
         }
+        guard !info.accounts.isEmpty else { return [legacy] }
         let sorted = info.accounts.sorted { a, b in
             if a.isActive != b.isActive { return a.isActive }
             return a.lastActiveAt > b.lastActiveAt
@@ -382,6 +389,15 @@ class NotificationService: SDKNotificationService {
                 Self.recordDiagnostic("wakeAccounts:deadline opened=\(opened)")
                 break
             }
+            // `serviceExtensionTimeWillExpire` releases the flock from under
+            // us; never open another store after that.
+            wakeNodeLock.lock()
+            let lockStillHeld = marmotWakeStoreLock != nil
+            wakeNodeLock.unlock()
+            if index > 0, !lockStillHeld {
+                Self.recordDiagnostic("wakeAccounts:lockReleased opened=\(opened)")
+                break
+            }
             let nsec = Self.readKeychainString(account: account.nsecKeychainKey)
             let dbKeyHex = Self.readKeychainString(account: account.dbKeychainKey)
             guard let nsec, let dbKeyHex, !nsec.isEmpty, dbKeyHex.count == 64 else {
@@ -398,10 +414,25 @@ class NotificationService: SDKNotificationService {
                 lastError = error
                 continue
             }
+            let identity: SonarIdentity
+            do {
+                identity = try SonarIdentity.import(nsec: nsec)
+            } catch {
+                lastError = error
+                continue
+            }
+            // Registry and keychain can drift (a restore that died before
+            // repointing its row). Never sync one identity against another
+            // account's store.
+            if !account.pubkeyHex.isEmpty, identity.pubkeyHex() != account.pubkeyHex {
+                Self.recordDiagnostic("wakeAccounts:keyMismatch active=\(account.isActive)")
+                lastError = NSEMarmotError.missingCredentials
+                continue
+            }
             let node: SonarNode
             do {
                 node = try SonarNode.connect(
-                    identity: try SonarIdentity.import(nsec: nsec),
+                    identity: identity,
                     relayUrls: Self.defaultRelayUrls,
                     dbPath: dbURL.path,
                     dbKeyHex: dbKeyHex,

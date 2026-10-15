@@ -1634,11 +1634,16 @@ final class MarmotService: @unchecked Sendable {
     /// pinned to `dbFileProtection` so the store stays readable during locked
     /// background work (see `dbFileProtection`).
     private static func databaseURL() throws -> URL {
-        // `databaseDirectory()` runs the App Group migration; the registry
-        // then names the ACTIVE account's store under it (the legacy store
-        // for single-account installs, `accounts/<hex>/` after a switch).
+        try databaseURL(for: try SonarAccountRegistry.resolveActive())
+    }
+
+    /// Store URL of one account. `databaseDirectory()` runs the App Group
+    /// migration; the registry then names the account's store under it (the
+    /// legacy store for single-account installs, `accounts/<hex>/` after a
+    /// switch).
+    private static func databaseURL(for account: SonarAccount) throws -> URL {
         _ = try MarmotAppGroupStore.databaseDirectory()
-        let url = URL(fileURLWithPath: try SonarAccountRegistry.resolveActive().dbPath)
+        let url = URL(fileURLWithPath: account.dbPath)
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         #if os(iOS)
@@ -1649,7 +1654,11 @@ final class MarmotService: @unchecked Sendable {
 
     /// (path, 64-char hex key). Generates and persists a fresh key the first time.
     private static func databaseConfig() throws -> (String, String) {
-        let url = try databaseURL()
+        // One registry read for BOTH the path and the key name, so a switch
+        // landing between two lookups can never pair A's store with B's key.
+        let account = try SonarAccountRegistry.resolveActive()
+        let url = try databaseURL(for: account)
+        let dbKeychainKey = account.dbKeychainKey
         #if DEBUG
         // SONAR_BENCH: derive a STABLE db key from the env identity so the
         // encrypted DB persists across cold-start runs without Keychain. Unsigned
@@ -1791,23 +1800,25 @@ final class MarmotService: @unchecked Sendable {
             }
             dbKeys = SonarAccountRegistry.allKeychainKeysForWipe()
                 .filter { $0.hasPrefix(SonarAccountRegistry.dbKeyBase) }
+            #if os(iOS)
+            if let legacyDir = MarmotAppGroupStore.legacyApplicationSupportDirectory() {
+                let legacyDb = legacyDir.appendingPathComponent(MarmotAppGroupStore.dbFileName)
+                if FileManager.default.fileExists(atPath: legacyDb.path) {
+                    wipePaths.append(legacyDb.path)
+                }
+            }
+            #endif
         case .activeAccount:
             // Fixed path from the registry snapshot — never `databaseURL()`,
-            // which migrates before open.
-            if let active = try? SonarAccountRegistry.resolveActive(),
-               FileManager.default.fileExists(atPath: active.dbPath) {
+            // which migrates before open. Path and key name come from ONE
+            // resolution; a registry that cannot be read aborts the wipe
+            // instead of deleting a key for a path it never found.
+            let active = try SonarAccountRegistry.resolveActive()
+            if FileManager.default.fileExists(atPath: active.dbPath) {
                 wipePaths.append(active.dbPath)
             }
-            dbKeys = [Self.dbKeychainKey]
+            dbKeys = [active.dbKeychainKey]
         }
-        #if os(iOS)
-        if let legacyDir = MarmotAppGroupStore.legacyApplicationSupportDirectory() {
-            let legacyDb = legacyDir.appendingPathComponent(MarmotAppGroupStore.dbFileName)
-            if FileManager.default.fileExists(atPath: legacyDb.path) {
-                wipePaths.append(legacyDb.path)
-            }
-        }
-        #endif
         // Same reason as `closeNode()`: the close hop below must not queue
         // behind blocking relay FFI already parked on the serial `workQueue`.
         interruptNodeForSuspend()
@@ -1857,23 +1868,24 @@ final class MarmotService: @unchecked Sendable {
             for path in wipePaths {
                 try wipeMarmotDatabase(dbPath: path)
             }
+            // Keys go once their stores are gone (no surviving store without
+            // a key) and BEFORE the registry that names them: a retry after a
+            // failed delete can still enumerate every account.
+            let keychain = KeychainManager()
+            for key in dbKeys {
+                guard keychain.deleteIdentityKey(forKey: key) else {
+                    throw ServiceError.core("failed to delete Marmot database key")
+                }
+            }
             if case .everything = scope {
                 // Drop directory roots (sidecars, empty dirs, the registry and
-                // every `accounts/<hex>/`) without remigrating. Must succeed
-                // before the Keychain db-key delete — a surviving store with a
-                // missing key is unrecoverable.
+                // every `accounts/<hex>/`) without remigrating.
                 do {
                     try MarmotAppGroupStore.removeAllStoreFiles()
                 } catch {
                     throw ServiceError.core(error.localizedDescription)
                 }
                 SonarAccountRegistry.invalidate()
-            }
-            let keychain = KeychainManager()
-            for key in dbKeys {
-                guard keychain.deleteIdentityKey(forKey: key) else {
-                    throw ServiceError.core("failed to delete Marmot database key")
-                }
             }
             return ()
         }
