@@ -227,8 +227,9 @@ actual object SonarCore {
         lock.withLock {
             stickerOperationLock.write {
                 check(activeAccount().pubkeyHex != pubkeyHex) { "switch away before removing the active account" }
-                val out = uniffi.sonar_ffi.accountRegistryRemove(marmotDir().absolutePath, pubkeyHex)
-                invalidateRegistry()
+                val out = synchronized(bookkeepingMonitor) {
+                    uniffi.sonar_ffi.accountRegistryRemove(marmotDir().absolutePath, pubkeyHex).also { invalidateRegistry() }
+                }
                 val removed = out.removed.toCommon()
                 DesktopSecrets.clear(removed.nsecSecretKey, removed.dbKeySecretKey)
             }
@@ -1260,6 +1261,13 @@ actual object SonarCore {
     /** Store whose backup is being recorded: the one the seal ran for, which
      *  is the active one unless a switch happened while the upload was out.
      *  Bookkeeping must land on the account that was uploaded. */
+    /** Held across "is the sealed account still registered?" + the FFI write,
+     *  and across the registry removal + store deletion, so a removal cannot
+     *  land between the lookup and the write (which would recreate the
+     *  deleted directory with a stray policy sidecar). A plain monitor: the
+     *  record paths are not suspend functions. */
+    private val bookkeepingMonitor = Any()
+
     private fun sealedAccountDbPath(): String? {
         val sealed = sealedForPubkeyHex
         if (sealed.isEmpty()) return marmotDbPath()
@@ -1332,23 +1340,27 @@ actual object SonarCore {
 
     actual fun recordBackupSuccess(sizeBytes: Long?) {
         SonarNativeLoader.ensureLoaded()
-        val target = sealedAccountDbPath() ?: run {
-            sonarLog("Backup", "upload finished for a removed account — not recorded")
-            return
+        synchronized(bookkeepingMonitor) {
+            val target = sealedAccountDbPath() ?: run {
+                sonarLog("Backup", "upload finished for a removed account — not recorded")
+                return
+            }
+            // The key is only for the message count and must belong to the same
+            // store: a foreign (non-active) target records without a count.
+            val dbKeyHex = if (target == marmotDbPath()) runCatching { loadOrCreateDbKey() }.getOrNull() else null
+            uniffi.sonar_ffi.recordBackupSuccess(target, sizeBytes?.toULong(), dbKeyHex)
         }
-        // The key is only for the message count and must belong to the same
-        // store: a foreign (non-active) target records without a count.
-        val dbKeyHex = if (target == marmotDbPath()) runCatching { loadOrCreateDbKey() }.getOrNull() else null
-        uniffi.sonar_ffi.recordBackupSuccess(target, sizeBytes?.toULong(), dbKeyHex)
     }
 
     actual fun recordBackupFailure(error: String) {
         SonarNativeLoader.ensureLoaded()
-        val target = sealedAccountDbPath() ?: run {
-            sonarLog("Backup", "upload failed for a removed account — not recorded")
-            return
+        synchronized(bookkeepingMonitor) {
+            val target = sealedAccountDbPath() ?: run {
+                sonarLog("Backup", "upload failed for a removed account — not recorded")
+                return
+            }
+            uniffi.sonar_ffi.recordBackupFailure(target, error)
         }
-        uniffi.sonar_ffi.recordBackupFailure(target, error)
     }
 
     actual suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome = withContext(Dispatchers.IO) {
