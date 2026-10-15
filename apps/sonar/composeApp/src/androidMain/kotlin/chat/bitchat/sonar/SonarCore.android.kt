@@ -245,51 +245,60 @@ actual object SonarCore {
      * Push wake, background accounts: the Transponder wake names no account,
      * so after the active account's drain each NON-active account's store is
      * opened in turn — one at a time, bounded by [maxAccounts] and [waitMs] —
-     * and allowed to drain. Returns the accounts that received something. The
-     * live node is untouched (different stores); the whole pass runs under the
-     * core lock so a seal or switch cannot interleave. Mirror of the iOS NSE
-     * account loop.
+     * and allowed to drain. Returns the accounts that received something.
+     *
+     * One store open per process: the ACTIVE node is CLOSED first and left
+     * closed; the next `start()` reopens it lazily. Only for a wake with the
+     * UI not visible — the pass stops as soon as the app comes to the
+     * foreground so a cold open never waits behind it. Runs under the core
+     * lock and the sticker write lock, the same pair a switch takes, so no
+     * sticker read can meet a closed node. Mirror of the iOS NSE loop.
      */
     internal suspend fun peekInactiveAccountsForWake(
         waitMs: Long,
         maxAccounts: Int = 4,
     ): List<SonarAccount> = withContext(Dispatchers.IO) {
         lock.withLock {
-            val others = accounts().ordered.filter { !it.isActive }.take(maxAccounts)
-            if (others.isEmpty()) return@withLock emptyList()
-            // One store open per process: the caller runs this only while the
-            // UI is not visible, so the active node is idle wake-path state —
-            // close it before opening anyone else's store. The next start()
-            // reopens it lazily.
-            if (SonarLifecycle.appVisible) return@withLock emptyList()
-            closeNode()
-            val hit = mutableListOf<SonarAccount>()
-            for (account in others) {
-                val nsec = AndroidSecrets.get(account.nsecSecretKey) ?: continue
-                val dbKeyHex = AndroidSecrets.get(account.dbKeySecretKey) ?: continue
-                val db = File(account.dbPath)
-                // Never mint a store from the wake path.
-                if (!db.isFile || db.length() == 0L) continue
-                val identity = runCatching { SonarIdentity.import(nsec) }.getOrNull() ?: continue
-                // Registry and keystore can drift; never sync one identity
-                // against another account's store.
-                if (identity.pubkeyHex() != account.pubkeyHex) continue
-                val peek = try {
-                    SonarNode.connect(identity, relayUrls, account.dbPath, dbKeyHex, null)
-                } catch (e: Throwable) {
-                    sonarLog("Accounts", "wake peek: open failed for ${account.pubkeyHex.take(8)}…: ${e.message}")
-                    continue
-                }
-                try {
-                    if (peek.collectNotificationsAfterWake(waitMs.toULong()).isNotEmpty()) hit += account
-                } catch (e: Throwable) {
-                    sonarLog("Accounts", "wake peek: drain failed for ${account.pubkeyHex.take(8)}…: ${e.message}")
-                } finally {
-                    peek.close()
-                }
+            stickerOperationLock.write {
+                peekInactiveAccountsLocked(waitMs, maxAccounts)
             }
-            hit
         }
+    }
+
+    private fun peekInactiveAccountsLocked(waitMs: Long, maxAccounts: Int): List<SonarAccount> {
+        val others = accounts().ordered.filter { !it.isActive }.take(maxAccounts)
+        if (others.isEmpty()) return emptyList()
+        if (SonarLifecycle.appVisible) return emptyList()
+        closeNode()
+        val hit = mutableListOf<SonarAccount>()
+        for (account in others) {
+            // The UI came back while we held the lock: stop opening
+            // stores; start() will reopen the active account next.
+            if (SonarLifecycle.appVisible) break
+            val nsec = AndroidSecrets.get(account.nsecSecretKey) ?: continue
+            val dbKeyHex = AndroidSecrets.get(account.dbKeySecretKey) ?: continue
+            val db = File(account.dbPath)
+            // Never mint a store from the wake path.
+            if (!db.isFile || db.length() == 0L) continue
+            val identity = runCatching { SonarIdentity.import(nsec) }.getOrNull() ?: continue
+            // Registry and keystore can drift; never sync one identity
+            // against another account's store.
+            if (identity.pubkeyHex() != account.pubkeyHex) continue
+            val peek = try {
+                SonarNode.connect(identity, relayUrls, account.dbPath, dbKeyHex, null)
+            } catch (e: Throwable) {
+                sonarLog("Accounts", "wake peek: open failed for ${account.pubkeyHex.take(8)}…: ${e.message}")
+                continue
+            }
+            try {
+                if (peek.collectNotificationsAfterWake(waitMs.toULong()).isNotEmpty()) hit += account
+            } catch (e: Throwable) {
+                sonarLog("Accounts", "wake peek: drain failed for ${account.pubkeyHex.take(8)}…: ${e.message}")
+            } finally {
+                peek.close()
+            }
+        }
+        return hit
     }
 
     actual suspend fun removeAccount(pubkeyHex: String): Unit = withContext(Dispatchers.IO) {
