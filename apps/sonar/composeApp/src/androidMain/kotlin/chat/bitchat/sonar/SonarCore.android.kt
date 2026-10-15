@@ -257,6 +257,12 @@ actual object SonarCore {
         lock.withLock {
             val others = accounts().ordered.filter { !it.isActive }.take(maxAccounts)
             if (others.isEmpty()) return@withLock emptyList()
+            // One store open per process: the caller runs this only while the
+            // UI is not visible, so the active node is idle wake-path state —
+            // close it before opening anyone else's store. The next start()
+            // reopens it lazily.
+            if (SonarLifecycle.appVisible) return@withLock emptyList()
+            closeNode()
             val hit = mutableListOf<SonarAccount>()
             for (account in others) {
                 val nsec = AndroidSecrets.get(account.nsecSecretKey) ?: continue
@@ -1243,6 +1249,13 @@ actual object SonarCore {
                     pubkeyHex = identity.pubkeyHex()
                     lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
                     return@write npub
+                }
+                // Already another account on this phone: a switch, never a
+                // replacement of the active slot (the host checks this too).
+                if (accounts().accounts.any { it.pubkeyHex == identity.pubkeyHex() }) {
+                    sonarLog("Identity", "import is a registered account — switching instead of replacing")
+                    lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
+                    return@write switchAccountLocked(identity.pubkeyHex())
                 }
                 closeNode()
                 val marmotDir = File(marmotDbPath()).parentFile!!

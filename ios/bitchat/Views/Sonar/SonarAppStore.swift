@@ -3337,6 +3337,14 @@ final class SonarAppStore: ObservableObject {
             )
             return
         }
+        // A key that is already ANOTHER account on this phone: switch to it.
+        // Replacing would wipe the active store and write this key under the
+        // active slot's keychain names, destroying that account.
+        if let registered = SonarAccountRegistry.snapshot().accounts.first(where: { $0.pubkeyHex == incoming.pubkeyHex() }) {
+            SecureLogger.info("ℹ️ Restore account: key is a registered account — switching instead", category: .session)
+            try await switchAccount(to: registered.pubkeyHex)
+            return
+        }
 
         // Hold Marmot's send/setup suspension across wallet deletion and every
         // host-owned cache mutation, not just the core database replacement.

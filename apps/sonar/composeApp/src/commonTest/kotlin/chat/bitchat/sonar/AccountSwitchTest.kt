@@ -93,6 +93,19 @@ class AccountSwitchTest {
         assertTrue(other.shortNpub.length < other.npub.length)
     }
 
+    /** Restoring a key that is already another account on this phone must be
+     *  found so the host switches instead of wiping the active slot. */
+    @Test
+    fun restoringARegisteredKeyIsFoundAsASwitchTarget() {
+        val other = account(b)
+        val all = listOf(account(a, active = true), other)
+        assertEquals(other, registeredAccountFor(all, other.npub))
+        assertEquals(other, registeredAccountFor(all, " ${other.npub} "))
+        assertEquals(other, registeredAccountFor(all, b))
+        assertNull(registeredAccountFor(all, "npub1somebodyelse"))
+        assertNull(registeredAccountFor(all, ""))
+    }
+
     /** Removing the active account hands over to the most recently active
      *  other one; the only account has no successor. */
     @Test

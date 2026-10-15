@@ -1357,6 +1357,14 @@ final class MarmotChatModel: ObservableObject {
             )
             return .unchanged
         }
+        // Already another account on this phone: a switch, never a replacement
+        // of the active slot (the store checks this too; this is the layer
+        // that would otherwise wipe).
+        if SonarAccountRegistry.snapshot().accounts.contains(where: { $0.pubkeyHex == incoming.pubkeyHex() }) {
+            SecureLogger.info("ℹ️ Identity import is a registered account — switching instead of replacing", category: .session)
+            try await switchAccount(toPubkeyHex: incoming.pubkeyHex())
+            return .unchanged
+        }
         // Block connectIfNeeded while the old node, database, and identity-bound
         // caches are invalidated and the replacement identity is connected.
         busy = true

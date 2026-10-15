@@ -73,6 +73,19 @@ fun accountDisplayName(account: SonarAccount, activeNick: String): String {
     return account.shortNpub
 }
 
+/**
+ * An nsec pasted into "Restore account" that belongs to an account already on
+ * this phone is a SWITCH to that account, never a replacement of the active
+ * slot: replacing would wipe the active store and write the other account's
+ * key under the active slot's names. Returns the registered account, or null
+ * when the key is new to this phone.
+ */
+fun registeredAccountFor(accounts: List<SonarAccount>, incomingNpub: String): SonarAccount? {
+    val npub = incomingNpub.trim()
+    if (npub.isEmpty()) return null
+    return accounts.firstOrNull { it.npub == npub || it.pubkeyHex == npub }
+}
+
 /** The account to switch to when [removedPubkeyHex] is the active one: the
  *  most recently active other account, or null when it is the only one. */
 fun nextActiveAfterRemoving(accounts: List<SonarAccount>, removedPubkeyHex: String): SonarAccount? =

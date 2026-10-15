@@ -1306,6 +1306,16 @@ Noise shape). Core registry `sonar_core::accounts` (`<data dir>/accounts.json`,
 - **Guard:** `sonar_core::accounts::tests::adding_a_registered_key_returns_it_unchanged`
 - **Origin:** PR multi-account switcher (2026-10-15).
 
+### QA-174 — Restoring a key that is already another account switches to it
+- **Platforms:** iOS, Android, desktop.
+- **Steps:** accounts A (active) and B registered. Settings → Restore account →
+  paste B's nsec.
+- **Expect:** the app switches to B. A's store is untouched and A's keychain
+  items still hold A's key. Replacing here would have wiped A's store and
+  written B's key under A's slot names, destroying A.
+- **Guard:** `AccountSwitchTest.restoringARegisteredKeyIsFoundAsASwitchTarget`
+- **Origin:** codex review of the multi-account switcher PR (2026-10-15).
+
 ### QA-171 — Removing an account clears only that account
 - **Platforms:** iOS, Android, desktop.
 - **Steps:** three accounts. Remove a NON-active one, then remove the active

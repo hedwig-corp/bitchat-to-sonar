@@ -5237,6 +5237,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                     sonarLog("Identity", "restore: key matches the signed-in account — nothing to do")
                     return@runCatching
                 }
+                // A key that is already ANOTHER account on this phone: switch to
+                // it. Replacing would wipe the active store and write this key
+                // under the active slot's secret names, destroying that account.
+                registeredAccountFor(accounts.ifEmpty { SonarCore.accounts().accounts }, expectedNpub)?.let { target ->
+                    sonarLog("Identity", "restore: key is a registered account — switching instead")
+                    val switched = kotlinx.coroutines.CompletableDeferred<Result<Unit>>()
+                    switchAccount(target.pubkeyHex) { switched.complete(it) }
+                    switched.await().getOrThrow()
+                    return@runCatching
+                }
 
                 // Unregister the legacy webhook while its node is still
                 // available, but preserve the device token for immediate

@@ -1168,8 +1168,15 @@ actual object SonarCore {
                     lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
                     return@write npub
                 }
+                // Already another account on this phone: a switch, never a
+                // replacement of the active slot (the host checks this too).
+                if (accounts().accounts.any { it.pubkeyHex == identity.pubkeyHex() }) {
+                    sonarLog("Identity", "import is a registered account — switching instead of replacing")
+                    lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
+                    return@write switchAccountLocked(identity.pubkeyHex())
+                }
                 closeNode()
-                val marmotDir = File(marmotDbPath()).parentFile!!
+                val activeStoreDir = File(marmotDbPath()).parentFile!!
                 try {
                     // Only the ACTIVE account's store: other accounts and the
                     // registry survive a restore of this one.
@@ -1178,7 +1185,7 @@ actual object SonarCore {
                     DesktopSecrets.put(nsecKey(), identity.nsec())
                     npub = identity.npub()
                     pubkeyHex = identity.pubkeyHex()
-                    tryRestoreAccountBackupLocked(identity, marmotDir).also {
+                    tryRestoreAccountBackupLocked(identity, activeStoreDir).also {
                         lastImportBackupOutcomeValue = it
                     }
                     // The row this restore replaced in place now holds the new
