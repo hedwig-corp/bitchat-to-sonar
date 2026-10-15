@@ -159,13 +159,16 @@ class NotificationService: SDKNotificationService {
                 return
             }
             do {
-                let (notifications, accountPubkeyHex) = try await Task.detached(priority: .userInitiated) { [weak self] in
-                    guard let self else { return (notifications: [DrainNotificationInfo](), accountPubkeyHex: nil) }
+                typealias WakeDrain = (notifications: [DrainNotificationInfo], accountPubkeyHex: String?)
+                let drain: WakeDrain = try await Task.detached(priority: .userInitiated) { [weak self] () throws -> WakeDrain in
+                    guard let self else { return (notifications: [], accountPubkeyHex: nil) }
                     return try self.collectMarmotNotificationsAfterWake(
                         hintGroupIdHex: hintGroupId,
                         hydrateAttempt: attempt
                     )
                 }.value
+                let notifications = drain.notifications
+                let accountPubkeyHex = drain.accountPubkeyHex
                 #if DEBUG
                 Self.logResidentMemory("after-wake")
                 #endif
