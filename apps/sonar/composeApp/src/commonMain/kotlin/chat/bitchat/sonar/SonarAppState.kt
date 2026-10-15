@@ -4946,6 +4946,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         accountChangeInFlight = true
     }
 
+    /** Release only when THIS caller acquired: a refused second tap must not
+     *  drop the gate the first mutation still holds. */
+    private fun endAccountChange(acquired: Boolean) {
+        if (acquired) accountChangeInFlight = false
+    }
+
     /** Re-read the registry. Cheap: the core actual caches until a write. */
     fun refreshAccounts() {
         val snap = SonarCore.accounts()
@@ -4966,9 +4972,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun switchAccount(pubkeyHex: String, onResult: (Result<Unit>) -> Unit = {}) {
         scope.launch {
             var marmotDeliveryGeneration: Long? = null
+            var acquired = false
             val result = runCatching {
                 if (SonarCore.accounts().active?.pubkeyHex == pubkeyHex) return@runCatching
                 beginAccountChange()
+                acquired = true
                 Notifier.prepareForAccountReplacement()
                 setAsideWalletsForAccountChange()
                 marmotDeliveryGeneration = tearDownAccountBoundState()
@@ -4985,7 +4993,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 finishAccountChange(newNpub)
             }
-            accountChangeInFlight = false
+            endAccountChange(acquired)
             marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
             onResult(result)
         }
@@ -4996,6 +5004,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun addAccount(nsec: String?, label: String?, onResult: (Result<Unit>) -> Unit = {}) {
         scope.launch {
             var marmotDeliveryGeneration: Long? = null
+            var acquired = false
             val result = runCatching {
                 val key = nsec?.trim()?.takeIf { it.isNotEmpty() }
                 if (key != null) {
@@ -5020,6 +5029,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     )
                 }
                 beginAccountChange()
+                acquired = true
                 Notifier.prepareForAccountReplacement()
                 setAsideWalletsForAccountChange()
                 marmotDeliveryGeneration = tearDownAccountBoundState()
@@ -5042,7 +5052,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     AccountBackupRestoreOutcome.Unchanged -> Unit
                 }
             }
-            accountChangeInFlight = false
+            endAccountChange(acquired)
             marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
             onResult(result)
         }

@@ -1385,12 +1385,12 @@ actual object SonarCore {
     /** Store whose backup is being recorded: the one the seal ran for, which
      *  is the active one unless a switch happened while the upload was out.
      *  Bookkeeping must land on the account that was uploaded. */
-    private fun sealedAccountDbPath(): String {
+    private fun sealedAccountDbPath(): String? {
         val sealed = sealedForPubkeyHex
-        if (sealed.isNotEmpty()) {
-            accounts().accounts.firstOrNull { it.pubkeyHex == sealed }?.let { return it.dbPath }
-        }
-        return marmotDbPath()
+        if (sealed.isEmpty()) return marmotDbPath()
+        // The sealed account was removed while the upload was out: there is
+        // no store to record against. Never substitute the active account.
+        return accounts().accounts.firstOrNull { it.pubkeyHex == sealed }?.dbPath
     }
 
     actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
@@ -1454,12 +1454,22 @@ actual object SonarCore {
     actual fun recordBackupSuccess(sizeBytes: Long?) {
         // The key never touches disk outside the Keystore-encrypted prefs; the
         // core needs it transiently to count messages in the SQLCipher index.
-        val dbKeyHex = runCatching { loadOrCreateDbKey() }.getOrNull()
-        uniffi.sonar_ffi.recordBackupSuccess(sealedAccountDbPath(), sizeBytes?.toULong(), dbKeyHex)
+        val target = sealedAccountDbPath() ?: run {
+            sonarLog("Backup", "upload finished for a removed account — not recorded")
+            return
+        }
+        // The key is only for the message count and must belong to the same
+        // store: a foreign (non-active) target records without a count.
+        val dbKeyHex = if (target == marmotDbPath()) runCatching { loadOrCreateDbKey() }.getOrNull() else null
+        uniffi.sonar_ffi.recordBackupSuccess(target, sizeBytes?.toULong(), dbKeyHex)
     }
 
     actual fun recordBackupFailure(error: String) {
-        uniffi.sonar_ffi.recordBackupFailure(sealedAccountDbPath(), error)
+        val target = sealedAccountDbPath() ?: run {
+            sonarLog("Backup", "upload failed for a removed account — not recorded")
+            return
+        }
+        uniffi.sonar_ffi.recordBackupFailure(target, error)
     }
 
     actual suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome = withContext(Dispatchers.IO) {
