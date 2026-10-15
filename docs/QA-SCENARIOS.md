@@ -1320,11 +1320,11 @@ real mint and need the maintainer's approval of the amounts.
 - **Expect:** first run: paid once, on a second quote — the CLI prints
   `{"requote":1,…}` before the payment; the mint shows the first quote
   UNPAID with no melt request and the second PAID; exactly one melt request.
-  The log has `melt <8 chars>: … not starting, QuoteExpired` and
+  The log has `melt <8 hex>: … not starting, QuoteExpired` and
   `re-quoting (1/2)`; no full quote id, invoice or proof in it, and the
-  expired quote's tag differs from the re-quote's (cdk-mintd quote ids are
-  UUIDv7, so their first 8 hex digits are the same for every quote issued
-  within ~65 s). `5x3`: "The
+  expired quote's tag differs from the re-quote's (the tag is a SHA-256
+  digest of the id: cdk-mintd quote ids are UUIDv7, so their first 8 hex
+  digits are the same for every quote issued within ~65 s). `5x3`: "The
   payment quote expired before it could be sent. Nothing was sent — try
   again." — never "Payment failed", no melt request, balance unchanged. The
   sheet left past 120 s pays on a fresh quote within the fee it showed (a
@@ -1340,7 +1340,8 @@ real mint and need the maintainer's approval of the amounts.
   `aRequoteAboveTheAgreedFeeStopsWithTheNewFee`,
   `requotingIsBoundedAndEndsInATypedQuoteExpired`, `aPendingSendIsNeverRequoted`,
   and the `CashuWalletServiceTests` mirrors. Log tags:
-  `a_quote_and_its_requote_get_different_log_tags` (fails: open, #666 QA).
+  `a_quote_and_its_requote_get_different_log_tags`,
+  `logs_name_a_quote_by_a_short_digest`.
 - **Origin:** 2026-10-13 incident review. Melt quotes live 120 s on
   mint.hedwig.sh; the wallet never looked at the expiry, and a preparation
   slower than its 60 s wait was cancelled (answering "Mint offline") instead
@@ -1359,8 +1360,9 @@ real mint and need the maintainer's approval of the amounts.
   no `Mint rejected outputs with inactive keyset`, no `Melt request failed
   with error: Inactive Keyset`, and no `saga recovery: … 1 failed` on the
   next connect.
-- **Guard:** `a_send_right_after_a_keyset_rotation_pays_and_leaves_no_saga`
-  (fails: open, #666 QA). FakeMint now refuses melt change outputs on an
+- **Guard:** `a_send_right_after_a_keyset_rotation_pays_and_leaves_no_saga`;
+  `a_preview_and_its_send_read_the_keysets_once` pins the cost (one keyset
+  read per preview and send). FakeMint now refuses melt change outputs on an
   inactive keyset, as cdk-mintd does.
 - **Origin:** #666 QA, 2026-10-15. The wallet still treated the retired
   keyset as active: CDK keeps keysets for an hour, and keysets loaded from its
@@ -1373,8 +1375,9 @@ real mint and need the maintainer's approval of the amounts.
   later connect makes a `/v1/restore` call and logs `Failed to recover saga`.
   A retry paid, once the refused request had refreshed the keysets. The unit
   tests missed it because `wallet_with_retired_fee_proofs` sets a zero cache
-  TTL. A probe of `warm_keysets` with `KeysetLoadPolicy::Refresh` makes the
-  guard pass; that fix is not on this branch.
+  TTL. Fixed in #666: `warm_keysets` reads the mint (`fetch_mint_info`, which
+  reports a failure instead of falling back to the cache) before a melt is
+  priced or sent, and one read serves 60 s.
 
 ## Core test stability
 

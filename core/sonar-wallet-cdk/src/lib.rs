@@ -384,6 +384,7 @@ impl CdkWallet {
             melt_grace: budget,
             melt_ttl_floor: budget,
             confirm_ttl_floor: budget,
+            keyset_refresh: budget,
         };
     }
 
@@ -1493,6 +1494,9 @@ struct Budgets {
     /// later is cancelled — no melt request was made — instead of confirmed
     /// into a quote about to expire.
     confirm_ttl_floor: Duration,
+    /// How long keysets read from the mint before a melt are trusted (see
+    /// [`warm_keysets`]).
+    keyset_refresh: Duration,
 }
 
 impl Budgets {
@@ -1508,6 +1512,8 @@ impl Budgets {
         melt_ttl_floor: Duration::from_secs(20),
         // The swap and the melt request: two healthy round trips with slack.
         confirm_ttl_floor: Duration::from_secs(10),
+        // A fee preview and the send that follows it share one read.
+        keyset_refresh: Duration::from_secs(60),
     };
 }
 
@@ -1539,6 +1545,8 @@ struct Reconciler {
     /// — with each other and with balance reads, so a dry run's short-lived
     /// reservation is never seen as money leaving.
     prepare: tokio::sync::Mutex<()>,
+    /// When a melt last read keysets from the mint (see [`warm_keysets`]).
+    keysets_read: Mutex<Option<Instant>>,
     /// The connector the current wallet talks through, for the one mint call
     /// CDK's wallet does not offer: proof states by Y, for proofs the local
     /// store no longer holds. Set on every build.
@@ -1555,6 +1563,7 @@ impl Default for Reconciler {
             confirming: Mutex::new(std::collections::HashSet::new()),
             sending: Mutex::new(std::collections::HashSet::new()),
             prepare: tokio::sync::Mutex::new(()),
+            keysets_read: Mutex::new(None),
             mint: Mutex::new(None),
         }
     }
@@ -1860,14 +1869,15 @@ fn map_melt_error(e: cdk::Error) -> WalletError {
     }
 }
 
-/// A melt quote id as logs show it: a prefix that tells quotes apart in one
-/// log without handing the mint-side record (amount, invoice) to whoever
-/// reads the log.
-pub(crate) fn quote_tag(quote_id: &str) -> &str {
-    quote_id
-        .char_indices()
-        .nth(8)
-        .map_or(quote_id, |(i, _)| &quote_id[..i])
+/// A melt quote id as logs show it: 8 hex digits of its SHA-256. It tells
+/// quotes apart in one log, and someone holding the full id can match it,
+/// but the log never hands out the id — and with it the mint-side record
+/// (amount, invoice). Not a prefix: cdk-mintd's ids are UUIDv7, whose
+/// leading digits are a timestamp every quote within about a minute shares,
+/// so a quote and its re-quote logged the same (#666 QA).
+pub(crate) fn quote_tag(quote_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(quote_id.as_bytes())[..4])
 }
 
 /// How long a quote expiring at `expiry` (unix seconds) has left.
@@ -1916,14 +1926,37 @@ impl MeltPrice {
     }
 }
 
-/// Keyset metadata, fresh, under a mint-call deadline. CDK's melt
-/// preparation refreshes stale metadata itself, with no deadline; doing it
-/// here first keeps the preparation local, so a hung mint fails this call
-/// instead of stalling a payment.
-async fn warm_keysets(wallet: &Wallet, budget: Duration) -> Result<()> {
-    bounded(budget, wallet.keysets(Default::default()))
-        .await
-        .map(|_| ())
+/// Keysets as the mint has them now, read under a mint-call deadline before
+/// a melt is priced or sent.
+///
+/// CDK keeps keysets for an hour and counts the ones it loads from its own
+/// database as fresh, so after the mint rotates its keyset a melt would
+/// still build its swap and change outputs on the retired one. Against
+/// cdk-mintd 0.18.1 (#666 QA) the swap was refused, retried and paid, then
+/// the melt was refused InactiveKeyset: the send failed after paying the
+/// swap fee, and the swap's saga stayed open. Reading the keysets first
+/// prevents that and keeps CDK's own preparation local, so a hung mint
+/// fails here, under the deadline, instead of stalling a payment.
+///
+/// `fetch_mint_info` reads the mint (info and keysets) and reports a
+/// failure, where `KeysetLoadPolicy::Refresh` would quietly fall back to the
+/// cache. One read serves `keyset_refresh` (60 s), so a fee preview and the
+/// send after it cost one round trip, not two.
+async fn warm_keysets(wallet: &Wallet, reconciler: &Reconciler, budgets: Budgets) -> Result<()> {
+    let fresh = reconciler
+        .keysets_read
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|at| at.elapsed() < budgets.keyset_refresh);
+    if fresh {
+        return Ok(());
+    }
+    bounded(budgets.mint_call, wallet.fetch_mint_info()).await?;
+    *reconciler
+        .keysets_read
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    Ok(())
 }
 
 /// CDK 0.18.1's `MeltSaga::prepare` reserves the melt quote before it
@@ -2075,7 +2108,7 @@ async fn price_melt(
     budgets: Budgets,
     quote: &cdk::wallet::MeltQuote,
 ) -> Result<MeltPrice> {
-    warm_keysets(wallet, budgets.mint_call).await?;
+    warm_keysets(wallet, reconciler, budgets).await?;
     let _prepare = reconciler.prepare.lock().await;
     match prepare_funded_melt(wallet, &quote.id, HashMap::new()).await {
         Ok(melt) => {
@@ -2126,7 +2159,7 @@ impl MeltJob {
         let quote_id = &self.quote_id;
         let tag = quote_tag(quote_id);
 
-        if let Err(e) = warm_keysets(wallet, self.budgets.mint_call).await {
+        if let Err(e) = warm_keysets(wallet, reconciler, self.budgets).await {
             tracing::warn!("melt {tag}: keyset metadata unavailable, nothing sent: {e}");
             return Err(e);
         }
@@ -3180,7 +3213,7 @@ impl WalletBackend for CdkWallet {
                 "this prepared send did not come from the CDK backend".into(),
             ));
         };
-        let tag = quote_tag(quote_id).to_string();
+        let tag = quote_tag(quote_id);
         let note = (!note.is_empty()).then(|| note.to_string());
         let mut metadata = HashMap::new();
         if let Some(note) = &note {
@@ -5598,12 +5631,33 @@ mod tests {
     }
 
     #[test]
-    fn logs_name_a_quote_by_a_short_prefix() {
+    fn logs_name_a_quote_by_a_short_digest() {
+        let id = "8f3a1c2d-9b7e-4c1a-a5d2-0e9f8b7c6d5e";
+        let tag = quote_tag(id);
+        assert_eq!(tag.len(), 8);
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()), "{tag}");
+        assert_eq!(tag, quote_tag(id), "one quote, one tag");
+        assert!(!id.contains(&tag), "the tag gives away no part of the id");
+        assert_ne!(quote_tag("melt1"), quote_tag("melt2"));
+    }
+
+    /// A fee preview and the send after it read the mint's keysets once:
+    /// the read before a melt is shared for `keyset_refresh`.
+    #[test]
+    fn a_preview_and_its_send_read_the_keysets_once() {
+        let dir = scratch("keysets-read-once");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let before = mint.calls("get_mint_keysets");
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
         assert_eq!(
-            quote_tag("8f3a1c2d-9b7e-4c1a-a5d2-0e9f8b7c6d5e"),
-            "8f3a1c2d"
+            w.send(&prepared, "").unwrap().status,
+            PaymentStatus::Complete
         );
-        assert_eq!(quote_tag("melt1"), "melt1");
+        assert_eq!(mint.calls("get_mint_keysets") - before, 1);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// cdk-mintd 0.18.1 names quotes by UUIDv7, whose first 8 hex digits are
