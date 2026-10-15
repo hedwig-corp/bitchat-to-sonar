@@ -1283,11 +1283,19 @@ real mint and need the maintainer's approval of the amounts.
   quote and no melt request, the balance is unchanged and nothing reads as
   pending. Max pays the largest amount the fees allow. A send that fits pays
   once, and the mint's fee check passes (it refuses a melt that underpays).
-- **Not covered end to end:** proofs on a keyset the mint has since RETIRED
-  (the incident's exact shape, where CDK 0.18.1 skips fees in its selection)
-  need a mint rotated after funding; cdk-mintd only creates retired keysets
-  at build (`[[fake_wallet.keyset_rotations]]`), so the guard is the unit
-  test against `FakeMint::rotate_keyset`.
+- **Retired keyset (the incident's exact shape):** fund the wallet, stop the
+  mint, `cdk-mintd -w <dir> config apply --file <toml with input_fee_ppk = 0>`
+  and start it again. cdk-mintd 0.18.1 rotates on a fee mismatch at startup
+  ("Rotating keyset for unit sat due to fee mismatch"), and `curl
+  <mint>/v1/keysets` then shows the funded keyset inactive at 1000 ppk.
+  The wallet does not see the rotation by itself: CDK keeps keysets for an
+  hour, and ones loaded from its database count as fresh. Receive 1 sat and
+  `sync`, so the mint refuses its outputs and CDK refreshes ("Active keyset
+  changed"); for a wallet that skips this, see QA-167. Then repeat the steps
+  above. Expect the log line `CDK selected N proofs that do not cover their
+  own input fee … topping the selection up`, the same refusal at balance −
+  reserve − 20, and a send that fits melts the retired proofs directly
+  (`swap first: false`) and pays once.
 - **Guard:** `incident_near_exact_balance_with_retired_fee_proofs_is_refused_up_front`,
   `retired_fee_proofs_are_swapped_then_paid_when_the_fee_fits`,
   `proofs_held_by_a_send_in_flight_are_not_spendable`, `a_fee_preview_holds_nothing`,
@@ -1313,7 +1321,10 @@ real mint and need the maintainer's approval of the amounts.
   `{"requote":1,…}` before the payment; the mint shows the first quote
   UNPAID with no melt request and the second PAID; exactly one melt request.
   The log has `melt <8 chars>: … not starting, QuoteExpired` and
-  `re-quoting (1/2)`; no full quote id, invoice or proof in it. `5x3`: "The
+  `re-quoting (1/2)`; no full quote id, invoice or proof in it, and the
+  expired quote's tag differs from the re-quote's (cdk-mintd quote ids are
+  UUIDv7, so their first 8 hex digits are the same for every quote issued
+  within ~65 s). `5x3`: "The
   payment quote expired before it could be sent. Nothing was sent — try
   again." — never "Payment failed", no melt request, balance unchanged. The
   sheet left past 120 s pays on a fresh quote within the fee it showed (a
@@ -1328,11 +1339,42 @@ real mint and need the maintainer's approval of the amounts.
   app side `CashuWalletEngineTest.aQuoteThatExpiresUnsentIsRequotedAndTheFreshQuotePays`,
   `aRequoteAboveTheAgreedFeeStopsWithTheNewFee`,
   `requotingIsBoundedAndEndsInATypedQuoteExpired`, `aPendingSendIsNeverRequoted`,
-  and the `CashuWalletServiceTests` mirrors.
+  and the `CashuWalletServiceTests` mirrors. Log tags:
+  `a_quote_and_its_requote_get_different_log_tags` (fails: open, #666 QA).
 - **Origin:** 2026-10-13 incident review. Melt quotes live 120 s on
   mint.hedwig.sh; the wallet never looked at the expiry, and a preparation
   slower than its 60 s wait was cancelled (answering "Mint offline") instead
-  of confirmed.
+  of confirmed. #666 QA against cdk-mintd 0.18.1: the expired quote, its
+  re-quote, and all three quotes of a `5x3` run logged under one tag
+  (`melt 01a1406b`, `melt 01a1406c`).
+
+### QA-167 — The first send after the mint rotates its keyset pays
+- **Platforms:** both (one Rust core; headless with `sonar-cashu-cli`
+  against a local `cdk-mintd` 0.18.1 fakewallet mint).
+- **Steps:** fund the wallet on a 1000 ppk keyset. Stop the mint, `config
+  apply` a document with `input_fee_ppk = 0`, start it (it rotates; see
+  QA-165). Without any receive or sync first, pay a foreign invoice that fits
+  the balance with the fee shown. Then run any command again and read the log.
+- **Expect:** the send pays once and the mint shows the quote PAID. The log has
+  no `Mint rejected outputs with inactive keyset`, no `Melt request failed
+  with error: Inactive Keyset`, and no `saga recovery: … 1 failed` on the
+  next connect.
+- **Guard:** `a_send_right_after_a_keyset_rotation_pays_and_leaves_no_saga`
+  (fails: open, #666 QA). FakeMint now refuses melt change outputs on an
+  inactive keyset, as cdk-mintd does.
+- **Origin:** #666 QA, 2026-10-15. The wallet still treated the retired
+  keyset as active: CDK keeps keysets for an hour, and keysets loaded from its
+  database count as fresh. `warm_keysets` uses CDK's default
+  `CacheThenNetwork`, so it re-reads nothing. The pre-melt swap was refused
+  InactiveKeyset. CDK refreshed and retried the swap, paying its 12-sat fee,
+  then sent the melt's change outputs on the retired keyset. The mint refused
+  the melt. The send ended Failed with nothing paid, balance 188 → 176, and
+  the quote UNPAID. The refused swap's saga stayed `swap_requested`, so every
+  later connect makes a `/v1/restore` call and logs `Failed to recover saga`.
+  A retry paid, once the refused request had refreshed the keysets. The unit
+  tests missed it because `wallet_with_retired_fee_proofs` sets a zero cache
+  TTL. A probe of `warm_keysets` with `KeysetLoadPolicy::Refresh` makes the
+  guard pass; that fix is not on this branch.
 
 ## Core test stability
 

@@ -867,6 +867,23 @@ impl MintConnector for FakeMint {
                 "fake mint: melt inputs {inputs_total} < amount + reserve {owed} + input fee {fee}"
             )));
         }
+        // cdk-mintd 0.18.1 also checks the NUT-08 change outputs at melt
+        // setup, before paying: one naming a keyset it no longer signs with
+        // is refused InactiveKeyset and nothing moves.
+        let outputs = request.outputs().iter().flatten();
+        for output in outputs {
+            let active = self
+                .with(|s| {
+                    s.keysets
+                        .iter()
+                        .find(|k| k.keyset.id == output.keyset_id)
+                        .map(FakeKeyset::active)
+                })
+                .ok_or(Error::UnknownKeySet)?;
+            if !active {
+                return Err(Error::InactiveKeyset);
+            }
+        }
         let method = self.with(|s| {
             let q = s.melt_quotes.get_mut(&quote_id)?;
             match &outcome {

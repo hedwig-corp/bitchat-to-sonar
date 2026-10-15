@@ -5235,6 +5235,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The same send from a wallet that has not yet seen the rotation: CDK's
+    /// own metadata cache, not the zero TTL `wallet_with_retired_fee_proofs`
+    /// sets. CDK keeps keysets for an hour, and keysets loaded from its
+    /// database count as fresh, so nothing re-reads them until the mint
+    /// refuses an output. Found against a real cdk-mintd 0.18.1 (#666 QA,
+    /// QA-165): the pre-melt swap was refused InactiveKeyset, CDK refreshed
+    /// and retried it (paying its fee), then sent the melt's change outputs
+    /// on the retired keyset. The mint refused the melt, the send ended
+    /// Failed with nothing paid, and the refused swap's saga stayed open,
+    /// failing recovery on every later connect. The first send after any
+    /// rotation must pay like the second one does.
+    #[test]
+    fn a_send_right_after_a_keyset_rotation_pays_and_leaves_no_saga() {
+        let dir = scratch("rotation-stale-keysets");
+        let mint = Arc::new(test_mint::FakeMint::with_input_fee(1_000));
+        let mut cfg = config();
+        cfg.working_dir = dir.clone();
+        let w = CdkWallet::with_connector(cfg, "https://mint.example.com", mint.clone()).unwrap();
+        w.connect().unwrap();
+        for _ in 0..5 {
+            receive_paid_bolt11(&w, &mint, 255);
+        }
+        mint.rotate_keyset(0);
+        let balance = w.balance().unwrap().confirmed_sats;
+        let proofs = u64::try_from(unspent_proofs(&w)).unwrap();
+        // Room for the reserve and a sat for every proof, plus 10.
+        let amount = balance - 2 - proofs - 10;
+        let prepared = prepare(&w, &test_invoice(Some(amount * 1_000)), None).unwrap();
+        let fee = prepared.fees_sats.unwrap();
+        assert!(prepared.amount_sats + fee <= balance, "fee {fee}");
+
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete, "{payment:?}");
+        assert_eq!(
+            mint.melt_quote_state(quote_id_of(&prepared)),
+            Some(MeltQuoteState::Paid)
+        );
+        let wallet = w.wallet().unwrap();
+        let sagas = w
+            .rt()
+            .block_on(wallet.localstore.get_incomplete_sagas())
+            .unwrap();
+        assert!(sagas.is_empty(), "{} open sagas", sagas.len());
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Proofs a send in flight holds are not spendable. A second send that
     /// only the TOTAL could cover is refused by the hosts' check, because
     /// the balance and the price both count unreserved proofs only.
@@ -5557,5 +5604,24 @@ mod tests {
             "8f3a1c2d"
         );
         assert_eq!(quote_tag("melt1"), "melt1");
+    }
+
+    /// cdk-mintd 0.18.1 names quotes by UUIDv7, whose first 8 hex digits are
+    /// the top of a millisecond timestamp: every quote a mint issues within
+    /// ~65 s shares them. These two are QA-166's run against a real mint
+    /// (#666 QA), 40 ms apart: the quote refused QuoteExpired and its
+    /// re-quote, which paid. Both logged as `melt 01a1406b`, so the log
+    /// could not say which one was sent. Updating this to pass means
+    /// changing `logs_name_a_quote_by_a_short_prefix` too.
+    #[test]
+    fn a_quote_and_its_requote_get_different_log_tags() {
+        let expired = "01a1406b-ee7d-73cc-aae6-a8b6aaa30098";
+        let requoted = "01a1406b-eea4-77ca-ab0f-db1d985b2e79";
+        for id in [expired, requoted] {
+            let tag = quote_tag(id);
+            assert!(tag.len() <= 8, "{tag:?} is too long for a log tag");
+            assert!(tag.len() < id.len(), "{tag:?} is the whole id");
+        }
+        assert_ne!(quote_tag(expired), quote_tag(requoted));
     }
 }
