@@ -1346,7 +1346,8 @@ public protocol SonarCashuWalletProtocol: AnyObject, Sendable {
      * Pay a prepared send — the one spending call. A result with
      * `status: Pending` is NOT a failure: the payment may be routing, and
      * its outcome arrives as an event with the same `id`. Never retry a
-     * Pending send with a new quote; that can pay twice.
+     * Pending send with a new quote; that can pay twice. `QuoteExpired` and
+     * `FeeChanged` are the errors that guarantee nothing was sent.
      */
     func send(prepared: WalletPreparedSend, note: String) throws  -> WalletPayment
 
@@ -1608,7 +1609,8 @@ open func restoreOfferBackups(backups: [String])throws  -> UInt32  {
      * Pay a prepared send — the one spending call. A result with
      * `status: Pending` is NOT a failure: the payment may be routing, and
      * its outcome arrives as an event with the same `id`. Never retry a
-     * Pending send with a new quote; that can pay twice.
+     * Pending send with a new quote; that can pay twice. `QuoteExpired` and
+     * `FeeChanged` are the errors that guarantee nothing was sent.
      */
 open func send(prepared: WalletPreparedSend, note: String)throws  -> WalletPayment  {
     return try  FfiConverterTypeWalletPayment_lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
@@ -7202,24 +7204,51 @@ public func FfiConverterTypeWalletPayment_lower(_ value: WalletPayment) -> RustB
 
 /**
  * A priced send, from `prepare_send`: what the user is agreeing to. Pass it
- * back unchanged to `send`. `fees_sats` is the mint's fee RESERVE — the most
- * the payment can cost on top of `amount_sats`; unused reserve returns.
+ * back to `send`.
  */
 public struct WalletPreparedSend: Equatable, Hashable {
     public var quoteId: String
     public var destination: String
     public var kind: WalletDestinationKind
     public var amountSats: UInt64
+    /**
+     * The most the payment can cost on top of `amount_sats`: the mint's
+     * Lightning fee reserve (unused reserve returns) plus its input fees on
+     * the ecash this payment spends. Check `amount_sats + fees_sats`
+     * against the balance. On the way back into `send` it is the fee the
+     * user agreed to: `send` pays no more (`FeeChanged`), so a host may
+     * raise it to a ceiling the user accepted, never lower it to hide a fee.
+     */
     public var feesSats: UInt64?
+    /**
+     * When the quote stops being payable (unix seconds, the mint's clock);
+     * `send` answers `QuoteExpired` once it is too close. For display and
+     * diagnostics: the wallet enforces its own stored copy.
+     */
+    public var expiresAtSecs: UInt64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(quoteId: String, destination: String, kind: WalletDestinationKind, amountSats: UInt64, feesSats: UInt64?) {
+    public init(quoteId: String, destination: String, kind: WalletDestinationKind, amountSats: UInt64,
+        /**
+         * The most the payment can cost on top of `amount_sats`: the mint's
+         * Lightning fee reserve (unused reserve returns) plus its input fees on
+         * the ecash this payment spends. Check `amount_sats + fees_sats`
+         * against the balance. On the way back into `send` it is the fee the
+         * user agreed to: `send` pays no more (`FeeChanged`), so a host may
+         * raise it to a ceiling the user accepted, never lower it to hide a fee.
+         */feesSats: UInt64?,
+        /**
+         * When the quote stops being payable (unix seconds, the mint's clock);
+         * `send` answers `QuoteExpired` once it is too close. For display and
+         * diagnostics: the wallet enforces its own stored copy.
+         */expiresAtSecs: UInt64?) {
         self.quoteId = quoteId
         self.destination = destination
         self.kind = kind
         self.amountSats = amountSats
         self.feesSats = feesSats
+        self.expiresAtSecs = expiresAtSecs
     }
 
 
@@ -7242,7 +7271,8 @@ public struct FfiConverterTypeWalletPreparedSend: FfiConverterRustBuffer {
                 destination: FfiConverterString.read(from: &buf),
                 kind: FfiConverterTypeWalletDestinationKind.read(from: &buf),
                 amountSats: FfiConverterUInt64.read(from: &buf),
-                feesSats: FfiConverterOptionUInt64.read(from: &buf)
+                feesSats: FfiConverterOptionUInt64.read(from: &buf),
+                expiresAtSecs: FfiConverterOptionUInt64.read(from: &buf)
         )
     }
 
@@ -7252,6 +7282,7 @@ public struct FfiConverterTypeWalletPreparedSend: FfiConverterRustBuffer {
         FfiConverterTypeWalletDestinationKind.write(value.kind, into: &buf)
         FfiConverterUInt64.write(value.amountSats, into: &buf)
         FfiConverterOptionUInt64.write(value.feesSats, into: &buf)
+        FfiConverterOptionUInt64.write(value.expiresAtSecs, into: &buf)
     }
 }
 
@@ -8368,8 +8399,10 @@ public func FfiConverterTypeWalletDestinationKind_lower(_ value: WalletDestinati
 /**
  * Why a wallet call failed. Non-flat, with typed variants the hosts branch
  * on: `InsufficientFunds` sizes a send down, `NotConnected`/`Timeout`/
- * `Network` drive the reconnect UI. Fields are named `reason`, never
- * `message` — that name collides with `Throwable.message` in Kotlin.
+ * `Network` drive the reconnect UI, `QuoteExpired` re-quotes a send and
+ * `FeeChanged` asks about a new fee — neither of those two sent anything.
+ * Fields are named `reason`, never `message` — that name collides with
+ * `Throwable.message` in Kotlin.
  */
 public enum WalletFfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
@@ -8389,6 +8422,17 @@ public enum WalletFfiError: Swift.Error, Equatable, Hashable, Foundation.Localiz
     )
     case Timeout
     case Backend(reason: String
+    )
+    /**
+     * The quote expired, or was too close to expiry to pay safely, before
+     * any payment request left the wallet. Nothing was sent: prepare again.
+     */
+    case QuoteExpired
+    /**
+     * Paying would cost more in fees than the `fees_sats` passed to `send`.
+     * Nothing was sent; `fees_sats` here is the new fee to ask about.
+     */
+    case FeeChanged(feesSats: UInt64
     )
 
 
@@ -8439,6 +8483,10 @@ public struct FfiConverterTypeWalletFfiError: FfiConverterRustBuffer {
         case 8: return .Timeout
         case 9: return .Backend(
             reason: try FfiConverterString.read(from: &buf)
+            )
+        case 10: return .QuoteExpired
+        case 11: return .FeeChanged(
+            feesSats: try FfiConverterUInt64.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -8492,6 +8540,15 @@ public struct FfiConverterTypeWalletFfiError: FfiConverterRustBuffer {
         case let .Backend(reason):
             writeInt(&buf, Int32(9))
             FfiConverterString.write(reason, into: &buf)
+
+
+        case .QuoteExpired:
+            writeInt(&buf, Int32(10))
+
+
+        case let .FeeChanged(feesSats):
+            writeInt(&buf, Int32(11))
+            FfiConverterUInt64.write(feesSats, into: &buf)
 
         }
     }
@@ -11597,7 +11654,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_restore_offer_backups() != 23246) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_send() != 43113) {
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_send() != 291) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_set_listener() != 39372) {

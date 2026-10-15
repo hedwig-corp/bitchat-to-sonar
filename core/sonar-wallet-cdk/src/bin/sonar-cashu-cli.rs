@@ -47,7 +47,9 @@ enum Command {
     Receive(ReceiveArgs),
     /// Price a send without paying it.
     Quote(SendArgs),
-    /// Pay a destination (prepare, enforce the cap, execute).
+    /// Pay a destination the way the apps do: prepare, check amount + fee
+    /// against the balance, enforce the cap, execute; re-quote (at most
+    /// twice) when the quote expires before anything was sent.
     Send(SendArgs),
     /// Recent payments, newest first.
     Payments,
@@ -130,6 +132,18 @@ fn enforce_fee_cap(max: Option<u64>, quoted: Option<u64>) -> Result<(), WalletEr
         }
     }
     Ok(())
+}
+
+/// Fresh quotes `send` may take after `QuoteExpired` — the same bound the
+/// apps use (`CashuWalletService` / `CashuWalletEngine`).
+const MAX_REQUOTES: usize = 2;
+
+fn quote_json(prepared: &sonar_wallet::PreparedSend) -> serde_json::Value {
+    json!({
+        "amount_sats": prepared.amount_sats,
+        "fees_sats": prepared.fees_sats,
+        "expires_at_secs": prepared.expires_at_secs,
+    })
 }
 
 fn main() -> Result<(), WalletError> {
@@ -254,28 +268,44 @@ fn run(wallet: &CdkWallet, command: &Command) -> Result<(), WalletError> {
             let destination = wallet.parse_destination(&args.destination)?;
             let prepared = wallet.prepare_send(&destination, args.amount_sats)?;
             enforce_fee_cap(args.max_fee_sats, prepared.fees_sats)?;
-            println!(
-                "{}",
-                json!({
-                    "amount_sats": prepared.amount_sats,
-                    "fees_sats": prepared.fees_sats,
-                })
-            );
+            let balance = wallet.balance()?.confirmed_sats;
+            let mut quote = quote_json(&prepared);
+            quote["spendable_sats"] = json!(balance);
+            quote["affordable"] =
+                json!(prepared.amount_sats + prepared.fees_sats.unwrap_or(0) <= balance);
+            println!("{quote}");
         }
         Command::Send(args) => {
             let destination = wallet.parse_destination(&args.destination)?;
-            let prepared = wallet.prepare_send(&destination, args.amount_sats)?;
-            println!(
-                "{}",
-                json!({
-                    "quote": {
-                        "amount_sats": prepared.amount_sats,
-                        "fees_sats": prepared.fees_sats,
+            let mut requotes = 0;
+            let payment = loop {
+                let mut prepared = wallet.prepare_send(&destination, args.amount_sats)?;
+                println!("{}", json!({ "quote": quote_json(&prepared) }));
+                let balance = wallet.balance()?.confirmed_sats;
+                let fee = prepared.fees_sats.unwrap_or(0);
+                if prepared.amount_sats.saturating_add(fee) > balance {
+                    println!(
+                        "{}",
+                        json!({ "refused": "amount plus fee exceeds the balance", "spendable_sats": balance })
+                    );
+                    return Err(WalletError::InsufficientFunds);
+                }
+                enforce_fee_cap(args.max_fee_sats, prepared.fees_sats)?;
+                // The cap is the fee agreed to: `send` pays no more.
+                if let Some(max) = args.max_fee_sats {
+                    prepared.fees_sats = Some(max);
+                }
+                match wallet.send(&prepared, "") {
+                    Err(WalletError::QuoteExpired) if requotes < MAX_REQUOTES => {
+                        requotes += 1;
+                        println!(
+                            "{}",
+                            json!({ "requote": requotes, "reason": "quote expired before anything was sent" })
+                        );
                     }
-                })
-            );
-            enforce_fee_cap(args.max_fee_sats, prepared.fees_sats)?;
-            let payment = wallet.send(&prepared, "")?;
+                    other => break other?,
+                }
+            };
             println!("{}", payment_json(&payment));
         }
         Command::Payments => {
