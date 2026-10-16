@@ -1055,11 +1055,11 @@ share a zone with the app and report the zone the app shared with it.
     a latched node refuses the wake drain at once.
   - `dropping_a_node_does_not_wait_for_blocking_tasks` and
     `aborted_connect_returns_without_waiting_for_blocking_tasks`
-    (`core/sonar-ffi`): releasing a node, or a connect the host aborted, no
-    longer joins tokio's blocking pool. The relay dial resolves hostnames
-    there, so on a stalled cellular resolver the NSE's yield used to release
-    the store lock only after the resolver timed out. The first test fails in
-    20 s with tokio's own drop (measured).
+    (`core/sonar-ffi`): releasing a node, or a connect the host aborted,
+    waits at most 2 s for tokio's blocking pool instead of indefinitely. The
+    relay dial resolves hostnames there, so on a stalled cellular resolver
+    the NSE's yield used to release the store lock only after the resolver
+    timed out. The first test fails in 20 s with tokio's own drop (measured).
   - `MarmotStoreLockTests.acquireExclusiveAsksHolderToYield` (iOS): the app's
     blocking acquire posts the yield notification before it parks, and a
     holder that releases on it lets the acquire through.
