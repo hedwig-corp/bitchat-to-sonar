@@ -1007,15 +1007,17 @@ impl SonarSuspendLatch {
 /// blocking — call from a background queue in Swift, never the main thread.
 #[derive(uniffi::Object)]
 pub struct SonarNode {
-    /// `ManuallyDrop` so `Drop` can hand the runtime to `shutdown_background`
+    /// `ManuallyDrop` so `Drop` can hand the runtime to `shutdown_timeout`
     /// instead of letting tokio's own drop run. That drop WAITS for every
     /// in-flight blocking-pool task, and the relay dial resolves hostnames
     /// with `getaddrinfo` on that pool: on a cellular link with a stalled
     /// resolver, releasing a node (and with it the SQLCipher store and, in
     /// the NSE, the cross-process store lock) would park for the resolver's
     /// timeout, tens of seconds, after every relay future had already been
-    /// cancelled. `shutdown_background` cancels the async tasks the same way
-    /// and lets the blocking threads finish on their own.
+    /// cancelled. The bounded shutdown still waits for the workers to drop
+    /// their tasks (milliseconds; that is what keeps "the SQLCipher handle is
+    /// closed when drop returns" true for the store lock), and only a stalled
+    /// resolver ever reaches the cap.
     runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
     client: SonarClient,
     /// One-way suspend latch (`interrupt_for_suspend`). Long-blocking relay
@@ -1032,12 +1034,17 @@ pub struct SonarNode {
     call: Mutex<Option<Arc<sonar_core::call::engine::CallEngine>>>,
 }
 
+/// How long releasing a node may wait for the runtime's threads. Task drops
+/// finish in milliseconds; only a blocking-pool `getaddrinfo` on a stalled
+/// resolver runs into this, and 2 s is far below any resolver timeout.
+const RUNTIME_SHUTDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Drop for SonarNode {
     fn drop(&mut self) {
         // SAFETY: `runtime` is never touched again — this is the only take,
         // and the field is `ManuallyDrop` precisely so no second drop runs.
         let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
-        runtime.shutdown_background();
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_CAP);
     }
 }
 
@@ -1153,7 +1160,7 @@ impl SonarNode {
                 // Same reason as `Drop`: a connect the host aborted (or that
                 // timed out) must not then wait on a stalled DNS lookup
                 // before the caller can release the store lock.
-                runtime.shutdown_background();
+                runtime.shutdown_timeout(RUNTIME_SHUTDOWN_CAP);
                 return Err(err);
             }
         };
@@ -4125,6 +4132,7 @@ mod tests {
             .expect("blocking task started");
         let dropped_at = std::time::Instant::now();
         drop(node);
+        // Bounded by RUNTIME_SHUTDOWN_CAP (2 s), not by the 20 s park above.
         assert!(
             dropped_at.elapsed() < std::time::Duration::from_secs(5),
             "node drop waited on the blocking pool ({}s)",
