@@ -6,11 +6,11 @@ struct SwapUpdatedRequest: Codable {
     let status: String
 }
 
-class SwapUpdatedTask : TaskProtocol {
+class SwapUpdatedTask : TaskProtocol, NwcEventListener {
     fileprivate let TAG = "SwapUpdatedTask"
-    
+
     private let pollingInterval: TimeInterval = 5.0
-    
+
     internal var payload: String
     internal var contentHandler: ((UNNotificationContent) -> Void)?
     internal var bestAttemptContent: UNMutableNotificationContent?
@@ -18,20 +18,26 @@ class SwapUpdatedTask : TaskProtocol {
     internal var request: SwapUpdatedRequest? = nil
     internal var notified: Bool = false
     private var pollingTimer: Timer?
-    
+    private var zapInvoice: String? = nil
+    private var nwcService: BindingNwcService? = nil
+
     init(payload: String, logger: ServiceLogger, contentHandler: ((UNNotificationContent) -> Void)? = nil, bestAttemptContent: UNMutableNotificationContent? = nil) {
         self.payload = payload
         self.contentHandler = contentHandler
         self.bestAttemptContent = bestAttemptContent
         self.logger = logger
     }
-    
-    func start(liquidSDK: BindingLiquidSdk) throws {
+
+    func start(liquidSDK: BindingLiquidSdk, pluginConfigs: PluginConfigs) throws {
+        self.nwcService = try PluginManager.nwc(liquidSDK: liquidSDK, pluginConfigs: pluginConfigs)
+        if let nwcService = nwcService {
+            let _ = nwcService.addEventListener(listener: self)
+        }
         do {
-            self.request = try JSONDecoder().decode(SwapUpdatedRequest.self, from: self.payload.data(using: .utf8)!)
+            request = try JSONDecoder().decode(SwapUpdatedRequest.self, from: payload.data(using: .utf8)!)
         } catch let e {
-            self.logger.log(tag: TAG, line: "Failed to decode payload: \(e)", level: "ERROR")
-            self.onShutdown()
+            logger.log(tag: TAG, line: "Failed to decode payload: \(e)", level: "ERROR")
+            onShutdown()
             throw e
         }
 
@@ -50,13 +56,16 @@ class SwapUpdatedTask : TaskProtocol {
                 if let payment = try liquidSDK.getPayment(req: .swapId(swapId: request.id)) {
                     switch payment.status {
                     case .complete:
+                        self.logger.log(tag: TAG, line: "Payment complete", level: "INFO")
                         onEvent(e: SdkEvent.paymentSucceeded(details: payment))
                         self.stopPolling()
                     case .waitingFeeAcceptance:
+                        self.logger.log(tag: TAG, line: "Payment waiting fee acceptance", level: "INFO")
                         onEvent(e: SdkEvent.paymentWaitingFeeAcceptance(details: payment))
                         self.stopPolling()
                     case .pending:
                         if paymentClaimIsBroadcasted(details: payment.details) {
+                            self.logger.log(tag: TAG, line: "Payment pending with claim broadcasted", level: "INFO")
                             onEvent(e: SdkEvent.paymentWaitingConfirmation(details: payment))
                             self.stopPolling()
                         }
@@ -71,11 +80,11 @@ class SwapUpdatedTask : TaskProtocol {
 
         pollingTimer?.fire()
     }
-    
+
     private func stopPolling(withError error: Error? = nil) {
         pollingTimer?.invalidate()
         pollingTimer = nil
-        
+
         if let error = error {
             logger.log(tag: TAG, line: "Polling stopped with error: \(error)", level: "ERROR")
             onShutdown()
@@ -83,20 +92,21 @@ class SwapUpdatedTask : TaskProtocol {
     }
 
     public func onEvent(e: SdkEvent) {
-        if let swapIdHash = self.request?.id {
+        if let swapIdHash = request?.id {
             switch e {
             case .paymentWaitingConfirmation(details: let payment), .paymentSucceeded(details: let payment):
-                let swapId = self.getSwapId(details: payment.details)
+                let swapId = getSwapId(details: payment.details)
                 if swapIdHash == swapId?.sha256() {
-                    self.logger.log(tag: TAG, line: "Received payment event: \(swapIdHash) \(payment.status)", level: "INFO")
-                    self.notifySuccess(payment: payment)
+                    logger.log(tag: TAG, line: "Received payment event: \(swapIdHash) \(payment.status)", level: "INFO")
+                    notifySuccess(payment: payment)
+                    checkAndTrackZap(payment: payment)
                 }
                 break
             case .paymentWaitingFeeAcceptance(details: let payment):
-                let swapId = self.getSwapId(details: payment.details)
+                let swapId = getSwapId(details: payment.details)
                 if swapIdHash == swapId?.sha256() {
-                    self.logger.log(tag: TAG, line: "Received payment event: \(swapIdHash) \(payment.status)", level: "INFO")
-                    self.notifyPaymentWaitingFeeAcceptance(payment: payment)
+                    logger.log(tag: TAG, line: "Received payment event: \(swapIdHash) \(payment.status)", level: "INFO")
+                    notifyPaymentWaitingFeeAcceptance(payment: payment)
                 }
                 break
             default:
@@ -110,8 +120,20 @@ class SwapUpdatedTask : TaskProtocol {
             switch details {
             case let .bitcoin(swapId, _, _, _, _, _, _, _, _, _):
                 return swapId
-            case let .lightning(swapId, _, _, _, _, _, _, _, _, _, _, _, _, _):
+            case let .lightning(swapId, _, _, _, _, _, _, _, _, _, _, _, _, _, _):
                 return swapId
+            default:
+                break
+            }
+        }
+        return nil
+    }
+
+    func getInvoice(details: PaymentDetails?) -> String? {
+        if let details = details {
+            switch details {
+            case let .lightning(_, _, _, _, invoice, _, _, _, _, _, _, _, _, _, _):
+                return invoice
             default:
                 break
             }
@@ -123,7 +145,7 @@ class SwapUpdatedTask : TaskProtocol {
         switch details {
         case let .bitcoin(_, _, _, _, _, _, _, claimTxId, _, _):
             return claimTxId != nil
-        case let .lightning(_, _, _, _, _, _, _, _, _, _, _, claimTxId, _, _):
+        case let .lightning(_, _, _, _, _, _, _, _, _, _, _, claimTxId, _, _, _):
             return claimTxId != nil
         default:
             return false
@@ -133,33 +155,63 @@ class SwapUpdatedTask : TaskProtocol {
     func onShutdown() {
         let notificationTitle = ResourceHelper.shared.getString(key: Constants.SWAP_CONFIRMED_NOTIFICATION_FAILURE_TITLE, fallback: Constants.DEFAULT_SWAP_CONFIRMED_NOTIFICATION_FAILURE_TITLE)
         let notificationBody = ResourceHelper.shared.getString(key: Constants.SWAP_CONFIRMED_NOTIFICATION_FAILURE_TEXT, fallback: Constants.DEFAULT_SWAP_CONFIRMED_NOTIFICATION_FAILURE_TEXT)
-        self.displayPushNotification(title: notificationTitle, body: notificationBody, logger: self.logger, threadIdentifier: Constants.NOTIFICATION_THREAD_DISMISSIBLE)
+        displayPushNotification(title: notificationTitle, body: notificationBody, logger: logger, threadIdentifier: Constants.NOTIFICATION_THREAD_DISMISSIBLE)
     }
 
     func notifySuccess(payment: Payment) {
-        if !self.notified {
-            self.logger.log(tag: TAG, line: "Payment \(payment.txId ?? "") processing successful", level: "INFO")
+        if !notified {
+            logger.log(tag: TAG, line: "Payment \(payment.txId ?? "") processing successful", level: "INFO")
             let received = payment.paymentType == PaymentType.receive
             let notificationTitle = ResourceHelper.shared.getString(
-                key: received ? Constants.PAYMENT_RECEIVED_NOTIFICATION_TITLE : Constants.PAYMENT_SENT_NOTIFICATION_TITLE, 
-                validateContains: "%d", 
+                key: received ? Constants.PAYMENT_RECEIVED_NOTIFICATION_TITLE : Constants.PAYMENT_SENT_NOTIFICATION_TITLE,
+                validateContains: "%d",
                 fallback: received ? Constants.DEFAULT_PAYMENT_RECEIVED_NOTIFICATION_TITLE: Constants.DEFAULT_PAYMENT_SENT_NOTIFICATION_TITLE)
-            self.notified = true
-            self.displayPushNotification(title: String(format: notificationTitle, payment.amountSat), logger: self.logger, threadIdentifier: Constants.NOTIFICATION_THREAD_DISMISSIBLE)
+            notified = true
+            displayPushNotification(title: String(format: notificationTitle, payment.amountSat), logger: logger, threadIdentifier: Constants.NOTIFICATION_THREAD_DISMISSIBLE)
         }
     }
-    
+
     func notifyPaymentWaitingFeeAcceptance(payment: Payment) {
-        if !self.notified {
-            self.logger.log(tag: TAG, line: "Payment \(self.getSwapId(details: payment.details) ?? "") requires fee acceptance", level: "INFO")
+        if !notified {
+            logger.log(tag: TAG, line: "Payment \(getSwapId(details: payment.details) ?? "") requires fee acceptance", level: "INFO")
             let notificationTitle = ResourceHelper.shared.getString(
                 key: Constants.PAYMENT_WAITING_FEE_ACCEPTANCE_TITLE,
                 fallback: Constants.DEFAULT_PAYMENT_WAITING_FEE_ACCEPTANCE_TITLE)
             let notificationBody = ResourceHelper.shared.getString(
                 key: Constants.PAYMENT_WAITING_FEE_ACCEPTANCE_TEXT,
                 fallback: Constants.DEFAULT_PAYMENT_WAITING_FEE_ACCEPTANCE_TEXT)
-            self.notified = true
-            self.displayPushNotification(title: notificationTitle, body: notificationBody, logger: self.logger, threadIdentifier: Constants.NOTIFICATION_THREAD_DISMISSIBLE)
+            notified = true
+            displayPushNotification(title: notificationTitle, body: notificationBody, logger: logger, threadIdentifier: Constants.NOTIFICATION_THREAD_DISMISSIBLE)
+        }
+    }
+
+    func checkAndTrackZap(payment: Payment) {
+        guard let invoice = getInvoice(details: payment.details),
+              let nwcService = nwcService else {
+            return
+        }
+
+        do {
+            if try nwcService.isZap(invoice: invoice) {
+                logger.log(tag: TAG, line: "Waiting for zap receipt", level: "INFO")
+                zapInvoice = invoice
+                return
+            }
+        } catch let e {
+            logger.log(tag: TAG, line: "Failed to check zap status: \(e)", level: "WARN")
+        }
+    }
+
+    func onEvent(event: NwcEvent) {
+        guard let zapInvoice = zapInvoice else { return }
+
+        switch event.details {
+        case .zapReceived(let receivedInvoice):
+            if zapInvoice == receivedInvoice {
+                logger.log(tag: TAG, line: "Zap receipt published for invoice: \(zapInvoice)", level: "INFO")
+            }
+        default:
+            break
         }
     }
 }
