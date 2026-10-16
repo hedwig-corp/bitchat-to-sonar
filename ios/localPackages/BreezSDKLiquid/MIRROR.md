@@ -47,6 +47,21 @@ and users who never had the legacy wallet (Cashu is the primary wallet) are
 unaffected. The durable fix is to build a 0.12.4 xcframework from the vendored
 Rust sources — tracked as a follow-up.
 
+### Why this package is not simply 0.12.4 (checked 2026-10-15)
+
+- The 0.11.13 binary really lacks the 0.12.4 migrations: `strings` on its
+  `ios-arm64` slice has no `settled_at` and no `wallet_cache_kv`, and still
+  carries `wallet_updates`; the vendored 0.12.4 `lib/core/src/persist/
+  migrations.rs` adds both. So the limitation above is real, not theoretical.
+- Nothing left to rebuild 0.12.4 from: `core/vendor/breez-sdk-liquid` holds
+  `lib/core` only (no `lib/bindings`, which owned the uniffi scaffolding and
+  the xcframework assembly); Maven never served the KMP iOS klibs
+  (`breez-sdk-liquid-kmp-{iosarm64,iossimulatorarm64,macosarm64}` 0.12.4 →
+  404) and the cached `-jvm` jar contains compiled classes only (no UDL,
+  no Kotlin sources); `~/.cargo/git` has no Breez checkout any more; the
+  upstream tag is gone. Reconstructing the uniffi surface by hand is a
+  separate project — see the follow-up.
+
 ## If the mirror disappears too
 
 Download the asset while it is up, verify the checksum above, and either host
