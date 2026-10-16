@@ -398,9 +398,7 @@ public final class SonarWallet {
         guard let node = sdk else { throw WalletError.notConfigured }
         return try await run {
             let prepared = try node.prepareReceivePayment(req: PrepareReceiveRequest(paymentMethod: .bolt12Offer, amount: nil))
-            let resp = try node.receivePayment(req: // 0.11.13 bindings (vendored, see ../../BreezSDKLiquid/MIRROR.md): the
-            // hash flag is `useDescriptionHash`; 0.12.4 had renamed it.
-            ReceivePaymentRequest(prepareResponse: prepared, description: "Sonar", useDescriptionHash: nil, payerNote: nil))
+            let resp = try node.receivePayment(req: ReceivePaymentRequest(prepareResponse: prepared, description: "Sonar", descriptionHash: nil, payerNote: nil))
             return resp.destination
         }
     }
@@ -476,9 +474,8 @@ public final class SonarWallet {
             payerNote: _,
             claimTxId: _,
             refundTxId: _,
-            refundTxAmountSat: _
-            // `settledAt` arrived in 0.12.x; the vendored 0.11.13 case has no
-            // such field (MIRROR.md).
+            refundTxAmountSat: _,
+            settledAt: _
         ) = p.details {
             preimage = pi
         }

@@ -572,8 +572,12 @@
 			shellPath = /bin/sh;
 			shellScript = (
 				"set -e",
-				"if [ \"${PLATFORM_NAME}\" = \"macosx\" ]; then",
-				"  rm -rf \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/breez_sdk_liquidFFI.framework\"",
+				"# The macOS slice of breez_sdk_liquidFFI.xcframework is a dynamic framework",
+				"# since the 0.12.4 mirror (ios/localPackages/BreezSDKLiquid/MIRROR.md) and",
+				"# must stay embedded. Only a static archive wrapper is dead weight.",
+				"FW=\"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/breez_sdk_liquidFFI.framework\"",
+				"if [ \"${PLATFORM_NAME}\" = \"macosx\" ] && [ -e \"$FW/breez_sdk_liquidFFI\" ] && file -L \"$FW/breez_sdk_liquidFFI\" | grep -q \"ar archive\"; then",
+				"  rm -rf \"$FW\"",
 				"fi",
 				"",
 			);

@@ -1744,6 +1744,28 @@ real mint and need the maintainer's approval of the amounts.
   came from Breez, which cannot set an invoice's amount. The Cashu core and
   mint could pay it all along. Now only the old wallet refuses it.
 
+### QA-175 — A legacy Breez wallet store written by 0.12.4 still opens on iOS
+- **Platforms:** iOS (automated). Android/desktop stay on the 0.12.4 KMP
+  package, so the engine never moved there.
+- **Steps:** Run `LegacyBreezStoreOpenTests`: the committed store
+  `ios/bitchatTests/Fixtures/breez-0.12.4-storage.sql` (schema `user_version`
+  46, written by Breez's own 0.12.4 engine) is copied under
+  `<tmp>/mainnet/73c5da0a/` and opened with `connect` against unreachable
+  explorers; no network, no API key.
+- **Expect:** `connect` succeeds, `getInfo()` reports fingerprint `73c5da0a`
+  and balance 0, the same `storage.sql` inode is still there and no second
+  wallet directory was created. Manually: an install that had the legacy Breez
+  wallet before 1.15.4 still shows its balance after updating, instead of
+  "wallet unavailable".
+- **How:** unit test at the real call site (`BreezSDKLiquid.connect`).
+- **Guard:** `LegacyBreezStoreOpenTests.testStoreWrittenByThe0124EngineOpens`
+- **Origin:** #667 review round 5. The first vendored replacement for the
+  deleted `breez-sdk-liquid-swift` package carried the 0.11.13 engine (the only
+  mirrored Swift release); its persister refuses a store a 0.12.4 build had
+  migrated (`DatabaseTooFarAhead`), so every existing legacy wallet showed as
+  unavailable on iOS. The package is 0.12.4 again
+  (`ios/localPackages/BreezSDKLiquid/MIRROR.md`).
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs

@@ -1,0 +1,3 @@
+# Local copies of the binary target; the package pins the release asset by checksum.
+breez_sdk_liquidFFI.xcframework/
+breez_sdk_liquidFFI.xcframework.zip
