@@ -35,6 +35,10 @@ class FakeCashuNative: SonarCashuWalletProtocol, @unchecked Sendable {
     var offer: String? = "lno1fakeoffer"
     /// Fee reserve quoted for every prepare.
     var feeReserve: UInt64? = 0
+    /// Fees of successive prepares; `feeReserve` once empty.
+    var nextFees: [UInt64?] = []
+    /// Thrown by successive `send` calls, one per call, before anything is spent.
+    var sendErrors: [Error] = []
     /// Status of the payment `send` returns.
     var sendStatus: WalletPaymentStatus = .complete
     var sendError: Error?
@@ -125,12 +129,16 @@ class FakeCashuNative: SonarCashuWalletProtocol, @unchecked Sendable {
         lock.lock(); preparedAmounts.append(amountSats); lock.unlock()
         guard isConnectedLocked() else { throw WalletFfiError.NotConnected }
         if let prepareError { throw prepareError }
+        lock.lock()
+        let fee = nextFees.isEmpty ? feeReserve : nextFees.removeFirst()
+        lock.unlock()
         return WalletPreparedSend(
             quoteId: "quote-\(preparedAmounts.count)",
             destination: destination,
             kind: .bolt12Offer,
             amountSats: amountSats ?? 0,
-            feesSats: feeReserve
+            feesSats: fee,
+            expiresAtSecs: 1_800_000_000 + 120 * UInt64(preparedAmounts.count)
         )
     }
 
@@ -177,7 +185,11 @@ class FakeCashuNative: SonarCashuWalletProtocol, @unchecked Sendable {
 
     func send(prepared: WalletPreparedSend, note: String) throws -> WalletPayment {
         record("send")
-        lock.lock(); sentPrepared.append(prepared); lock.unlock()
+        lock.lock()
+        sentPrepared.append(prepared)
+        let scripted = sendErrors.isEmpty ? nil : sendErrors.removeFirst()
+        lock.unlock()
+        if let scripted { throw scripted }
         if let sendError { throw sendError }
         return WalletPayment(
             id: prepared.quoteId,

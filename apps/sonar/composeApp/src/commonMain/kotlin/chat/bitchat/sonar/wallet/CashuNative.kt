@@ -91,14 +91,21 @@ data class CashuDestination(val raw: String, val kind: CashuDestinationKind, val
  */
 data class CashuInvoice(val invoice: String, val paymentId: String)
 
-/** A priced send from `prepareSend`: pass it back unchanged to `send`. */
+/** A priced send from `prepareSend`: pass it back to `send`. */
 data class CashuPreparedSend(
     val quoteId: String,
     val destination: String,
     val kind: CashuDestinationKind,
     val amountSats: Long,
-    /** The mint's fee RESERVE: the most the payment can cost on top of [amountSats]. */
+    /**
+     * The most the payment can cost on top of [amountSats]: the mint's fee
+     * reserve plus its input fees on the ecash spent. Passed back to `send`
+     * it is the fee the user agreed to — `send` refuses with
+     * [CashuWalletException.FeeChanged] rather than pay more.
+     */
     val feesSats: Long?,
+    /** When the quote stops being payable (unix seconds); null = never. */
+    val expiresAtSecs: Long? = null,
 )
 
 sealed interface CashuEvent {
@@ -126,6 +133,11 @@ sealed class CashuWalletException(reason: String) : Exception(reason) {
     class Network(val reason: String) : CashuWalletException("network error: $reason")
     class Timeout : CashuWalletException("wallet operation timed out")
     class Backend(val reason: String) : CashuWalletException("wallet error: $reason")
+    /** The quote expired before anything was sent: prepare again and send that. */
+    class QuoteExpired : CashuWalletException("the payment quote expired before it was sent")
+    /** Paying would cost more than the agreed fee; nothing was sent. */
+    class FeeChanged(val feesSats: Long) :
+        CashuWalletException("the fee for this payment is now up to $feesSats sats")
 
     /** The mint is unreachable (or we are not connected yet): retry later. */
     val isOffline: Boolean get() = this is NotConnected || this is Network || this is Timeout
