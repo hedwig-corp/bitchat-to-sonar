@@ -1601,7 +1601,7 @@ final class MarmotChatModel: ObservableObject {
             )
         }
 
-        var sealedBundle: (nsec: String, dbPath: String, sealed: Data)?
+        var sealedBundle: (nsec: String, dbPath: String, sealed: Data, pubkeyHex: String)?
         var sealError: Error?
         var sealSkippedUnchanged = false
         do {
@@ -1707,10 +1707,10 @@ final class MarmotChatModel: ObservableObject {
                 nsec: sealedBundle.nsec,
                 sealed: sealedBundle.sealed
             )
-            try? service.noteBackupSuccess(sizeBytes: UInt64(sealedBundle.sealed.count), dbPath: sealedBundle.dbPath)
+            try? service.noteBackupSuccess(sizeBytes: UInt64(sealedBundle.sealed.count), dbPath: sealedBundle.dbPath, accountPubkeyHex: sealedBundle.pubkeyHex)
         } catch {
             uploadError = error
-            try? service.noteBackupFailure(error.localizedDescription, dbPath: sealedBundle.dbPath)
+            try? service.noteBackupFailure(error.localizedDescription, dbPath: sealedBundle.dbPath, accountPubkeyHex: sealedBundle.pubkeyHex)
         }
         let outcome = MarmotAccountBackupFlow.outcome(
             uploadSucceeded: uploadError == nil,

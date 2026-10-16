@@ -1256,6 +1256,13 @@ actual object SonarCore {
             SonarNativeLoader.ensureLoaded()
             lock.withLock {
                 stickerOperationLock.write {
+                    // A new attempt retires the previous seal BEFORE anything
+                    // can fail: callers never re-upload old bytes (a retry is
+                    // a new seal), and a seal that fails here must record its
+                    // failure against the account it ran for, never against
+                    // the account a retained earlier seal belonged to.
+                    forgetSeal(null)
+                    uploaded.set(null)
                     val nsec = DesktopSecrets.get(nsecKey()) ?: error("no identity to back up")
                     val dbPath = marmotDbPath()
                     val dbKeyHex = loadOrCreateDbKey()

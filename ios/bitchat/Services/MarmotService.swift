@@ -1975,7 +1975,7 @@ final class MarmotService: @unchecked Sendable {
     /// on the Blossom RTT. Seal (checkpoint + AEAD) runs off the main actor
     /// via `runAccountBackupHostWork` / `runAccountBackupFFI` (Compose hops to
     /// `Dispatchers.IO`; mirror that here).
-    func prepareSealedAccountBackup() async throws -> (nsec: String, dbPath: String, sealed: Data) {
+    func prepareSealedAccountBackup() async throws -> (nsec: String, dbPath: String, sealed: Data, pubkeyHex: String) {
         accountBackupLock.lock()
         if accountBackupInFlight {
             accountBackupLock.unlock()
@@ -1989,9 +1989,11 @@ final class MarmotService: @unchecked Sendable {
             accountBackupLock.unlock()
         }
 
-        guard let nsec = snapshotIdentity()?.nsec() else {
+        guard let identity = snapshotIdentity() else {
             throw ServiceError.core("no identity to back up")
         }
+        let nsec = identity.nsec()
+        let sealedPubkeyHex = identity.pubkeyHex()
 
         // Hold the cross-process store lock across close+seal. The Notification
         // Service Extension is a SEPARATE PROCESS that tries this same lock
@@ -2034,7 +2036,7 @@ final class MarmotService: @unchecked Sendable {
             sealStoreLock.release()
             #endif
             await clearNodeClosingFence()
-            return (nsec, config.0, sealed)
+            return (nsec, config.0, sealed, sealedPubkeyHex)
         } catch {
             #if os(iOS)
             sealStoreLock.release()
@@ -2152,23 +2154,33 @@ final class MarmotService: @unchecked Sendable {
     /// Settings stats strip describes what was uploaded, so it comes from the
     /// bytes we actually pushed rather than a later measurement of a DB that has
     /// moved on.
-    /// The active store always counts; any other path must still be a
-    /// registered account's store.
-    private static func backupBookkeepingTargetExists(_ dbPath: String, activePath: String) -> Bool {
-        if dbPath == activePath { return true }
-        return SonarAccountRegistry.snapshot().accounts.contains { $0.dbPath == dbPath }
+    /// The store at `dbPath` must still belong to the account the upload was
+    /// sealed from. A path alone is not enough: a restore while the upload
+    /// was out can install a different account at the same path (the legacy
+    /// slot), and A's result must not land in C's store. With a registry the
+    /// row at that path decides; without one, the live identity does.
+    private func backupBookkeepingTargetExists(_ dbPath: String, activePath: String, accountPubkeyHex: String?) -> Bool {
+        let rows = SonarAccountRegistry.snapshot().accounts
+        if let row = rows.first(where: { $0.dbPath == dbPath }) {
+            guard let sealedFor = accountPubkeyHex else { return true }
+            return row.pubkeyHex == sealedFor
+        }
+        guard dbPath == activePath else { return false }
+        guard let sealedFor = accountPubkeyHex else { return true }
+        return snapshotIdentity()?.pubkeyHex() == sealedFor
     }
 
     /// `dbPath` names the store the upload was SEALED from. Pass it from the
     /// sealed bundle: an account switch while the upload is out would
     /// otherwise record A's result against the now-active B.
-    func noteBackupSuccess(sizeBytes: UInt64? = nil, dbPath sealedDbPath: String? = nil) throws {
+    func noteBackupSuccess(sizeBytes: UInt64? = nil, dbPath sealedDbPath: String? = nil, accountPubkeyHex: String? = nil) throws {
         let (activePath, activeKey) = try Self.databaseConfig()
         let dbPath = sealedDbPath ?? activePath
-        // The sealed account was removed while the upload was out: recording
-        // would recreate its directory with a stray sidecar. Skip.
-        guard Self.backupBookkeepingTargetExists(dbPath, activePath: activePath) else {
-            SecureLogger.info("Backup upload finished for a removed account — not recorded", category: .session)
+        // The sealed account was removed or replaced while the upload was
+        // out: recording would recreate its directory with a stray sidecar,
+        // or credit another account's store. Skip.
+        guard backupBookkeepingTargetExists(dbPath, activePath: activePath, accountPubkeyHex: accountPubkeyHex) else {
+            SecureLogger.info("Backup upload finished for a removed or replaced account — not recorded", category: .session)
             return
         }
         // The key is only needed for the message count; it must belong to
@@ -2181,11 +2193,11 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    func noteBackupFailure(_ message: String, dbPath sealedDbPath: String? = nil) throws {
+    func noteBackupFailure(_ message: String, dbPath sealedDbPath: String? = nil, accountPubkeyHex: String? = nil) throws {
         let activePath = try Self.databaseConfig().0
         let dbPath = sealedDbPath ?? activePath
-        guard Self.backupBookkeepingTargetExists(dbPath, activePath: activePath) else {
-            SecureLogger.info("Backup upload failed for a removed account — not recorded", category: .session)
+        guard backupBookkeepingTargetExists(dbPath, activePath: activePath, accountPubkeyHex: accountPubkeyHex) else {
+            SecureLogger.info("Backup upload failed for a removed or replaced account — not recorded", category: .session)
             return
         }
         do {

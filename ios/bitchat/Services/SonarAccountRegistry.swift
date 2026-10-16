@@ -248,10 +248,37 @@ enum SonarAccountRegistry {
     /// Secrets a removal could not delete; retried on the next connect.
     static let pendingSecretCleanupKey = "sonar.accounts.pendingSecretCleanup"
 
-    /// Retry keychain deletions a removal left behind (see `remove`).
+    /// Keychain names a registered account owns right now. A single-account
+    /// install without a registry owns the bare legacy pair.
+    private static func ownedKeychainKeys() -> Set<String> {
+        let snap = snapshot()
+        var owned = Set(snap.accounts.flatMap { [$0.nsecKeychainKey, $0.dbKeychainKey] })
+        if snap.accounts.isEmpty { owned.formUnion([nsecKeychainKey(tag: ""), dbKeychainKey(tag: "")]) }
+        return owned
+    }
+
+    /// Drop from the pending-cleanup list every name a registered account owns
+    /// again: a removed account re-added under the same tag writes its key
+    /// under the very names the failed cleanup remembered, and the retry
+    /// would otherwise delete the live key (Account Key Durability Rule).
+    static func releasePendingSecretCleanup(ownedBy account: SonarAccount, defaults: UserDefaults = .standard) {
+        guard let pending = defaults.stringArray(forKey: pendingSecretCleanupKey), !pending.isEmpty else { return }
+        let mine: Set<String> = [account.nsecKeychainKey, account.dbKeychainKey]
+        let remaining = pending.filter { !mine.contains($0) }
+        if remaining.count == pending.count { return }
+        if remaining.isEmpty {
+            defaults.removeObject(forKey: pendingSecretCleanupKey)
+        } else {
+            defaults.set(remaining, forKey: pendingSecretCleanupKey)
+        }
+    }
+
+    /// Retry keychain deletions a removal left behind (see `remove`). Names a
+    /// registered account owns again are released, never deleted.
     static func retryPendingSecretCleanup(keychain: KeychainManagerProtocol, defaults: UserDefaults = .standard) {
         guard let pending = defaults.stringArray(forKey: pendingSecretCleanupKey), !pending.isEmpty else { return }
-        let remaining = pending.filter { !keychain.deleteIdentityKey(forKey: $0) }
+        let owned = ownedKeychainKeys()
+        let remaining = pending.filter { !owned.contains($0) && !keychain.deleteIdentityKey(forKey: $0) }
         if remaining.isEmpty {
             defaults.removeObject(forKey: pendingSecretCleanupKey)
         } else {
@@ -297,7 +324,11 @@ enum SonarAccountRegistry {
             throw RegistryError.limitReached(snap.maxAccounts)
         }
         defer { invalidate() }
-        return SonarAccount(try accountRegistryAdd(dataDir: try dataDirectory().path, pubkey: pubkey, label: label))
+        let added = SonarAccount(try accountRegistryAdd(dataDir: try dataDirectory().path, pubkey: pubkey, label: label))
+        // The host writes this account's key under these names next; a stale
+        // cleanup entry for them must be gone before that happens.
+        releasePendingSecretCleanup(ownedBy: added)
+        return added
     }
 
     @discardableResult
