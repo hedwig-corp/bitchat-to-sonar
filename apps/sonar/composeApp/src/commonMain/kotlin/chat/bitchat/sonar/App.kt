@@ -1547,6 +1547,26 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var needsLiveEdgeOpen by remember(screen.id) {
         mutableStateOf(transcriptOpenAction == TranscriptOpenAction.LiveEdge)
     }
+    // Signal's rule for an outgoing message: it always brings the transcript
+    // to the live edge, even when the chat was opened at the unread divider
+    // or the reader scrolled up. The tail-follow effect below only follows a
+    // reader who is already at the bottom, so a send from history landed off
+    // screen below the unread agent replies (QA-150). The tick is bumped at
+    // send (keyboard Send and the button); once the echo is the newest row,
+    // anchor the tail and hand tail-following back.
+    var ownSendTick by remember(screen.id) { mutableStateOf(0) }
+    var ownSendTailKeyAtTap by remember(screen.id) { mutableStateOf<String?>(null) }
+    LaunchedEffect(screen.id, ownSendTick, newestFeedKey, feed.size) {
+        if (!transcriptOwnSendShouldFollow(ownSendTick, ownSendTailKeyAtTap, newestFeedKey)) {
+            return@LaunchedEffect
+        }
+        withFrameNanos { }
+        listState.anchorTranscriptTail(chatFeedListTailIndex(currentListItems), animate = false)
+        isNearBottom = true
+        didLeaveTail = false
+        needsLiveEdgeOpen = false
+        ownSendTick = 0
+    }
 
     // The divider must not resurrect or re-scroll once the reader takes over.
     LaunchedEffect(screen.id, listState) {
@@ -2092,6 +2112,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 emojiTray = false
                                 if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
                                     state.send(screen.id, d)
+                                    ownSendTailKeyAtTap = newestFeedKey
+                                    ownSendTick++
                                 }
                             },
                         )
@@ -2177,6 +2199,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 emojiTray = false
                                 if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
                                     state.send(screen.id, d)
+                                    ownSendTailKeyAtTap = newestFeedKey
+                                    ownSendTick++
                                 }
                             },
                         contentAlignment = Alignment.Center

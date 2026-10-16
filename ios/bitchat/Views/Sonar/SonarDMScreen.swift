@@ -271,6 +271,7 @@ struct SonarDMScreenContent: View {
                 // independently after the send has entered the local-first
                 // transport/outbox path.
                 store.sendDm(peerId, text)
+                convo.noteOwnSend()
                 // Paint the local echo in this frame instead of waiting on the
                 // store invalidation debounce (background bursts keep it).
                 convo.rebuildNow()
@@ -284,6 +285,7 @@ struct SonarDMScreenContent: View {
             },
             onSticker: { sticker, coord in
                 store.sendSticker(peerId, sticker: sticker, packCoordinate: coord)
+                convo.noteOwnSend()
                 convo.rebuildNow()
                 Task { @MainActor in
                     await convo.loadNewestIfNeeded()
@@ -296,7 +298,10 @@ struct SonarDMScreenContent: View {
             fetchInstalledPacks: { await store.fetchInstalledPacks() },
             cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: store.canSendMedia(peerId),
-            onVoice: { store.sendVoiceNote(peerId, url: $0) },
+            onVoice: {
+                store.sendVoiceNote(peerId, url: $0)
+                convo.noteOwnSend()
+            },
             // Always pass the roster; SNComposer derives suggestions from the
             // bound draft locally (no store-wide mention-query publish).
             mentionRoster: store.mentionRoster(forConversationId: peerId),
@@ -402,6 +407,7 @@ struct SonarDMScreenContent: View {
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
                     onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
+                    ownSendRevision: convo.ownSendRevision,
                     composerVersion: composerVersion
                 ) {
                     dmComposer
@@ -692,7 +698,10 @@ struct SonarDMScreenContent: View {
         if !previews.isEmpty {
             MediaSendPreviewLoaderView(
                 previews: previews,
-                onSend: { store.confirmSendPreview(peerId: peerId) },
+                onSend: {
+                    store.confirmSendPreview(peerId: peerId)
+                    convo.noteOwnSend()
+                },
                 onCancel: { store.cancelPreview(peerId: peerId) }
             )
         }

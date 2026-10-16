@@ -96,6 +96,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var jumpMessageId: String? = nil
     /// Cleared by the host after Jump applies (or soft-fails).
     var onJumpSettled: (() -> Void)? = nil
+    /// Own-send counter from `ConversationViewState.noteOwnSend()`.
+    var ownSendRevision: UInt64? = nil
     /// Changes only when composer chrome inputs change (send/mic boundary,
     /// mention roster fingerprint, reply, transport, peer title). Unrelated
     /// store updates then leave the active keyboard hierarchy untouched.
@@ -133,6 +135,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
             onJumpSettled: onJumpSettled,
+            ownSendRevision: ownSendRevision,
             composerVersion: composerVersion,
             composer: composer
         )
