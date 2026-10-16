@@ -8,6 +8,7 @@
 
 import Testing
 import Foundation
+import notify
 @testable import Sonar
 
 struct MarmotStoreLockTests {
@@ -81,6 +82,57 @@ struct MarmotStoreLockTests {
         nse?.release()
         #endif
     }
+
+    /// QA-164 (#665): the app's blocking acquire must ask whoever holds the
+    /// store to yield BEFORE it parks on `flock`. The holder here is a hold in
+    /// this process that lets go only when that Darwin notification arrives,
+    /// which is exactly what the NSE's observer does with its latch. Without
+    /// the signal the acquire waits until the holder finishes on its own; for
+    /// a push wake on cellular that was the 5 s relay quorum plus the 8 s
+    /// drain, with the app stuck on its launch surface the whole time.
+    /// Other tests' acquires post the same notification and may release this
+    /// hold early; that cannot make this test pass without the fix, because
+    /// without it nothing posts at all.
+    @Test("acquireExclusive asks the store holder to yield (QA-164)")
+    func acquireExclusiveAsksHolderToYield() throws {
+        #if os(iOS)
+        let group = IsolatedAppGroup()
+        defer { group.remove() }
+        _ = MarmotStoreLock.lockFileURL(fileManager: group, createDirectory: true)
+        let held = try #require(MarmotStoreLock.tryAcquireExclusive(fileManager: group))
+
+        var token: Int32 = NOTIFY_TOKEN_INVALID
+        let status = notify_register_dispatch(
+            MarmotStoreLock.hostWantsStoreNotification,
+            &token,
+            DispatchQueue.global(qos: .userInitiated)
+        ) { _ in held.release() }
+        #expect(status == 0) // NOTIFY_STATUS_OK
+        defer { notify_cancel(token) }
+
+        let acquired = AcquiredLockBox()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            acquired.lock = try? MarmotStoreLock.acquireExclusive(fileManager: group)
+            done.signal()
+        }
+        let yielded = done.wait(timeout: .now() + 3) == .success
+        if !yielded {
+            // Unpark the blocked acquire so the suite ends instead of hanging.
+            held.release()
+            done.wait()
+        }
+        #expect(yielded, "acquireExclusive parked on flock without asking the holder to yield")
+        #expect(acquired.lock != nil)
+        acquired.lock?.release()
+        #endif
+    }
+}
+
+/// Carries the lock out of the background acquire in
+/// `acquireExclusiveAsksHolderToYield`; the semaphore orders the access.
+private final class AcquiredLockBox: @unchecked Sendable {
+    var lock: MarmotStoreLock?
 }
 
 /// An App Group container of the test's own. These tests take the exclusive
