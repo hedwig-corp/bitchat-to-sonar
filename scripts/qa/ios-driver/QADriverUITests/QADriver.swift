@@ -46,6 +46,9 @@ final class QADriver: XCTestCase {
             switch cmd {
             case "launch":
                 if let nsec = env["QA_NSEC"] { app.launchEnvironment["SONAR_BENCH_NSEC"] = nsec }
+                // QA identities are throwaway: keep their relay lists and
+                // profile off the public indexers unless a scenario opts in.
+                app.launchEnvironment["SONAR_LOOKUP_RELAYS"] = env["SONAR_LOOKUP_RELAYS"] ?? "none"
                 app.launch()
             case "activate":
                 app.activate()

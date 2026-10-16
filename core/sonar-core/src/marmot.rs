@@ -2589,6 +2589,7 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         DM_AUTOACCEPT_FILE_SUFFIX,
         DM_AUTOACCEPT_TMP_FILE_SUFFIX,
         KEY_PACKAGE_SLOT_FILE_SUFFIX,
+        crate::relay_routes::RELAY_RECORDS_FILE_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
