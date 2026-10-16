@@ -19,9 +19,9 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // Breez SDK Liquid Swift bindings, vendored: upstream deleted the package
-        // and its binaries (see ../BreezSDKLiquid/MIRROR.md). 0.11.13 is the last
-        // mirrored release; the Android/desktop KMP package stays on 0.12.4.
+        // Breez SDK Liquid Swift bindings 0.12.4, vendored: upstream deleted the
+        // package and its binaries (see ../BreezSDKLiquid/MIRROR.md). Same engine
+        // as the Android/desktop KMP package and the shipped TestFlight builds.
         .package(path: "../BreezSDKLiquid"),
     ],
     targets: [
