@@ -1408,6 +1408,18 @@ actual object SonarCore {
      *  caller holds: a finished upload never erases a newer seal. */
     private class SealRecord(val pubkeyHex: String, val nsec: String, val digest: String)
     private val seal = java.util.concurrent.atomic.AtomicReference<SealRecord?>(null)
+    /** The record the most recent [uploadSealedAccountBackup] signed with,
+     *  handed to the bookkeeping call that follows it. Bookkeeping must bind
+     *  to the upload that completed, not to whatever [seal] holds by then: if
+     *  a newer seal landed in between, reading [seal] would credit A's upload
+     *  to B and forget B's credential. Callers also serialize seal → upload →
+     *  record under their backup mutex; this keeps the core correct without
+     *  relying on that. */
+    private val uploaded = java.util.concurrent.atomic.AtomicReference<SealRecord?>(null)
+
+    /** The record bookkeeping is for: the completed upload's, else (no upload
+     *  happened, e.g. a metered abort right after sealing) the current seal. */
+    private fun takeBookkeepingRecord(): SealRecord? = uploaded.getAndSet(null) ?: seal.get()
 
     private fun sha256Hex(bytes: ByteArray): String =
         java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
@@ -1445,6 +1457,8 @@ actual object SonarCore {
         check(record.digest == sha256Hex(sealed)) {
             "the sealed backup is not the most recent seal; seal again"
         }
+        // Set before the call so a failure's bookkeeping binds to it too.
+        uploaded.set(record)
         val info = uniffi.sonar_ffi.uploadSealedAccountBackup(record.nsec, sealed, null)
         // Blob sha prefix, not the URL: Diagnostics → Share exports this log
         // (#176), and the full URL is a direct fetch handle to the user's
@@ -1501,7 +1515,7 @@ actual object SonarCore {
         // The key never touches disk outside the Keystore-encrypted prefs; the
         // core needs it transiently to count messages in the SQLCipher index.
         synchronized(bookkeepingMonitor) {
-            val record = seal.get()
+            val record = takeBookkeepingRecord()
             val target = sealedAccountDbPath(record) ?: run {
                 sonarLog("Backup", "upload finished for a removed account — not recorded")
                 forgetSeal(record)
@@ -1520,7 +1534,7 @@ actual object SonarCore {
 
     actual fun recordBackupFailure(error: String) {
         synchronized(bookkeepingMonitor) {
-            val record = seal.get()
+            val record = takeBookkeepingRecord()
             val target = sealedAccountDbPath(record) ?: run {
                 sonarLog("Backup", "upload failed for a removed account — not recorded")
                 forgetSeal(record)
@@ -1609,6 +1623,7 @@ actual object SonarCore {
                 AndroidCrashDiagnostics.clear()
                 closeNode()
                 forgetSeal(null)
+                uploaded.set(null)
                 npub = ""; pubkeyHex = ""
                 // Drop the encrypted Marmot DB + all prefs. The diagnostics logs
                 // live under sonar-marmot/ (logs/), so this also removes them — at
