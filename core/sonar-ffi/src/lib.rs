@@ -1001,7 +1001,16 @@ impl SonarSuspendLatch {
 /// blocking — call from a background queue in Swift, never the main thread.
 #[derive(uniffi::Object)]
 pub struct SonarNode {
-    runtime: tokio::runtime::Runtime,
+    /// `ManuallyDrop` so `Drop` can hand the runtime to `shutdown_background`
+    /// instead of letting tokio's own drop run. That drop WAITS for every
+    /// in-flight blocking-pool task, and the relay dial resolves hostnames
+    /// with `getaddrinfo` on that pool: on a cellular link with a stalled
+    /// resolver, releasing a node (and with it the SQLCipher store and, in
+    /// the NSE, the cross-process store lock) would park for the resolver's
+    /// timeout, tens of seconds, after every relay future had already been
+    /// cancelled. `shutdown_background` cancels the async tasks the same way
+    /// and lets the blocking threads finish on their own.
+    runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
     client: SonarClient,
     /// One-way suspend latch (`interrupt_for_suspend`). Long-blocking relay
     /// methods select against it so an imminent iOS suspension can abort them
@@ -1015,6 +1024,15 @@ pub struct SonarNode {
     /// lock so a long `call_wait_event` park never blocks `call_hangup` etc.
     #[cfg(feature = "calls-audio")]
     call: Mutex<Option<Arc<sonar_core::call::engine::CallEngine>>>,
+}
+
+impl Drop for SonarNode {
+    fn drop(&mut self) {
+        // SAFETY: `runtime` is never touched again — this is the only take,
+        // and the field is `ManuallyDrop` precisely so no second drop runs.
+        let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
+        runtime.shutdown_background();
+    }
 }
 
 /// Stable marker at the end of every suspend-aborted error message.
@@ -1122,9 +1140,19 @@ impl SonarNode {
                     db_key,
                 ) => result.map_err(Into::into),
             }
-        })?;
+        });
+        let client = match client {
+            Ok(client) => client,
+            Err(err) => {
+                // Same reason as `Drop`: a connect the host aborted (or that
+                // timed out) must not then wait on a stalled DNS lookup
+                // before the caller can release the store lock.
+                runtime.shutdown_background();
+                return Err(err);
+            }
+        };
         Ok(Arc::new(Self {
-            runtime,
+            runtime: std::mem::ManuallyDrop::new(runtime),
             client,
             suspend_interrupt,
             #[cfg(feature = "calls-audio")]
@@ -4073,6 +4101,70 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "in-flight connect must abort on latch ({}s)",
+            elapsed.as_secs()
+        );
+    }
+
+    /// Releasing a node must not wait on the blocking pool. tokio's own
+    /// runtime drop joins every in-flight `spawn_blocking` task, and the relay
+    /// dial's `getaddrinfo` runs there; on a stalled cellular resolver that
+    /// held the NSE's store lock (and the app's SQLCipher handle) for the
+    /// resolver's timeout after the host had already aborted the connect.
+    #[test]
+    fn dropping_a_node_does_not_wait_for_blocking_tasks() {
+        let node = local_test_node(vec![]);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        node.runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("test observes the park");
+            std::thread::sleep(std::time::Duration::from_secs(20));
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("blocking task started");
+        let dropped_at = std::time::Instant::now();
+        drop(node);
+        assert!(
+            dropped_at.elapsed() < std::time::Duration::from_secs(5),
+            "node drop waited on the blocking pool ({}s)",
+            dropped_at.elapsed().as_secs()
+        );
+    }
+
+    /// The error path of `connect` owns the runtime itself (the node was
+    /// never built), so it needs the same treatment: a latched connect must
+    /// return to the host promptly even with a dial parked in the pool.
+    #[test]
+    fn aborted_connect_returns_without_waiting_for_blocking_tasks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("marmot.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let latch = SonarSuspendLatch::new();
+        let connecting = {
+            let latch = latch.clone();
+            std::thread::spawn(move || {
+                // A hostname, so the dial goes through the blocking-pool
+                // resolver rather than a bare IP connect.
+                let started = std::time::Instant::now();
+                let result = SonarNode::connect(
+                    SonarIdentity::generate(),
+                    vec!["wss://relay.invalid".into()],
+                    db_path,
+                    "ab".repeat(32),
+                    Some(latch),
+                );
+                (result, started.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        latch.interrupt();
+        let (result, elapsed) = connecting.join().expect("connect thread joins");
+        assert!(result.is_err(), "interrupted connect must not produce a node");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "aborted connect must return at once ({}s)",
             elapsed.as_secs()
         );
     }

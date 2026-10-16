@@ -877,6 +877,13 @@ share a zone with the app and report the zone the app shared with it.
 - **Guarding tests:**
   - `latched_collect_after_wake_refuses_instead_of_syncing` (`core/sonar-ffi`):
     a latched node refuses the wake drain at once.
+  - `dropping_a_node_does_not_wait_for_blocking_tasks` and
+    `aborted_connect_returns_without_waiting_for_blocking_tasks`
+    (`core/sonar-ffi`): releasing a node, or a connect the host aborted, no
+    longer joins tokio's blocking pool. The relay dial resolves hostnames
+    there, so on a stalled cellular resolver the NSE's yield used to release
+    the store lock only after the resolver timed out. The first test fails in
+    20 s with tokio's own drop (measured).
   - `MarmotStoreLockTests.acquireExclusiveAsksHolderToYield` (iOS): the app's
     blocking acquire posts the yield notification before it parks, and a
     holder that releases on it lets the acquire through.
@@ -894,6 +901,10 @@ share a zone with the app and report the zone the app shared with it.
   (the test target could not build while `breez-sdk-liquid-swift` was
   unresolvable): with the fix the acquire got the lock at once; with
   `signalHostWantsStore()` removed it stayed parked until the 3 s limit.
+  The notification extension target was compiled for the simulator against
+  a local compile-only stand-in for the Breez module (its seven symbols the
+  extension uses), so the observer wiring type-checks; the real build still
+  needs the package restored.
 - **Origin:** 2026-10-13 tester report "quando non sono in Wi-Fi non si
   apre". Both hosts gate first paint on the local store open, and both let a
   push-driven relay attach hold the store lock across its network timeouts:
