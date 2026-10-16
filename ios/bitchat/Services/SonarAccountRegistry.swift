@@ -93,6 +93,7 @@ enum SonarAccountRegistry {
         case lastAccount
         case faulted(String)
         case activeAccount
+        case secretCleanupPending
 
         var errorDescription: String? {
             switch self {
@@ -106,6 +107,8 @@ enum SonarAccountRegistry {
                 return String(localized: "Account list unreadable: \(why)")
             case .activeAccount:
                 return String(localized: "Switch to another account before removing this one.")
+            case .secretCleanupPending:
+                return String(localized: "The account was removed, but one of its keys could not be deleted yet. It will be cleared on the next launch.")
             }
         }
     }
@@ -134,8 +137,15 @@ enum SonarAccountRegistry {
         dbKeychainKey(tag: activeSecretTag())
     }
 
+    /// A refused resolution (unreadable registry on a multi-account install)
+    /// yields a tag no item was ever stored under, so every keychain read
+    /// misses and connect reports "account key missing" instead of silently
+    /// opening the legacy identity. Nothing is ever minted under it: the
+    /// create paths only run during onboarding.
+    static let refusedSecretTag = "unreadable-registry"
+
     private static func activeSecretTag() -> String {
-        (try? resolveActive())?.secretTag ?? ""
+        (try? resolveActive())?.secretTag ?? refusedSecretTag
     }
 
     // MARK: Data dir
@@ -198,7 +208,46 @@ enum SonarAccountRegistry {
     static func resolveActive() throws -> SonarAccount {
         let snap = snapshot()
         if let active = snap.active { return active }
+        // A registry that exists but cannot be read: the legacy store is a
+        // safe answer only on an install that never had a second account
+        // (no `accounts/` directory). With one, the legacy slot may be
+        // another identity than the one the user had selected — refuse
+        // (Durability rule 2: surface, never substitute).
+        if let fault = snap.fault, hasAccountsDirectory() {
+            throw RegistryError.faulted(fault)
+        }
         return SonarAccount(legacyAt: try legacyDatabasePath())
+    }
+
+    private static func hasAccountsDirectory() -> Bool {
+        guard let dir = try? dataDirectory().appendingPathComponent("accounts", isDirectory: true) else { return false }
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir) && isDir.boolValue
+    }
+
+    /// Tags of every `accounts/<tag>` directory on disk — the registry's view
+    /// when the registry itself cannot be read (wipe must still find them).
+    private static func onDiskSecretTags() -> [String] {
+        guard let dir = try? dataDirectory().appendingPathComponent("accounts", isDirectory: true),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return [] }
+        return names.filter { name in
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path, isDirectory: &isDir) && isDir.boolValue
+        }
+    }
+
+    /// Secrets a removal could not delete; retried on the next connect.
+    static let pendingSecretCleanupKey = "sonar.accounts.pendingSecretCleanup"
+
+    /// Retry keychain deletions a removal left behind (see `remove`).
+    static func retryPendingSecretCleanup(keychain: KeychainManagerProtocol, defaults: UserDefaults = .standard) {
+        guard let pending = defaults.stringArray(forKey: pendingSecretCleanupKey), !pending.isEmpty else { return }
+        let remaining = pending.filter { !keychain.deleteIdentityKey(forKey: $0) }
+        if remaining.isEmpty {
+            defaults.removeObject(forKey: pendingSecretCleanupKey)
+        } else {
+            defaults.set(remaining, forKey: pendingSecretCleanupKey)
+        }
     }
 
     /// Accounts other than the active one, most recently active first.
@@ -315,9 +364,16 @@ enum SonarAccountRegistry {
         let removed = SonarAccount(out.removed)
         // Explicit user action on a store the core has just wiped: the keys
         // guard nothing any more. (Durability invariant 5 applies to wipe;
-        // this is the same boundary scoped to one account.)
-        _ = keychain.deleteIdentityKey(forKey: removed.nsecKeychainKey)
-        _ = keychain.deleteIdentityKey(forKey: removed.dbKeychainKey)
+        // this is the same boundary scoped to one account.) The row is gone,
+        // so a failed delete is remembered and retried on the next connect
+        // instead of being reported as a clean removal.
+        let failed = [removed.nsecKeychainKey, removed.dbKeychainKey].filter { !keychain.deleteIdentityKey(forKey: $0) }
+        if !failed.isEmpty {
+            let defaults = UserDefaults.standard
+            let pending = Set((defaults.stringArray(forKey: pendingSecretCleanupKey) ?? []) + failed)
+            defaults.set(Array(pending), forKey: pendingSecretCleanupKey)
+            throw RegistryError.secretCleanupPending
+        }
         return (removed, SonarAccount(out.newActive))
     }
 
@@ -326,6 +382,11 @@ enum SonarAccountRegistry {
     static func allKeychainKeysForWipe() -> [String] {
         var tags = Set([""])
         for a in snapshot().accounts { tags.insert(a.secretTag) }
+        // When the registry cannot be read, the `accounts/<tag>` directory
+        // names ARE the tags: never leave a key behind because the list that
+        // named it was corrupt.
+        for t in onDiskSecretTags() { tags.insert(t) }
+        tags.insert(refusedSecretTag)
         return tags.flatMap { [nsecKeychainKey(tag: $0), dbKeychainKey(tag: $0)] }
     }
 }

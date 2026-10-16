@@ -363,6 +363,10 @@ fun App(
                         }
                     }.onFailure { state.toast = it.message }
                 }
+            } else if (target != null && registry?.accounts?.none { it.pubkeyHex == target } == true) {
+                // An explicitly account-scoped banner whose account is gone:
+                // never open its chat under another identity.
+                state.toast = "That account is no longer on this phone."
             } else if (req.conversationId.isNotEmpty()) {
                 state.openConversationFromNotification(
                     conversationId = req.conversationId,

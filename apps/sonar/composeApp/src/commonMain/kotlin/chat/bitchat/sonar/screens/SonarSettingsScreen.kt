@@ -21,6 +21,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -716,7 +719,7 @@ private fun RestoreAccountSheet(state: SonarAppState, onClose: () -> Unit) {
                     } ?: onClose()
                 }
             }
-            SNGhostButton(stringResource(Res.string.cancel)) { onClose() }
+            SNGhostButton(stringResource(Res.string.cancel)) { if (!inFlight) onClose() }
         }
     }
 }
@@ -995,7 +998,7 @@ fun AccountSwitcherSheet(state: SonarAppState, onClose: () -> Unit, onAdd: () ->
                     state.switchAccount(account.pubkeyHex) { result ->
                         inFlight = false
                         result.onSuccess { onClose() }
-                            .onFailure { error = it.message }
+                            .onFailure { error = it.message?.takeIf { m -> m.isNotBlank() } ?: it.toString() }
                     }
                 }
             }
@@ -1012,7 +1015,7 @@ fun AccountSwitcherSheet(state: SonarAppState, onClose: () -> Unit, onAdd: () ->
             )
         }
         Column(Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp)) {
-            SNGhostButton(stringResource(Res.string.cancel)) { onClose() }
+            SNGhostButton(stringResource(Res.string.cancel)) { if (!inFlight) onClose() }
         }
     }
 }
@@ -1048,7 +1051,7 @@ private fun AccountActionSheet(state: SonarAppState, account: SonarAccount, onCl
                     error = null
                     state.removeAccount(account.pubkeyHex) { result ->
                         inFlight = false
-                        result.onSuccess { onClose() }.onFailure { error = it.message }
+                        result.onSuccess { onClose() }.onFailure { error = it.message?.takeIf { m -> m.isNotBlank() } ?: it.toString() }
                     }
                 }
             } else {
@@ -1057,12 +1060,12 @@ private fun AccountActionSheet(state: SonarAppState, account: SonarAccount, onCl
                     error = null
                     state.switchAccount(account.pubkeyHex) { result ->
                         inFlight = false
-                        result.onSuccess { onClose() }.onFailure { error = it.message }
+                        result.onSuccess { onClose() }.onFailure { error = it.message?.takeIf { m -> m.isNotBlank() } ?: it.toString() }
                     }
                 }
                 SNGhostButton(stringResource(Res.string.remove_from_this_phone)) { confirmRemove = true }
             }
-            SNGhostButton(stringResource(Res.string.cancel)) { onClose() }
+            SNGhostButton(stringResource(Res.string.cancel)) { if (!inFlight) onClose() }
         }
     }
 }
@@ -1085,7 +1088,7 @@ private fun AddAccountSheet(state: SonarAppState, onClose: () -> Unit) {
         error = null
         state.addAccount(key, label.trim().takeIf { it.isNotEmpty() }) { result ->
             inFlight = false
-            result.onSuccess { onClose() }.onFailure { error = it.message }
+            result.onSuccess { onClose() }.onFailure { error = it.message?.takeIf { m -> m.isNotBlank() } ?: it.toString() }
         }
     }
     Sheet(stringResource(Res.string.add_account), onClose) {
@@ -1127,9 +1130,14 @@ private fun AddAccountSheet(state: SonarAppState, onClose: () -> Unit) {
             if (nsec.isEmpty()) {
                 Text("nsec1...", color = s.text3, fontSize = 15.sp)
             }
+            // A signing secret: password keyboard (no autocorrect, no IME
+            // learning), masked by default. Paste still works.
             BasicTextField(
                 value = nsec,
                 onValueChange = { nsec = it },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false),
+                visualTransformation = PasswordVisualTransformation(),
                 textStyle = TextStyle(color = s.text, fontSize = 15.sp, lineHeight = 20.sp),
                 cursorBrush = SolidColor(s.accent),
                 modifier = Modifier.fillMaxWidth(),
@@ -1160,7 +1168,7 @@ private fun AddAccountSheet(state: SonarAppState, onClose: () -> Unit) {
                 if (inFlight) stringResource(Res.string.adding) else stringResource(Res.string.sign_in_with_this_key),
                 disabled = !nsecOk || inFlight,
             ) { add(nsec.trim()) }
-            SNGhostButton(stringResource(Res.string.cancel)) { onClose() }
+            SNGhostButton(stringResource(Res.string.cancel)) { if (!inFlight) onClose() }
         }
     }
 }

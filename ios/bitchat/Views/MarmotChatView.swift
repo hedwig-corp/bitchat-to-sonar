@@ -1152,6 +1152,7 @@ final class MarmotChatModel: ObservableObject {
             // has always opened as this account, in place. No file or secret
             // moves; a no-op once registered.
             SonarAccountRegistry.registerLegacyIfNeeded(pubkey: np)
+            SonarAccountRegistry.retryPendingSecretCleanup(keychain: keychain)
             // A restore that replaced this slot's key but died before
             // repointing the row leaves the row naming the old key. The key
             // that actually opens the store is the truth; repoint now.

@@ -1067,6 +1067,12 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun wipe() {
         scope.launch {
+            // A switch or add mid-flight could register a key after the wipe
+            // enumerated them; refuse rather than leave that key behind.
+            if (accountChangeInFlight) {
+                toast = "Another account change is still finishing. Try again in a moment."
+                return@launch
+            }
             endTranscriptSession()
             relayConnectJob?.cancel(); relayConnectJob = null
             resetStartupFlags()
@@ -5047,8 +5053,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 when (SonarCore.lastImportBackupOutcome()) {
                     AccountBackupRestoreOutcome.Restored ->
                         toast = getString(Res.string.account_added_chats_recovered_from)
-                    AccountBackupRestoreOutcome.Missing, AccountBackupRestoreOutcome.Failed ->
+                    AccountBackupRestoreOutcome.Missing ->
                         if (key != null) toast = getString(Res.string.account_added_chats_start_empty_on_this)
+                    // A failed download/decrypt is actionable (retry online), not
+                    // "there was nothing to restore".
+                    AccountBackupRestoreOutcome.Failed ->
+                        toast = getString(Res.string.account_restored_chat_backup_restore)
                     AccountBackupRestoreOutcome.Unchanged -> Unit
                 }
             }
@@ -5110,6 +5120,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  Returns the Marmot delivery generation to resume afterwards. Shared by
      *  [restoreAccount], [switchAccount] and [addAccount]. */
     private suspend fun tearDownAccountBoundState(): Long? {
+        var generation: Long? = null
+        try {
+            return tearDownAccountBoundStateInner { generation = it }
+        } catch (t: Throwable) {
+            // A failure after the delivery pause must not strand the still-
+            // active account with delivery paused: resume before rethrowing.
+            generation?.let(::resumePendingMarmotPeerDelivery)
+            throw t
+        }
+    }
+
+    private suspend fun tearDownAccountBoundStateInner(onGeneration: (Long) -> Unit): Long? {
         endTranscriptSession()
         UnifyRadio.stopScanning()
         UnifyRadio.stopAdvertising()
@@ -5129,6 +5151,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         resetCallState()
         val marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
+        marmotDeliveryGeneration?.let(onGeneration)
         cancelPendingMarmotSetups()
         cancelPendingMarmotGroupSetups()
 
@@ -5234,6 +5257,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun restoreAccount(nsec: String, onResult: (Result<Unit>) -> Unit) {
         scope.launch {
             var marmotDeliveryGeneration: Long? = null
+            var acquired = false
             val result = runCatching {
                 val key = nsec.trim()
                 val expectedNpub = try {
@@ -5279,6 +5303,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     return@runCatching
                 }
 
+                // Same gate as switch / add: an in-place replacement must not
+                // interleave with a switch, or it would replace the account the
+                // switch just activated instead of the one it started on.
+                beginAccountChange()
+                acquired = true
                 // Unregister the legacy webhook while its node is still
                 // available, but preserve the device token for immediate
                 // registration by the new account.
@@ -5326,6 +5355,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     AccountBackupRestoreOutcome.Unchanged -> Unit
                 }
             }
+            endAccountChange(acquired)
             marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
             onResult(result.map { Unit })
         }

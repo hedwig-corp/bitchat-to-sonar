@@ -79,12 +79,11 @@ pub struct AccountEntry {
     pub label: Option<String>,
     /// Store directory relative to the data dir. `""` is the legacy store
     /// that lives directly in the data dir; later accounts use
-    /// `accounts/<pubkey_hex>`.
-    #[serde(default)]
+    /// `accounts/<pubkey_hex>`. Required on disk: a missing value must not
+    /// silently reinterpret a row as the legacy namespace.
     pub store_dir: String,
     /// Suffix hosts append to their secret names. `""` keeps the legacy
-    /// unsuffixed names; later accounts use their `pubkey_hex`.
-    #[serde(default)]
+    /// unsuffixed names; later accounts use their `pubkey_hex`. Required.
     pub secret_tag: String,
     /// Unix seconds.
     #[serde(default)]
@@ -113,7 +112,8 @@ pub struct AccountRegistry {
     /// `pubkey_hex` of the active account, if any.
     #[serde(default)]
     pub active: Option<String>,
-    #[serde(default)]
+    /// Required on disk: `{"version":1}` must read as corrupt, not as a
+    /// fresh install the legacy store may be registered over.
     pub accounts: Vec<AccountEntry>,
 }
 
@@ -279,14 +279,17 @@ impl AccountRegistry {
                 return Err(bad(format!("secret tag {:?} owned twice", a.secret_tag)));
             }
             if !a.store_dir.is_empty() {
-                let p = Path::new(&a.store_dir);
-                let inside = p.is_relative()
-                    && p.components()
-                        .all(|c| matches!(c, std::path::Component::Normal(_)))
-                    && a.store_dir.starts_with(&format!("{ACCOUNTS_SUBDIR}/"));
-                if !inside {
+                // Exactly `accounts/<slot>`: one non-empty slot of hex and
+                // `-`, no trailing slash, no nesting. The container itself
+                // (`accounts/`) or a nested path would make a removal
+                // delete other accounts' stores.
+                let slot = a.store_dir.strip_prefix(&format!("{ACCOUNTS_SUBDIR}/"));
+                let canonical = slot.is_some_and(|slot| {
+                    !slot.is_empty() && slot.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+                });
+                if !canonical {
                     return Err(bad(format!(
-                        "store dir {:?} escapes accounts/",
+                        "store dir {:?} is not accounts/<slot>",
                         a.store_dir
                     )));
                 }
@@ -328,9 +331,22 @@ impl AccountRegistry {
         fs::rename(&tmp, &path).map_err(|e| {
             Error::Storage(format!("account registry rename {}: {e}", path.display()))
         })?;
-        if let Ok(dir) = File::open(data_dir) {
-            let _ = dir.sync_all();
-        }
+        // The rename is only durable once the directory entry is: a crash
+        // before that can resurrect the previous registry after a reported
+        // success, which is exactly the registry/keychain drift this file
+        // exists to prevent.
+        let dir = File::open(data_dir).map_err(|e| {
+            Error::Storage(format!(
+                "account registry open dir {}: {e}",
+                data_dir.display()
+            ))
+        })?;
+        dir.sync_all().map_err(|e| {
+            Error::Storage(format!(
+                "account registry fsync dir {}: {e}",
+                data_dir.display()
+            ))
+        })?;
         Ok(())
     }
 
@@ -816,6 +832,60 @@ mod tests {
 
         fs::write(&path, good).unwrap();
         AccountRegistry::load(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn the_accounts_container_or_a_nested_dir_is_not_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Identity::generate();
+        let b = Identity::generate();
+        register_legacy(dir.path(), &hex_of(&a)).unwrap();
+        add_account(dir.path(), &hex_of(&b), None).unwrap();
+        let path = registry_path(dir.path());
+        let good = fs::read_to_string(&path).unwrap();
+        let own = format!("accounts/{}", hex_of(&b));
+        for bad in [
+            "accounts/".to_string(),
+            format!("{own}/"),
+            format!("{own}/inner"),
+            "accounts/../x".to_string(),
+        ] {
+            fs::write(&path, good.replace(&own, &bad)).unwrap();
+            assert!(
+                matches!(
+                    AccountRegistry::load(dir.path()).unwrap_err(),
+                    Error::Storage(_)
+                ),
+                "{bad} must be rejected"
+            );
+        }
+        fs::write(&path, good).unwrap();
+        AccountRegistry::load(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn a_registry_missing_its_accounts_field_is_corrupt_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(registry_path(dir.path()), br#"{"version":1}"#).unwrap();
+        assert!(matches!(
+            AccountRegistry::load(dir.path()).unwrap_err(),
+            Error::Storage(_)
+        ));
+        // A row without its ownership metadata is corrupt too.
+        let a = Identity::generate();
+        fs::write(
+            registry_path(dir.path()),
+            format!(
+                r#"{{"version":1,"accounts":[{{"pubkey_hex":"{}","npub":"{}"}}]}}"#,
+                hex_of(&a),
+                a.npub()
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            AccountRegistry::load(dir.path()).unwrap_err(),
+            Error::Storage(_)
+        ));
     }
 
     #[test]

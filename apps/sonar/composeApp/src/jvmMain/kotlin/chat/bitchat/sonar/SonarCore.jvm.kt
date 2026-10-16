@@ -101,7 +101,19 @@ actual object SonarCore {
         secretTag = "", isLegacy = true, isActive = true, lastActiveAt = 0,
     )
 
-    private fun activeAccount(): SonarAccount = accounts().active ?: legacyAccount()
+    /** The account whose store this process opens. A registry that exists
+     *  but cannot be read falls back to the legacy store ONLY on an install
+     *  that never had a second account (no `accounts/` directory); with one,
+     *  the legacy slot may be another identity than the one the user had
+     *  selected, so the open is refused instead (Durability rule 2). */
+    private fun activeAccount(): SonarAccount {
+        val snap = accounts()
+        snap.active?.let { return it }
+        if (snap.fault != null && File(marmotDir(), "accounts").isDirectory) {
+            throw IllegalStateException("Account list unreadable: ${snap.fault}. Restore it before opening a chat account.")
+        }
+        return legacyAccount()
+    }
     private fun nsecKey(): String = activeAccount().nsecSecretKey
     private fun dbKeyKey(): String = activeAccount().dbKeySecretKey
 
@@ -1247,6 +1259,7 @@ actual object SonarCore {
                     val dbPath = marmotDbPath()
                     val dbKeyHex = loadOrCreateDbKey()
                     sealedForPubkeyHex = activeAccount().pubkeyHex
+                    sealedNsec = nsec
                     closeNode()
                     uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex)
                 }
@@ -1257,6 +1270,9 @@ actual object SonarCore {
      *  same nsec, or a switch in between would file A's ciphertext as B's
      *  latest backup. */
     @Volatile private var sealedForPubkeyHex: String = ""
+    /** The nsec captured when that seal ran: the upload signs with it, never
+     *  with whatever account is active once the network call returns. */
+    @Volatile private var sealedNsec: String = ""
 
     /** Store whose backup is being recorded: the one the seal ran for, which
      *  is the active one unless a switch happened while the upload was out.
@@ -1277,11 +1293,12 @@ actual object SonarCore {
     }
 
     actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
-        check(sealedForPubkeyHex.isEmpty() || sealedForPubkeyHex == activeAccount().pubkeyHex) {
-            "the sealed backup belongs to another account; seal again"
-        }
         SonarNativeLoader.ensureLoaded()
-        val nsec = DesktopSecrets.get(nsecKey()) ?: error("no identity to back up")
+        // Sign with the key captured at seal time: a switch between seal and
+        // upload must never pair A's ciphertext with B's nsec.
+        val nsec = sealedNsec.takeIf { it.isNotEmpty() }
+            ?: DesktopSecrets.get(nsecKey())
+            ?: error("no identity to back up")
         val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
         "uploaded ${info.size} bytes"
     }
@@ -1434,7 +1451,13 @@ actual object SonarCore {
                 // too — at verbose level they can contain peer npubs and must not
                 // survive a wipe (Account Key Durability / privacy rule).
                 // Every account's secret names, read BEFORE the registry goes.
-                val accountKeys = accounts().accounts.flatMap { listOf(it.nsecSecretKey, it.dbKeySecretKey) }
+                // When the registry cannot be read, the `accounts/<tag>`
+                // directory names ARE the tags: never leave a key behind
+                // because the list that named it was corrupt.
+                val snap = accounts()
+                val dirTags = File(marmotDir(), "accounts").listFiles()?.filter { it.isDirectory }?.map { it.name }.orEmpty()
+                val tags = (snap.accounts.map { it.secretTag } + dirTags).toSet()
+                val accountKeys = tags.flatMap { listOf(accountSecretKeyName(NSEC_SECRET_BASE, it), accountSecretKeyName(DB_KEY_SECRET_BASE, it)) }
                 // The whole root: every account's store, the registry, logs.
                 val wipeFailure = runCatching { wipeMarmotStorage(marmotDir()) }.exceptionOrNull()
                 invalidateRegistry()

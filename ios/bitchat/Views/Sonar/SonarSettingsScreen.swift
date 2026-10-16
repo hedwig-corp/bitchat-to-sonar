@@ -747,27 +747,19 @@ struct SNAddAccountSheetContent: View {
                 .foregroundColor(SonarTheme.text3)
                 .padding(.vertical, 6)
 
-            ZStack(alignment: .topLeading) {
-                if nsec.isEmpty {
-                    Text(verbatim: "nsec1\u{2026}")
-                        .font(SonarTheme.monoFont(size: 15))
-                        .foregroundColor(SonarTheme.text3)
-                        .padding(EdgeInsets(top: 14, leading: 16, bottom: 0, trailing: 16))
-                        .allowsHitTesting(false)
-                }
-                TextEditor(text: $nsec)
-                    .font(SonarTheme.monoFont(size: 15))
-                    .foregroundColor(SonarTheme.text)
-                    .frame(minHeight: 72)
-                    .scrollContentBackground(.hidden)
-                    .padding(EdgeInsets(top: 6, leading: 11, bottom: 6, trailing: 11))
-                    #if os(iOS)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    #endif
-            }
-            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(SonarTheme.surface2))
-            .padding(.horizontal, 8)
+            // A signing secret: secure entry (no third-party keyboard access,
+            // no autocorrect, masked). Paste still works.
+            SecureField(String("nsec1\u{2026}"), text: $nsec)
+                .font(SonarTheme.monoFont(size: 15))
+                .foregroundColor(SonarTheme.text)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textContentType(.password)
+                #endif
+                .padding(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(SonarTheme.surface2))
+                .padding(.horizontal, 8)
 
             if let errorText {
                 Text(verbatim: errorText)
@@ -785,7 +777,7 @@ struct SNAddAccountSheetContent: View {
                 add(nsec: nsec)
             }
             .padding(EdgeInsets(top: 10, leading: 8, bottom: 0, trailing: 8))
-            SNGhostButton(label: String(localized: "Cancel"), action: onClose)
+            SNGhostButton(label: String(localized: "Cancel"), action: { if !inFlight { onClose() } })
                 .padding(.top, 4)
         }
     }
@@ -841,7 +833,7 @@ struct SNRemoveAccountSheetContent: View {
                 ) {
                     remove()
                 }
-                SNGhostButton(label: String(localized: "Cancel"), action: onClose)
+                SNGhostButton(label: String(localized: "Cancel"), action: { if !inFlight { onClose() } })
             }
             .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
         }

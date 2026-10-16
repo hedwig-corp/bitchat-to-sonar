@@ -3346,6 +3346,11 @@ final class SonarAppStore: ObservableObject {
             return
         }
 
+        // Same gate as switch / add: an in-place replacement must not
+        // interleave with a switch, or it would replace the account the switch
+        // just activated instead of the one it started on.
+        try beginAccountChange()
+        defer { endAccountChange() }
         // Hold Marmot's send/setup suspension across wallet deletion and every
         // host-owned cache mutation, not just the core database replacement.
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
@@ -3507,8 +3512,11 @@ final class SonarAppStore: ObservableObject {
         switch outcome {
         case .restored:
             showToast(String(localized: "Account added — chats recovered from backup"))
-        case .missing, .failed:
+        case .missing:
             showToast(String(localized: "Account added — chats start empty on this phone"))
+        case .failed:
+            // Actionable (retry online), not "there was nothing to restore".
+            showToast(String(localized: "Account restored — chat backup restore failed; try again when online"))
         case .unchanged:
             break
         }
@@ -11279,9 +11287,15 @@ final class SonarAppStore: ObservableObject {
         if let accountPubkeyHex {
             if accounts.isEmpty { refreshAccounts() }
         }
+        // An explicitly account-scoped banner whose account is gone: never
+        // open its chat under another identity.
         if let accountPubkeyHex,
-           accountPubkeyHex != SonarAccountRegistry.snapshot().active?.pubkeyHex,
-           SonarAccountRegistry.snapshot().accounts.contains(where: { $0.pubkeyHex == accountPubkeyHex }) {
+           !SonarAccountRegistry.snapshot().accounts.contains(where: { $0.pubkeyHex == accountPubkeyHex }) {
+            showToast(String(localized: "That account is no longer on this phone."))
+            return
+        }
+        if let accountPubkeyHex,
+           accountPubkeyHex != SonarAccountRegistry.snapshot().active?.pubkeyHex {
             let jump = jumpMessageId
             Task { @MainActor in
                 do {
@@ -12107,6 +12121,13 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func performWipe() async {
+        // A switch or add mid-flight could register a key after the wipe
+        // enumerated them; refuse rather than leave that key behind.
+        do { try beginAccountChange() } catch {
+            showToast(String(localized: "Another account change is still finishing. Try again in a moment."))
+            return
+        }
+        defer { endAccountChange() }
         // Every account's keychain names, captured BEFORE the Marmot wipe
         // removes the registry they are read from.
         let accountNsecKeys = SonarAccountRegistry.allKeychainKeysForWipe()

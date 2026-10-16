@@ -387,6 +387,7 @@ class NotificationService: SDKNotificationService {
         var activePubkey: String?
         var lastError: Error?
         var opened = 0
+        var collected = 0
         for (index, account) in accounts.enumerated() {
             if index > 0, Date().timeIntervalSince(startedAt) > Self.wakeAccountsDeadlineSecs {
                 Self.recordDiagnostic("wakeAccounts:deadline opened=\(opened)")
@@ -397,7 +398,7 @@ class NotificationService: SDKNotificationService {
             wakeNodeLock.lock()
             let lockStillHeld = marmotWakeStoreLock != nil
             wakeNodeLock.unlock()
-            if index > 0, !lockStillHeld {
+            if !lockStillHeld {
                 Self.recordDiagnostic("wakeAccounts:lockReleased opened=\(opened)")
                 break
             }
@@ -415,6 +416,14 @@ class NotificationService: SDKNotificationService {
                 dbURL = try Self.existingMarmotDatabaseURL(path: account.dbPath)
             } catch {
                 lastError = error
+                continue
+            }
+            // An interrupted Blossom restore left staging beside this store:
+            // only the app's own connect reconciles it. Opening here would
+            // pair the old file with the restored key.
+            if accountRestoreStagingPresent(dbPath: dbURL.path) {
+                Self.recordDiagnostic("wakeAccounts:restoreStaged active=\(account.isActive)")
+                lastError = NSEMarmotError.storeBusy
                 continue
             }
             let identity: SonarIdentity
@@ -456,6 +465,7 @@ class NotificationService: SDKNotificationService {
             let drained: [DrainNotificationInfo]
             do {
                 drained = try node.collectNotificationsAfterWake(maxWaitMs: waitMs)
+                collected += 1
             } catch {
                 lastError = error
                 dropWakeNode()
@@ -493,7 +503,8 @@ class NotificationService: SDKNotificationService {
             )
             return (activeFallback, activePubkey)
         }
-        if opened == 0, let lastError { throw lastError }
+        // A connect that never collected is a failure, not an empty drain.
+        if collected == 0, let lastError { throw lastError }
         return ([], nil)
     }
 

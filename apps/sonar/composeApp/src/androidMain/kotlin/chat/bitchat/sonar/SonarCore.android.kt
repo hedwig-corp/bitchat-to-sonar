@@ -106,8 +106,20 @@ actual object SonarCore {
         secretTag = "", isLegacy = true, isActive = true, lastActiveAt = 0,
     )
 
-    /** The account whose store this process opens. */
-    private fun activeAccount(): SonarAccount = accounts().active ?: legacyAccount()
+    /** The account whose store this process opens. A registry that exists
+     *  but cannot be read falls back to the legacy store ONLY on an install
+     *  that never had a second account (no `accounts/` directory); with one,
+     *  the legacy slot may be another identity than the one the user had
+     *  selected, so the open is refused instead (Durability rule 2: surface,
+     *  never substitute). */
+    private fun activeAccount(): SonarAccount {
+        val snap = accounts()
+        snap.active?.let { return it }
+        if (snap.fault != null && File(marmotDataDir(), "accounts").isDirectory) {
+            throw IllegalStateException("Account list unreadable: ${snap.fault}. Restore it before opening a chat account.")
+        }
+        return legacyAccount()
+    }
 
     private fun nsecKey(): String = activeAccount().nsecSecretKey
     private fun dbKeyKey(): String = activeAccount().dbKeySecretKey
@@ -256,7 +268,7 @@ actual object SonarCore {
      */
     internal suspend fun peekInactiveAccountsForWake(
         waitMs: Long,
-        maxAccounts: Int = 4,
+        maxAccounts: Int = 2,
     ): List<SonarAccount> = withContext(Dispatchers.IO) {
         lock.withLock {
             stickerOperationLock.write {
@@ -284,6 +296,13 @@ actual object SonarCore {
             // Registry and keystore can drift; never sync one identity
             // against another account's store.
             if (identity.pubkeyHex() != account.pubkeyHex) continue
+            // An interrupted Blossom restore left staging beside this store:
+            // opening it here would pair the old file with the restored key
+            // and trip the engine's self-heal wipe. Leave it for the account's
+            // own open, which reconciles first.
+            if (runCatching { uniffi.sonar_ffi.reconcileAccountRestore(account.dbPath, dbKeyHex) }.isFailure ||
+                uniffi.sonar_ffi.accountRestoreStagingPresent(account.dbPath)
+            ) continue
             val peek = try {
                 SonarNode.connect(identity, relayUrls, account.dbPath, dbKeyHex, null)
             } catch (e: Throwable) {
@@ -1372,6 +1391,7 @@ actual object SonarCore {
                     val dbPath = marmotDbPath()
                     val dbKeyHex = loadOrCreateDbKey()
                     sealedForPubkeyHex = activeAccount().pubkeyHex
+                    sealedNsec = nsec
                     closeNode()
                     uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex)
                 }
@@ -1382,6 +1402,9 @@ actual object SonarCore {
      *  same nsec, or a switch in between would file A's ciphertext as B's
      *  latest backup. */
     @Volatile private var sealedForPubkeyHex: String = ""
+    /** The nsec captured when that seal ran: the upload signs with it, never
+     *  with whatever account is active once the network call returns. */
+    @Volatile private var sealedNsec: String = ""
 
     /** Store whose backup is being recorded: the one the seal ran for, which
      *  is the active one unless a switch happened while the upload was out.
@@ -1402,10 +1425,10 @@ actual object SonarCore {
     }
 
     actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
-        check(sealedForPubkeyHex.isEmpty() || sealedForPubkeyHex == activeAccount().pubkeyHex) {
-            "the sealed backup belongs to another account; seal again"
-        }
-        val nsec = AndroidSecrets.getMigrating(nsecKey(), durable = true)
+        // Sign with the key captured at seal time: a switch between seal and
+        // upload must never pair A's ciphertext with B's nsec.
+        val nsec = sealedNsec.takeIf { it.isNotEmpty() }
+            ?: AndroidSecrets.getMigrating(nsecKey(), durable = true)
             ?: error("no identity to back up")
         val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
         // Blob sha prefix, not the URL: Diagnostics → Share exports this log
