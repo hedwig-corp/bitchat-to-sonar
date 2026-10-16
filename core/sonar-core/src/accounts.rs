@@ -335,18 +335,24 @@ impl AccountRegistry {
         // before that can resurrect the previous registry after a reported
         // success, which is exactly the registry/keychain drift this file
         // exists to prevent.
-        let dir = File::open(data_dir).map_err(|e| {
-            Error::Storage(format!(
-                "account registry open dir {}: {e}",
-                data_dir.display()
-            ))
-        })?;
-        dir.sync_all().map_err(|e| {
-            Error::Storage(format!(
-                "account registry fsync dir {}: {e}",
-                data_dir.display()
-            ))
-        })?;
+        // Windows cannot open a directory handle this way and its rename is
+        // durable on its own; everywhere else the directory fsync is part of
+        // the write.
+        #[cfg(not(windows))]
+        {
+            let dir = File::open(data_dir).map_err(|e| {
+                Error::Storage(format!(
+                    "account registry open dir {}: {e}",
+                    data_dir.display()
+                ))
+            })?;
+            dir.sync_all().map_err(|e| {
+                Error::Storage(format!(
+                    "account registry fsync dir {}: {e}",
+                    data_dir.display()
+                ))
+            })?;
+        }
         Ok(())
     }
 

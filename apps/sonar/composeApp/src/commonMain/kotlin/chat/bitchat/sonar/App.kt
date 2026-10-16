@@ -348,7 +348,9 @@ fun App(
             val target = req.accountPubkeyHex
             // Resolve against the registry, not the UI list: on a cold launch
             // from the tap `state.accounts` may not have been refreshed yet.
-            val registry = if (target != null) SonarCore.accounts() else null
+            // Every account-scoped request takes one of the two scoped
+            // branches below; only an unscoped request falls through.
+            val registry = target?.let { SonarCore.accounts() }
             if (target != null && registry != null &&
                 target != registry.active?.pubkeyHex &&
                 registry.accounts.any { it.pubkeyHex == target }
@@ -363,7 +365,7 @@ fun App(
                         }
                     }.onFailure { state.toast = it.message }
                 }
-            } else if (target != null && registry?.accounts?.none { it.pubkeyHex == target } == true) {
+            } else if (target != null && registry != null && target != registry.active?.pubkeyHex) {
                 // An explicitly account-scoped banner whose account is gone:
                 // never open its chat under another identity.
                 state.toast = "That account is no longer on this phone."

@@ -243,6 +243,7 @@ actual object SonarCore {
                     uniffi.sonar_ffi.accountRegistryRemove(marmotDir().absolutePath, pubkeyHex).also { invalidateRegistry() }
                 }
                 val removed = out.removed.toCommon()
+                if (removed.pubkeyHex == sealedForPubkeyHex) clearSealedCredential()
                 DesktopSecrets.clear(removed.nsecSecretKey, removed.dbKeySecretKey)
             }
         }
@@ -1261,7 +1262,7 @@ actual object SonarCore {
                     sealedForPubkeyHex = activeAccount().pubkeyHex
                     sealedNsec = nsec
                     closeNode()
-                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex)
+                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex).also { sealedDigest = sha256Hex(it) }
                 }
             }
         }
@@ -1273,6 +1274,21 @@ actual object SonarCore {
     /** The nsec captured when that seal ran: the upload signs with it, never
      *  with whatever account is active once the network call returns. */
     @Volatile private var sealedNsec: String = ""
+    /** SHA-256 of the sealed bytes that [sealedNsec] belongs to, so an
+     *  upload of some OTHER ciphertext (an older seal kept by a caller) is
+     *  refused instead of signed with the wrong key. */
+    @Volatile private var sealedDigest: String = ""
+
+    private fun sha256Hex(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    /** Forget the seal-time credential: after the upload that consumed it, and
+     *  whenever the account it belongs to is removed or wiped. */
+    private fun clearSealedCredential() {
+        sealedForPubkeyHex = ""
+        sealedNsec = ""
+        sealedDigest = ""
+    }
 
     /** Store whose backup is being recorded: the one the seal ran for, which
      *  is the active one unless a switch happened while the upload was out.
@@ -1296,10 +1312,18 @@ actual object SonarCore {
         SonarNativeLoader.ensureLoaded()
         // Sign with the key captured at seal time: a switch between seal and
         // upload must never pair A's ciphertext with B's nsec.
+        // The captured key signs ONLY the ciphertext it was captured for.
+        check(sealedDigest.isEmpty() || sealedDigest == sha256Hex(sealed)) {
+            "the sealed backup is not the most recent seal; seal again"
+        }
         val nsec = sealedNsec.takeIf { it.isNotEmpty() }
             ?: DesktopSecrets.get(nsecKey())
             ?: error("no identity to back up")
-        val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
+        val info = try {
+            uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
+        } finally {
+            clearSealedCredential()
+        }
         "uploaded ${info.size} bytes"
     }
 
@@ -1444,20 +1468,31 @@ actual object SonarCore {
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             stickerOperationLock.write {
+                // Every account's secret names, read BEFORE anything is torn
+                // down or deleted. When the registry cannot be read, the
+                // `accounts/<tag>` directory names ARE the tags: never leave
+                // a key behind because the list that named it was corrupt.
+                val snap = accounts()
+                val accountsDir = File(marmotDir(), "accounts")
+                val dirTags = if (accountsDir.exists()) {
+                    // null here is an I/O failure, not "empty": deleting the
+                    // stores would then orphan keys we could not enumerate.
+                    // Nothing has been closed or removed yet, so the abort
+                    // leaves the account exactly as it was.
+                    accountsDir.listFiles()?.filter { it.isDirectory }?.map { it.name }
+                        ?: error("cannot list ${accountsDir.path}; wipe aborted before deleting anything")
+                } else {
+                    emptyList()
+                }
+                val tags = (snap.accounts.map { it.secretTag } + dirTags).toSet()
+                val accountKeys = tags.flatMap { listOf(accountSecretKeyName(NSEC_SECRET_BASE, it), accountSecretKeyName(DB_KEY_SECRET_BASE, it)) }
                 closeNode()
+                clearSealedCredential()
                 npub = ""; pubkeyHex = ""
                 // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
                 // the exported diagnostics zips live in a sibling dir, so drop them
                 // too — at verbose level they can contain peer npubs and must not
                 // survive a wipe (Account Key Durability / privacy rule).
-                // Every account's secret names, read BEFORE the registry goes.
-                // When the registry cannot be read, the `accounts/<tag>`
-                // directory names ARE the tags: never leave a key behind
-                // because the list that named it was corrupt.
-                val snap = accounts()
-                val dirTags = File(marmotDir(), "accounts").listFiles()?.filter { it.isDirectory }?.map { it.name }.orEmpty()
-                val tags = (snap.accounts.map { it.secretTag } + dirTags).toSet()
-                val accountKeys = tags.flatMap { listOf(accountSecretKeyName(NSEC_SECRET_BASE, it), accountSecretKeyName(DB_KEY_SECRET_BASE, it)) }
                 // The whole root: every account's store, the registry, logs.
                 val wipeFailure = runCatching { wipeMarmotStorage(marmotDir()) }.exceptionOrNull()
                 invalidateRegistry()

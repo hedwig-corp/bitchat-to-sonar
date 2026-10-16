@@ -328,6 +328,7 @@ actual object SonarCore {
                     uniffi.sonar_ffi.accountRegistryRemove(marmotDataDir().absolutePath, pubkeyHex).also { invalidateRegistry() }
                 }
                 val removed = out.removed.toCommon()
+                if (removed.pubkeyHex == sealedForPubkeyHex) clearSealedCredential()
                 // Explicit user action on a store the core has just wiped: the
                 // keys guard nothing any more. The account's Cashu directory is
                 // kept — it may hold funds.
@@ -1393,7 +1394,7 @@ actual object SonarCore {
                     sealedForPubkeyHex = activeAccount().pubkeyHex
                     sealedNsec = nsec
                     closeNode()
-                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex)
+                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex).also { sealedDigest = sha256Hex(it) }
                 }
             }
         }
@@ -1405,6 +1406,21 @@ actual object SonarCore {
     /** The nsec captured when that seal ran: the upload signs with it, never
      *  with whatever account is active once the network call returns. */
     @Volatile private var sealedNsec: String = ""
+    /** SHA-256 of the sealed bytes that [sealedNsec] belongs to, so an
+     *  upload of some OTHER ciphertext (an older seal kept by a caller) is
+     *  refused instead of signed with the wrong key. */
+    @Volatile private var sealedDigest: String = ""
+
+    private fun sha256Hex(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    /** Forget the seal-time credential: after the upload that consumed it, and
+     *  whenever the account it belongs to is removed or wiped. */
+    private fun clearSealedCredential() {
+        sealedForPubkeyHex = ""
+        sealedNsec = ""
+        sealedDigest = ""
+    }
 
     /** Store whose backup is being recorded: the one the seal ran for, which
      *  is the active one unless a switch happened while the upload was out.
@@ -1427,10 +1443,18 @@ actual object SonarCore {
     actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
         // Sign with the key captured at seal time: a switch between seal and
         // upload must never pair A's ciphertext with B's nsec.
+        // The captured key signs ONLY the ciphertext it was captured for.
+        check(sealedDigest.isEmpty() || sealedDigest == sha256Hex(sealed)) {
+            "the sealed backup is not the most recent seal; seal again"
+        }
         val nsec = sealedNsec.takeIf { it.isNotEmpty() }
             ?: AndroidSecrets.getMigrating(nsecKey(), durable = true)
             ?: error("no identity to back up")
-        val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
+        val info = try {
+            uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
+        } finally {
+            clearSealedCredential()
+        }
         // Blob sha prefix, not the URL: Diagnostics → Share exports this log
         // (#176), and the full URL is a direct fetch handle to the user's
         // backup ciphertext.
@@ -1585,6 +1609,7 @@ actual object SonarCore {
                 // with the previous account's open-chat context.
                 AndroidCrashDiagnostics.clear()
                 closeNode()
+                clearSealedCredential()
                 npub = ""; pubkeyHex = ""
                 // Drop the encrypted Marmot DB + all prefs. The diagnostics logs
                 // live under sonar-marmot/ (logs/), so this also removes them — at

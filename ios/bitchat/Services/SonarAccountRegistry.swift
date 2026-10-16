@@ -219,10 +219,19 @@ enum SonarAccountRegistry {
         return SonarAccount(legacyAt: try legacyDatabasePath())
     }
 
+    /// True unless the `accounts/` path is CONFIRMED absent: an unreadable
+    /// or indeterminate state counts as "may have had a second account", so
+    /// a faulted registry refuses rather than falling back to the legacy slot.
     private static func hasAccountsDirectory() -> Bool {
-        guard let dir = try? dataDirectory().appendingPathComponent("accounts", isDirectory: true) else { return false }
-        var isDir: ObjCBool = false
-        return FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir) && isDir.boolValue
+        guard let dir = try? dataDirectory().appendingPathComponent("accounts", isDirectory: true) else { return true }
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: dir.path)
+            return true
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            return false
+        } catch {
+            return true
+        }
     }
 
     /// Tags of every `accounts/<tag>` directory on disk — the registry's view
@@ -387,6 +396,13 @@ enum SonarAccountRegistry {
         // named it was corrupt.
         for t in onDiskSecretTags() { tags.insert(t) }
         tags.insert(refusedSecretTag)
-        return tags.flatMap { [nsecKeychainKey(tag: $0), dbKeychainKey(tag: $0)] }
+        var keys = tags.flatMap { [nsecKeychainKey(tag: $0), dbKeychainKey(tag: $0)] }
+        // Keys a removal could not delete are named exactly; include them.
+        keys += UserDefaults.standard.stringArray(forKey: pendingSecretCleanupKey) ?? []
+        // Belt and braces only: the panic wipe's `KeychainManager
+        // .deleteAllKeychainData()` sweeps every item in the service and the
+        // App Group regardless of tag, so an enumeration miss here cannot
+        // leave a key behind on a wipe.
+        return Array(Set(keys))
     }
 }
