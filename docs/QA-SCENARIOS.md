@@ -19,6 +19,13 @@ becomes a scenario here, so the next pass checks it by default.
    platform can be driven, say why (Cross-Platform Feature Rule).
 5. A bug that has now happened **twice** also gets a `docs/REGRESSIONS.md`
    entry — this registry is the checklist, the ledger is the invariant.
+6. **Do not only test from a clean start.** A fresh account on healthy
+   relays hides every bug that needs earlier state: a publish lost to an
+   offline window or a rate-limiting relay, or a schema stamped by an older
+   build. When a fix is for such a bug, its scenario must *create* that
+   state. Examples: an offline window (QA-142, `QA_SLOW=1`), or an in-place
+   upgrade from the previous release on an emulator that is never
+   `--fresh`-ed. Proving that the happy path works is not enough.
 
 Peers are fresh `sonar-cli` identities from `scripts/qa/peers.sh`; "the app"
 is the build under test on a dedicated QA emulator/simulator.
@@ -712,15 +719,35 @@ share a zone with the app and report the zone the app shared with it.
 
 ### QA-142 — A share lost on the way is sent again
 - **Platforms:** both. The fix is in core, so both apps get it.
-- **How:** automated in core, and CI runs it on every PR (`cargo test
-  --workspace`). `timezone_share_lost_while_offline_reaches_the_peer_once_back_online`
-  drives the whole path through a relay. Alice shares while no relay is
-  reachable, the outbox gives up, and the lost rumor still uses up one MLS
-  message key. Alice relaunches online, and Bob must receive and decrypt
-  her zone. Without the fix Bob never gets it, the same symptom as on the
-  device. The Android smoke gets no separate step: there `sonar-cli` is the
-  sender, so the step would re-run this same core code, and the app's
-  header already has QA-072.
+- **How:** automated twice.
+  - **In core, on every PR** (CI runs `cargo test --workspace`):
+    `timezone_share_lost_while_offline_reaches_the_peer_once_back_online`.
+    Alice shares with no relay reachable, the outbox gives up, and the lost
+    rumor still uses up one MLS message key. Alice relaunches online, and
+    Bob must receive and decrypt her zone.
+  - **On the app:** `QA_SLOW=1 android-smoke.sh` runs QA-142, about 12 min.
+    1. Sharing on for the peer's chat only (its own toggle), so exactly one
+       share row exists. With the Settings default on, 20 failures spread
+       over every chat and no share runs out: the first draft of this step
+       passed without ever reaching the fix. The peer confirms the current
+       zone.
+    2. Airplane mode, and wait until the emulator is really offline: the
+       link takes a few seconds to drop. A share created before that
+       reaches the relay while its ack is lost, and the step would prove
+       nothing. Then change the emulator timezone: a share that cannot
+       leave the phone.
+    3. Wait until one share (one `message_id`) has 20 `send_publish_failed`
+       in logcat, its whole budget. That takes about 2 min, because every
+       reconnect attempt re-publishes the row.
+    4. Check that the peer does NOT have the new zone yet. If it does, the
+       share leaked out and the step fails as a harness error.
+    5. Back online: the peer must receive the new zone within 180 s.
+
+  Without the fix, the app's sent-share record claims delivery and the peer
+  never gets it. `plan.sh` asks for `QA_SLOW=1` whenever a diff touches the
+  outbox, local time, the conversation index or `client.rs`.
+  iOS: same core. The app side is QA-072 (header) plus a manual pass of the
+  steps below.
 - **Steps (real accounts, the case that found it):** on two of your own
   devices with *Share local time* on, open their 1:1 chat on each. Read the
   sender's `sonar-core.log`, and on the receiver look for `cached private
@@ -733,8 +760,10 @@ share a zone with the app and report the zone the app shared with it.
   with an empty sent-share record and healthy relays, so the first share
   always arrives. The bug needs a record written while its publish was lost:
   an alpha.15 burst into a rate-limiting relay, or the outbox spending all
-  20 publish attempts. The backoff is 2, 2, 4, 8, 16 s and then 30 s, so
-  that takes only about 8 minutes offline with the app in the foreground.
+  20 publish attempts. Offline, that takes about 2 min with the app in the
+  foreground (measured on an emulator), not the 8 min the 2/2/4/8/16/30 s
+  backoff table suggests: every relay reconnect attempt re-publishes the
+  row.
 - **Guard:** `client.rs::timezone_share_lost_while_offline_reaches_the_peer_once_back_online`,
   `client.rs::timezone_share_the_outbox_gave_up_on_is_shared_again_on_the_heartbeat`,
   `client.rs::timezone_share_abandoned_before_a_restart_is_shared_again`,
