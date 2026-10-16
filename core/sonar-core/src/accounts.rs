@@ -335,9 +335,29 @@ impl AccountRegistry {
         // before that can resurrect the previous registry after a reported
         // success, which is exactly the registry/keychain drift this file
         // exists to prevent.
-        // Windows cannot open a directory handle this way and its rename is
-        // durable on its own; everywhere else the directory fsync is part of
-        // the write.
+        // On Windows a directory handle needs FILE_FLAG_BACKUP_SEMANTICS and
+        // FlushFileBuffers on it is best effort: NTFS journals the rename's
+        // metadata, but a power loss right after a reported success can still
+        // surface the previous registry. No Sonar build ships on Windows; the
+        // attempt is made and a refusal is logged rather than failing every
+        // registry write on a platform this cannot be verified on.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            let flushed = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(data_dir)
+                .and_then(|dir| dir.sync_all());
+            if let Err(e) = flushed {
+                tracing::warn!(
+                    "account registry: directory flush unavailable on Windows ({}): {e}",
+                    data_dir.display()
+                );
+            }
+        }
         #[cfg(not(windows))]
         {
             let dir = File::open(data_dir).map_err(|e| {

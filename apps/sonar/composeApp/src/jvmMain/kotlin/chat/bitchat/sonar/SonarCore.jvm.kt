@@ -243,7 +243,7 @@ actual object SonarCore {
                     uniffi.sonar_ffi.accountRegistryRemove(marmotDir().absolutePath, pubkeyHex).also { invalidateRegistry() }
                 }
                 val removed = out.removed.toCommon()
-                if (removed.pubkeyHex == sealedForPubkeyHex) clearSealedCredential()
+                seal.get()?.takeIf { it.pubkeyHex == removed.pubkeyHex }?.let { forgetSeal(it) }
                 DesktopSecrets.clear(removed.nsecSecretKey, removed.dbKeySecretKey)
             }
         }
@@ -1259,35 +1259,31 @@ actual object SonarCore {
                     val nsec = DesktopSecrets.get(nsecKey()) ?: error("no identity to back up")
                     val dbPath = marmotDbPath()
                     val dbKeyHex = loadOrCreateDbKey()
-                    sealedForPubkeyHex = activeAccount().pubkeyHex
-                    sealedNsec = nsec
+                    val forPubkeyHex = activeAccount().pubkeyHex
                     closeNode()
-                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex).also { sealedDigest = sha256Hex(it) }
+                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex).also {
+                        seal.set(SealRecord(forPubkeyHex, nsec, sha256Hex(it)))
+                    }
                 }
             }
         }
 
-    /** Account the last [sealAccountBackup] ran for: an upload must use the
-     *  same nsec, or a switch in between would file A's ciphertext as B's
-     *  latest backup. */
-    @Volatile private var sealedForPubkeyHex: String = ""
-    /** The nsec captured when that seal ran: the upload signs with it, never
-     *  with whatever account is active once the network call returns. */
-    @Volatile private var sealedNsec: String = ""
-    /** SHA-256 of the sealed bytes that [sealedNsec] belongs to, so an
-     *  upload of some OTHER ciphertext (an older seal kept by a caller) is
-     *  refused instead of signed with the wrong key. */
-    @Volatile private var sealedDigest: String = ""
+    /** What the last [sealAccountBackup] produced: the account it ran for,
+     *  the nsec captured then, and the SHA-256 of the ciphertext. One
+     *  immutable record replaced as a whole, so an upload or a bookkeeping
+     *  write that captured it keeps a consistent view even when a newer seal
+     *  lands meanwhile. Clearing is compare-and-set against the record the
+     *  caller holds: a finished upload never erases a newer seal. */
+    private class SealRecord(val pubkeyHex: String, val nsec: String, val digest: String)
+    private val seal = java.util.concurrent.atomic.AtomicReference<SealRecord?>(null)
 
     private fun sha256Hex(bytes: ByteArray): String =
         java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
-    /** Forget the seal-time credential: after the upload that consumed it, and
-     *  whenever the account it belongs to is removed or wiped. */
-    private fun clearSealedCredential() {
-        sealedForPubkeyHex = ""
-        sealedNsec = ""
-        sealedDigest = ""
+    /** Forget a seal-time credential: [record] only, and only while it is
+     *  still the current one; `null` forgets whatever is current (wipe). */
+    private fun forgetSeal(record: SealRecord?) {
+        if (record == null) seal.set(null) else seal.compareAndSet(record, null)
     }
 
     /** Store whose backup is being recorded: the one the seal ran for, which
@@ -1300,9 +1296,8 @@ actual object SonarCore {
      *  record paths are not suspend functions. */
     private val bookkeepingMonitor = Any()
 
-    private fun sealedAccountDbPath(): String? {
-        val sealed = sealedForPubkeyHex
-        if (sealed.isEmpty()) return marmotDbPath()
+    private fun sealedAccountDbPath(record: SealRecord?): String? {
+        val sealed = record?.pubkeyHex ?: return marmotDbPath()
         // The sealed account was removed while the upload was out: there is
         // no store to record against. Never substitute the active account.
         return accounts().accounts.firstOrNull { it.pubkeyHex == sealed }?.dbPath
@@ -1310,20 +1305,16 @@ actual object SonarCore {
 
     actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
-        // Sign with the key captured at seal time: a switch between seal and
-        // upload must never pair A's ciphertext with B's nsec.
-        // The captured key signs ONLY the ciphertext it was captured for.
-        check(sealedDigest.isEmpty() || sealedDigest == sha256Hex(sealed)) {
+        // Sign with the key captured at seal time, and ONLY for the ciphertext
+        // it was captured for: a switch between seal and upload must never
+        // pair A's ciphertext with B's nsec, and there is deliberately no
+        // fallback to the active account's key — without a matching seal the
+        // caller must seal again.
+        val record = seal.get() ?: error("no sealed backup to upload; seal again")
+        check(record.digest == sha256Hex(sealed)) {
             "the sealed backup is not the most recent seal; seal again"
         }
-        val nsec = sealedNsec.takeIf { it.isNotEmpty() }
-            ?: DesktopSecrets.get(nsecKey())
-            ?: error("no identity to back up")
-        val info = try {
-            uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
-        } finally {
-            clearSealedCredential()
-        }
+        val info = uniffi.sonar_ffi.uploadSealedAccountBackup(record.nsec, sealed, null)
         "uploaded ${info.size} bytes"
     }
 
@@ -1382,22 +1373,30 @@ actual object SonarCore {
     actual fun recordBackupSuccess(sizeBytes: Long?) {
         SonarNativeLoader.ensureLoaded()
         synchronized(bookkeepingMonitor) {
-            val target = sealedAccountDbPath() ?: run {
+            val record = seal.get()
+            val target = sealedAccountDbPath(record) ?: run {
                 sonarLog("Backup", "upload finished for a removed account — not recorded")
+                forgetSeal(record)
                 return
             }
             // The key is only for the message count and must belong to the same
             // store: a foreign (non-active) target records without a count.
             val dbKeyHex = if (target == marmotDbPath()) runCatching { loadOrCreateDbKey() }.getOrNull() else null
             uniffi.sonar_ffi.recordBackupSuccess(target, sizeBytes?.toULong(), dbKeyHex)
+            // The upload this seal was for is done: the credential has no
+            // further use. A failed upload keeps it, so the retry of the same
+            // ciphertext signs with the right key (see uploadSealedAccountBackup).
+            forgetSeal(record)
         }
     }
 
     actual fun recordBackupFailure(error: String) {
         SonarNativeLoader.ensureLoaded()
         synchronized(bookkeepingMonitor) {
-            val target = sealedAccountDbPath() ?: run {
+            val record = seal.get()
+            val target = sealedAccountDbPath(record) ?: run {
                 sonarLog("Backup", "upload failed for a removed account — not recorded")
+                forgetSeal(record)
                 return
             }
             uniffi.sonar_ffi.recordBackupFailure(target, error)
@@ -1487,7 +1486,7 @@ actual object SonarCore {
                 val tags = (snap.accounts.map { it.secretTag } + dirTags).toSet()
                 val accountKeys = tags.flatMap { listOf(accountSecretKeyName(NSEC_SECRET_BASE, it), accountSecretKeyName(DB_KEY_SECRET_BASE, it)) }
                 closeNode()
-                clearSealedCredential()
+                forgetSeal(null)
                 npub = ""; pubkeyHex = ""
                 // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
                 // the exported diagnostics zips live in a sibling dir, so drop them
