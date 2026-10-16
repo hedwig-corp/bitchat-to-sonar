@@ -1792,6 +1792,15 @@ impl MarmotEngine {
             .collect())
     }
 
+    /// The relays a group's Marmot routing names: the creator's list at
+    /// creation, the welcome's for a group we joined. Where kind-445 events
+    /// for the group are published and read.
+    pub fn group_relays(&self, group_id: &GroupId) -> Result<Vec<RelayUrl>> {
+        Ok(dispatch!(&self.storage, |mdk| mdk.get_relays(group_id))?
+            .into_iter()
+            .collect())
+    }
+
     /// Pending multi-member welcomes waiting for user acceptance.
     pub fn pending_group_invites(&self) -> Result<Vec<GroupInvite>> {
         let welcomes = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))?;
@@ -2589,6 +2598,8 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         DM_AUTOACCEPT_FILE_SUFFIX,
         DM_AUTOACCEPT_TMP_FILE_SUFFIX,
         KEY_PACKAGE_SLOT_FILE_SUFFIX,
+        crate::relay_routes::RELAY_RECORDS_FILE_SUFFIX,
+        crate::relay_routes::PEER_ROUTES_FILE_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
