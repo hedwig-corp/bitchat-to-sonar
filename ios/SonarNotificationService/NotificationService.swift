@@ -159,13 +159,16 @@ class NotificationService: SDKNotificationService {
                 return
             }
             do {
-                let notifications = try await Task.detached(priority: .userInitiated) { [weak self] in
-                    guard let self else { return [DrainNotificationInfo]() }
+                typealias WakeDrain = (notifications: [DrainNotificationInfo], accountPubkeyHex: String?)
+                let drain: WakeDrain = try await Task.detached(priority: .userInitiated) { [weak self] () throws -> WakeDrain in
+                    guard let self else { return (notifications: [], accountPubkeyHex: nil) }
                     return try self.collectMarmotNotificationsAfterWake(
                         hintGroupIdHex: hintGroupId,
                         hydrateAttempt: attempt
                     )
                 }.value
+                let notifications = drain.notifications
+                let accountPubkeyHex = drain.accountPubkeyHex
                 #if DEBUG
                 Self.logResidentMemory("after-wake")
                 #endif
@@ -239,11 +242,16 @@ class NotificationService: SDKNotificationService {
                 Self.apply(
                     notification: primary,
                     to: content,
-                    prefs: prefs
+                    prefs: prefs,
+                    accountPubkeyHex: accountPubkeyHex
                 )
                 let extras = Array(ordered.dropFirst().prefix(Self.maxAdditionalPresentations))
                 for extra in extras {
-                    Self.postAdditionalLocalNotification(extra, prefs: prefs)
+                    Self.postAdditionalLocalNotification(
+                        extra,
+                        prefs: prefs,
+                        accountPubkeyHex: accountPubkeyHex
+                    )
                 }
                 os_log("NSE: Marmot wake decorated primary + %d additional",
                        log: Self.log, type: .info, extras.count)
@@ -291,69 +299,220 @@ class NotificationService: SDKNotificationService {
         finish(with: content)
     }
 
+    /// One account the wake may belong to. Keychain names carry the
+    /// `identity_` prefix `KeychainManager` adds in the app.
+    private struct WakeAccount {
+        let pubkeyHex: String
+        let dbPath: String
+        let nsecKeychainKey: String
+        let dbKeychainKey: String
+        let isActive: Bool
+    }
+
+    /// Budget for every account after the active one. The push carries no
+    /// account id, so the active account gets the full White Noise window and
+    /// the others a short peek each, bounded by `maxWakeAccounts`.
+    private static let inactiveAccountWakeWaitMs: UInt64 = 3_000
+    private static let maxWakeAccounts = 5
+    /// Stop opening further accounts once this much of the ~30 s NSE budget
+    /// is spent; decorate + finish still need time.
+    private static let wakeAccountsDeadlineSecs: TimeInterval = 18
+
+    /// Accounts to try, active first then most recently active. Without a
+    /// registry (single-account install) or with one that cannot be read,
+    /// this is the legacy store under the legacy keychain names — exactly
+    /// what every earlier build opened. Never mints anything.
+    private static func wakeAccountsInOrder(dataDir: URL) -> [WakeAccount] {
+        let legacy = WakeAccount(
+            pubkeyHex: "",
+            dbPath: dataDir.appendingPathComponent("marmot.sqlite").path,
+            nsecKeychainKey: nsecKeychainKey,
+            dbKeychainKey: dbKeychainKey,
+            isActive: true
+        )
+        let info: AccountRegistryInfo
+        do {
+            info = try accountRegistryLoad(dataDir: dataDir.path)
+        } catch {
+            // A registry that exists but cannot be read: the app runs the
+            // legacy single-account path for this launch and so do we. Say so.
+            recordDiagnostic("registryUnreadable")
+            return [legacy]
+        }
+        guard !info.accounts.isEmpty else { return [legacy] }
+        let sorted = info.accounts.sorted { a, b in
+            if a.isActive != b.isActive { return a.isActive }
+            return a.lastActiveAt > b.lastActiveAt
+        }
+        return sorted.prefix(maxWakeAccounts).map { a in
+            WakeAccount(
+                pubkeyHex: a.pubkeyHex,
+                dbPath: a.dbPath,
+                nsecKeychainKey: "identity_" + accountSecretKeyName(base: "marmot-nsec", secretTag: a.secretTag),
+                dbKeychainKey: "identity_" + accountSecretKeyName(base: "marmot-db-key", secretTag: a.secretTag),
+                isActive: a.isActive
+            )
+        }
+    }
+
     /// Blocking UniFFI work — always call off the main actor.
     /// Main app owns App Group migration; NSE never creates an empty SQLCipher DB.
     /// Skips when the main app holds `MarmotStoreLock` (no concurrent writers).
+    ///
+    /// Multi-account: one store lock for the whole pass, one open store at a
+    /// time. The active account is drained first with the full window; when
+    /// that yields nothing, the other registered accounts get a short peek
+    /// each. The first non-empty drain wins and its account is stamped on the
+    /// banner so a tap switches before opening. If nothing drained anywhere,
+    /// the active account's unread tip (captured while its store was open) is
+    /// the fallback, as before.
     private func collectMarmotNotificationsAfterWake(
         hintGroupIdHex: String?,
         hydrateAttempt: Int = 1
-    ) throws -> [DrainNotificationInfo] {
-        let nsec = Self.readKeychainString(account: Self.nsecKeychainKey)
-        let dbKeyHex = Self.readKeychainString(account: Self.dbKeychainKey)
-        guard let nsec, let dbKeyHex, !nsec.isEmpty, dbKeyHex.count == 64 else {
-            Self.recordDiagnostic(
-                "missingCredentials:nsec=\(nsec != nil):dbKey=\(dbKeyHex?.count ?? -1)"
-            )
-            throw NSEMarmotError.missingCredentials
-        }
-        let dbURL = try Self.existingMarmotDatabaseURL()
+    ) throws -> (notifications: [DrainNotificationInfo], accountPubkeyHex: String?) {
+        let dataDir = try Self.marmotDataDirectory()
+        let accounts = Self.wakeAccountsInOrder(dataDir: dataDir)
         // Background suspend releases the flock asynchronously (beginBackgroundTask
         // + closeNode). Retry briefly so a Transponder wake that races the
         // suspend path still hydrates instead of sticking on the generic banner.
         let storeLock = try Self.acquireStoreLockForWake(hydrateAttempt: hydrateAttempt)
-        let identity = try SonarIdentity.import(nsec: nsec)
-        let node: SonarNode
-        do {
-            node = try SonarNode.connect(
-                identity: identity,
-                relayUrls: Self.defaultRelayUrls,
-                dbPath: dbURL.path,
-                dbKeyHex: dbKeyHex,
-                // No suspend latch: the NSE is not the app process, has no
-                // scene-phase suspend hook to fire one, and is torn down by its
-                // own `serviceExtensionTimeWillExpire` deadline instead.
-                suspendLatch: nil
-            )
-        } catch {
-            storeLock.release()
-            throw error
-        }
         wakeNodeLock.lock()
-        marmotWakeNode = node
         marmotWakeStoreLock = storeLock
         wakeNodeLock.unlock()
         // Always close node before unlocking — never unlock under an open handle.
         defer { releaseMarmotWakeNode() }
-        var drained = try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
-        // Mirror SonarPushProcessor unread-delta: drain can be empty when the
-        // row was already local, the concurrent app wake consumed the pending
-        // list first, or sync only advanced summaries. Prefer the newest
-        // unread conversation so the banner still gets names/preview.
-        // Cap at one — extras from unrelated stale unreads look like spam
-        // banners and hide the tip that just arrived.
-        if drained.isEmpty {
-            let fromUnread = Self.drainNotificationsFromUnreadSummaries(
-                node,
-                hintGroupIdHex: hintGroupIdHex
-            )
-            if !fromUnread.isEmpty {
-                Self.recordDiagnostic(
-                    SonarNSEDecoratePolicy.diagnosticFallbackUnread(count: fromUnread.count)
-                )
-                drained = fromUnread
+
+        let startedAt = Date()
+        var activeFallback: [DrainNotificationInfo] = []
+        var activePubkey: String?
+        var lastError: Error?
+        var opened = 0
+        var collected = 0
+        for (index, account) in accounts.enumerated() {
+            if index > 0, Date().timeIntervalSince(startedAt) > Self.wakeAccountsDeadlineSecs {
+                Self.recordDiagnostic("wakeAccounts:deadline opened=\(opened)")
+                break
             }
+            // `serviceExtensionTimeWillExpire` releases the flock from under
+            // us; never open another store after that.
+            wakeNodeLock.lock()
+            let lockStillHeld = marmotWakeStoreLock != nil
+            wakeNodeLock.unlock()
+            if !lockStillHeld {
+                Self.recordDiagnostic("wakeAccounts:lockReleased opened=\(opened)")
+                break
+            }
+            let nsec = Self.readKeychainString(account: account.nsecKeychainKey)
+            let dbKeyHex = Self.readKeychainString(account: account.dbKeychainKey)
+            guard let nsec, let dbKeyHex, !nsec.isEmpty, dbKeyHex.count == 64 else {
+                Self.recordDiagnostic(
+                    "missingCredentials:nsec=\(nsec != nil):dbKey=\(dbKeyHex?.count ?? -1):active=\(account.isActive)"
+                )
+                lastError = NSEMarmotError.missingCredentials
+                continue
+            }
+            let dbURL: URL
+            do {
+                dbURL = try Self.existingMarmotDatabaseURL(path: account.dbPath)
+            } catch {
+                lastError = error
+                continue
+            }
+            // An interrupted Blossom restore left staging beside this store:
+            // only the app's own connect reconciles it. Opening here would
+            // pair the old file with the restored key.
+            if accountRestoreStagingPresent(dbPath: dbURL.path) {
+                Self.recordDiagnostic("wakeAccounts:restoreStaged active=\(account.isActive)")
+                lastError = NSEMarmotError.storeBusy
+                continue
+            }
+            let identity: SonarIdentity
+            do {
+                identity = try SonarIdentity.import(nsec: nsec)
+            } catch {
+                lastError = error
+                continue
+            }
+            // Registry and keychain can drift (a restore that died before
+            // repointing its row). Never sync one identity against another
+            // account's store.
+            if !account.pubkeyHex.isEmpty, identity.pubkeyHex() != account.pubkeyHex {
+                Self.recordDiagnostic("wakeAccounts:keyMismatch active=\(account.isActive)")
+                lastError = NSEMarmotError.missingCredentials
+                continue
+            }
+            let node: SonarNode
+            do {
+                node = try SonarNode.connect(
+                    identity: identity,
+                    relayUrls: Self.defaultRelayUrls,
+                    dbPath: dbURL.path,
+                    dbKeyHex: dbKeyHex,
+                    // No suspend latch: the NSE is not the app process, has no
+                    // scene-phase suspend hook to fire one, and is torn down by its
+                    // own `serviceExtensionTimeWillExpire` deadline instead.
+                    suspendLatch: nil
+                )
+            } catch {
+                lastError = error
+                continue
+            }
+            opened += 1
+            wakeNodeLock.lock()
+            marmotWakeNode = node
+            wakeNodeLock.unlock()
+            let waitMs = account.isActive ? Self.marmotWakeWaitMs : Self.inactiveAccountWakeWaitMs
+            let drained: [DrainNotificationInfo]
+            do {
+                drained = try node.collectNotificationsAfterWake(maxWaitMs: waitMs)
+                collected += 1
+            } catch {
+                lastError = error
+                dropWakeNode()
+                continue
+            }
+            if !drained.isEmpty {
+                if !account.isActive {
+                    Self.recordDiagnostic("wakeAccounts:drainedInactive index=\(index)")
+                }
+                let enriched = Self.enrichEmptyContentPreviews(drained, node: node)
+                dropWakeNode()
+                return (enriched, account.pubkeyHex.isEmpty ? nil : account.pubkeyHex)
+            }
+            if account.isActive {
+                // Mirror SonarPushProcessor unread-delta: drain can be empty when the
+                // row was already local, the concurrent app wake consumed the pending
+                // list first, or sync only advanced summaries. Prefer the newest
+                // unread conversation so the banner still gets names/preview.
+                // Cap at one — extras from unrelated stale unreads look like spam
+                // banners and hide the tip that just arrived.
+                let fromUnread = Self.drainNotificationsFromUnreadSummaries(
+                    node,
+                    hintGroupIdHex: hintGroupIdHex
+                )
+                if !fromUnread.isEmpty {
+                    activeFallback = Self.enrichEmptyContentPreviews(fromUnread, node: node)
+                    activePubkey = account.pubkeyHex.isEmpty ? nil : account.pubkeyHex
+                }
+            }
+            dropWakeNode()
         }
-        return Self.enrichEmptyContentPreviews(drained, node: node)
+        if !activeFallback.isEmpty {
+            Self.recordDiagnostic(
+                SonarNSEDecoratePolicy.diagnosticFallbackUnread(count: activeFallback.count)
+            )
+            return (activeFallback, activePubkey)
+        }
+        // A connect that never collected is a failure, not an empty drain.
+        if collected == 0, let lastError { throw lastError }
+        return ([], nil)
+    }
+
+    /// Drop the open SQLCipher handle but keep the flock for the next account.
+    private func dropWakeNode() {
+        wakeNodeLock.lock()
+        marmotWakeNode = nil
+        wakeNodeLock.unlock()
     }
 
     /// Build banner rows from local unread conversation summaries (newest tip only).
@@ -470,15 +629,21 @@ class NotificationService: SDKNotificationService {
 
     /// Require an existing shared DB — never mkdir+connect into a missing path
     /// (that would mint an empty SQLCipher store and orphan Application Support history).
-    private static func existingMarmotDatabaseURL() throws -> URL {
+    /// The store root (`<App Group>/sonar-marmot`): the legacy store and the
+    /// account registry live here, added accounts under `accounts/<hex>/`.
+    private static func marmotDataDirectory() throws -> URL {
         guard let group = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: appGroupId
         ) else {
             Self.recordDiagnostic("appGroupUnavailable")
             throw NSEMarmotError.appGroupUnavailable
         }
-        let dir = group.appendingPathComponent("sonar-marmot", isDirectory: true)
-        let db = dir.appendingPathComponent("marmot.sqlite")
+        return group.appendingPathComponent("sonar-marmot", isDirectory: true)
+    }
+
+    private static func existingMarmotDatabaseURL(path: String) throws -> URL {
+        let db = URL(fileURLWithPath: path)
+        let dir = db.deletingLastPathComponent()
         // Refuse missing or empty placeholders — connect would mint a forked
         // SQLCipher store and orphan Application Support history.
         guard MarmotAppGroupStore.isAuthoritativeDatabaseFile(db) else {
@@ -510,7 +675,8 @@ class NotificationService: SDKNotificationService {
     private static func apply(
         notification: DrainNotificationInfo,
         to content: UNMutableNotificationContent,
-        prefs: NSENotificationPrefs
+        prefs: NSENotificationPrefs,
+        accountPubkeyHex: String? = nil
     ) {
         // App Group kind-0 mirror — never fetchProfile (relay) from the NSE.
         // Pass alias via cachedBestName so senderLabel does not truncate it.
@@ -544,15 +710,22 @@ class NotificationService: SDKNotificationService {
         if !notification.messageIdHex.isEmpty {
             userInfo["sonar.messageId"] = notification.messageIdHex
         }
+        // Which registered account this row came from, so a tap on another
+        // account's banner switches before opening (`SonarNotificationKeys
+        // .accountPubkey` in the app). Absent for the legacy single account.
+        if let accountPubkeyHex, !accountPubkeyHex.isEmpty {
+            userInfo["sonarAccountPubkey"] = accountPubkeyHex
+        }
         content.userInfo = userInfo
     }
 
     private static func postAdditionalLocalNotification(
         _ notification: DrainNotificationInfo,
-        prefs: NSENotificationPrefs
+        prefs: NSENotificationPrefs,
+        accountPubkeyHex: String? = nil
     ) {
         let content = UNMutableNotificationContent()
-        apply(notification: notification, to: content, prefs: prefs)
+        apply(notification: notification, to: content, prefs: prefs, accountPubkeyHex: accountPubkeyHex)
         // Prefer message id so UN replace + host R-004 dedup share one key.
         let idSuffix = notification.messageIdHex.isEmpty
             ? UUID().uuidString

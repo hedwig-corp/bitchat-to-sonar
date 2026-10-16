@@ -67,7 +67,187 @@ actual object SonarCore {
     @Volatile private var lastImportBackupOutcomeValue: AccountBackupRestoreOutcome =
         AccountBackupRestoreOutcome.Missing
 
+    /** The store root: legacy store, registry and logs live here. */
     private fun marmotDir(): File = DesktopEnv.file("sonar-marmot").apply { mkdirs() }
+
+    // ── Accounts (switcher) — mirror of the Android actual ──────────────
+    private val registryCacheLock = Any()
+    private var registryCache: SonarAccountRegistrySnapshot? = null
+    private fun invalidateRegistry() { synchronized(registryCacheLock) { registryCache = null } }
+
+    // Load and publish under one monitor so a load that started before a
+    // switch's invalidation cannot publish its stale snapshot after it.
+    actual fun accounts(): SonarAccountRegistrySnapshot = synchronized(registryCacheLock) {
+        registryCache ?: loadRegistry().also { registryCache = it }
+    }
+
+    private fun loadRegistry(): SonarAccountRegistrySnapshot = runCatching {
+        SonarNativeLoader.ensureLoaded()
+        val info = uniffi.sonar_ffi.accountRegistryLoad(marmotDir().absolutePath)
+        val accounts = info.accounts.map { it.toCommon() }
+        SonarAccountRegistrySnapshot(
+            accounts = accounts,
+            active = accounts.firstOrNull { it.pubkeyHex == info.activePubkeyHex },
+            maxAccounts = info.maxAccounts.toInt(),
+        )
+    }.getOrElse { e ->
+        sonarLog("Accounts", "registry unreadable — legacy single-account path: ${e.message}")
+        SonarAccountRegistrySnapshot(emptyList(), null, DEFAULT_MAX_ACCOUNTS, fault = e.message ?: "unreadable")
+    }
+
+    private fun legacyAccount(): SonarAccount = SonarAccount(
+        pubkeyHex = "", npub = "", label = null,
+        dbPath = File(marmotDir(), "marmot.sqlite").absolutePath,
+        secretTag = "", isLegacy = true, isActive = true, lastActiveAt = 0,
+    )
+
+    /** The account whose store this process opens. A registry that exists
+     *  but cannot be read falls back to the legacy store ONLY on an install
+     *  that never had a second account (no `accounts/` directory); with one,
+     *  the legacy slot may be another identity than the one the user had
+     *  selected, so the open is refused instead (Durability rule 2). */
+    private fun activeAccount(): SonarAccount {
+        val snap = accounts()
+        snap.active?.let { return it }
+        if (snap.fault != null && File(marmotDir(), "accounts").isDirectory) {
+            throw IllegalStateException("Account list unreadable: ${snap.fault}. Restore it before opening a chat account.")
+        }
+        return legacyAccount()
+    }
+    private fun nsecKey(): String = activeAccount().nsecSecretKey
+    private fun dbKeyKey(): String = activeAccount().dbKeySecretKey
+
+    private fun marmotDbPath(): String =
+        File(activeAccount().dbPath).also { it.parentFile?.mkdirs() }.absolutePath
+
+    private fun registerLegacyIfNeeded(hex: String) {
+        val snap = accounts()
+        if (snap.fault != null || !snap.isEmpty) return
+        runCatching { uniffi.sonar_ffi.accountRegistryRegisterLegacy(marmotDir().absolutePath, hex) }
+            .onSuccess { invalidateRegistry(); sonarLog("Accounts", "registered the legacy store in place") }
+            .onFailure { sonarLog("Accounts", "legacy registration failed — staying single-account: ${it.message}") }
+    }
+
+    /** The key that just opened the active store is the truth: a restore that
+     *  replaced this slot's key and died before repointing its row leaves the
+     *  row naming the old key. Repoint so switch and add address the right one. */
+    private fun healActiveRowIfNeeded(openedHex: String) {
+        val snap = accounts()
+        val active = snap.active ?: return
+        if (snap.fault != null || active.pubkeyHex == openedHex) return
+        sonarLog("Accounts", "active row ${active.pubkeyHex.take(8)}… does not match the opened key — repointing")
+        runCatching { uniffi.sonar_ffi.accountRegistryReplacePubkey(marmotDir().absolutePath, active.pubkeyHex, openedHex) }
+            .onFailure { sonarLog("Accounts", "could not repoint the active row: ${it.message}") }
+        invalidateRegistry()
+    }
+
+    private fun uniffi.sonar_ffi.AccountInfo.toCommon() = SonarAccount(
+        pubkeyHex = pubkeyHex, npub = npub, label = label, dbPath = dbPath,
+        secretTag = secretTag, isLegacy = isLegacy, isActive = isActive,
+        lastActiveAt = lastActiveAt.toLong(),
+    )
+
+    actual suspend fun switchAccount(pubkeyHex: String): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        lock.withLock { stickerOperationLock.write { switchAccountLocked(pubkeyHex) } }
+    }
+
+    private fun switchAccountLocked(target: String): String {
+        val previous = activeAccount()
+        if (previous.pubkeyHex == target) return npub
+        val dataDir = marmotDir().absolutePath
+        try {
+            closeNode()
+            uniffi.sonar_ffi.accountRegistrySetActive(dataDir, target)
+            invalidateRegistry()
+            openActiveAccountLocally()
+            sonarLog("Accounts", "switched to ${target.take(8)}…")
+            return npub
+        } catch (switchError: Throwable) {
+            throw rollBackAccountChange(previous, switchError)
+        }
+    }
+
+    /** Point the registry back at [previous] and reopen it. The thrown error
+     *  carries both failures when the rollback itself fails, so a caller never
+     *  reports "reopened the previous account" for a device with no store open. */
+    private fun rollBackAccountChange(previous: SonarAccount, cause: Throwable): Throwable {
+        sonarLog("Accounts", "account change failed — rolling back: ${cause.message}")
+        val problems = mutableListOf(cause.message ?: cause.toString())
+        if (previous.pubkeyHex.isNotEmpty()) {
+            runCatching { uniffi.sonar_ffi.accountRegistrySetActive(marmotDir().absolutePath, previous.pubkeyHex) }
+                .onFailure { problems += "could not restore the previous account pointer: ${it.message}" }
+        }
+        invalidateRegistry()
+        runCatching { openActiveAccountLocally() }
+            .onFailure { problems += "the previous account could not be reopened: ${it.message}" }
+        return IllegalStateException(problems.joinToString("; "), cause)
+    }
+
+    private fun openActiveAccountLocally() {
+        val identity = loadOrCreateIdentity()
+        node = connectLocalIdentity(identity)
+        relayConnected = false
+        npub = identity.npub()
+        pubkeyHex = identity.pubkeyHex()
+        installConversationListener()
+    }
+
+    actual suspend fun addAccount(nsec: String?, label: String?): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        val identity = if (nsec != null) SonarIdentity.import(nsec.trim()) else SonarIdentity.generate()
+        lock.withLock {
+            stickerOperationLock.write {
+                val hex = identity.pubkeyHex()
+                if (accounts().accounts.any { it.pubkeyHex == hex }) {
+                    lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
+                    return@write switchAccountLocked(hex)
+                }
+                val dataDir = marmotDir().absolutePath
+                val entry = uniffi.sonar_ffi.accountRegistryAdd(dataDir, hex, label).toCommon()
+                invalidateRegistry()
+                // The key lands under the new account's own name BEFORE it
+                // becomes active; when it cannot be stored the row goes too.
+                try {
+                    DesktopSecrets.put(entry.nsecSecretKey, identity.nsec())
+                } catch (putError: Throwable) {
+                    runCatching { uniffi.sonar_ffi.accountRegistryRemove(dataDir, hex) }
+                    invalidateRegistry()
+                    throw putError
+                }
+                val previous = activeAccount()
+                try {
+                    closeNode()
+                    uniffi.sonar_ffi.accountRegistrySetActive(dataDir, hex)
+                    invalidateRegistry()
+                    npub = identity.npub()
+                    pubkeyHex = hex
+                    lastImportBackupOutcomeValue =
+                        if (nsec != null) tryRestoreAccountBackupLocked(identity, File(entry.dbPath).parentFile!!)
+                        else AccountBackupRestoreOutcome.Missing
+                    openActiveAccountLocally()
+                    npub
+                } catch (addError: Throwable) {
+                    throw rollBackAccountChange(previous, addError)
+                }
+            }
+        }
+    }
+
+    actual suspend fun removeAccount(pubkeyHex: String): Unit = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        lock.withLock {
+            stickerOperationLock.write {
+                check(activeAccount().pubkeyHex != pubkeyHex) { "switch away before removing the active account" }
+                val out = synchronized(bookkeepingMonitor) {
+                    uniffi.sonar_ffi.accountRegistryRemove(marmotDir().absolutePath, pubkeyHex).also { invalidateRegistry() }
+                }
+                val removed = out.removed.toCommon()
+                seal.get()?.takeIf { it.pubkeyHex == removed.pubkeyHex }?.let { forgetSeal(it) }
+                DesktopSecrets.clear(removed.nsecSecretKey, removed.dbKeySecretKey)
+            }
+        }
+    }
 
     actual fun lastImportBackupOutcome(): AccountBackupRestoreOutcome = lastImportBackupOutcomeValue
 
@@ -78,8 +258,10 @@ actual object SonarCore {
                 val identity = loadOrCreateIdentity()
                 npub = identity.npub()
                 pubkeyHex = identity.pubkeyHex()
+                registerLegacyIfNeeded(identity.pubkeyHex())
+                healActiveRowIfNeeded(identity.pubkeyHex())
 
-                val dbPath = File(marmotDir(), "marmot.sqlite").absolutePath
+                val dbPath = marmotDbPath()
                 val dbKeyHex = loadOrCreateDbKey()
                 runCatching { uniffi.sonar_ffi.reconcileAccountRestore(dbPath, dbKeyHex) }
                     .onFailure {
@@ -109,7 +291,7 @@ actual object SonarCore {
             npub = identity.npub()
             pubkeyHex = identity.pubkeyHex()
 
-            val dbPath = File(marmotDir(), "marmot.sqlite").absolutePath
+            val dbPath = marmotDbPath()
             val dbKeyHex = loadOrCreateDbKey()
             runCatching { uniffi.sonar_ffi.reconcileAccountRestore(dbPath, dbKeyHex) }
                 .onFailure {
@@ -948,19 +1130,19 @@ actual object SonarCore {
     actual fun fingerprint(): String {
         var hex = pubkeyHex
         if (hex.isEmpty()) {
-            val saved = DesktopEnv.getString("nsec")
+            val saved = DesktopSecrets.get(nsecKey())
             if (saved != null) hex = runCatching { SonarIdentity.import(saved).pubkeyHex() }.getOrDefault("")
         }
         if (hex.isEmpty()) return ""
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
     }
 
-    actual fun identityNsec(): String = DesktopSecrets.get("nsec") ?: ""
+    actual fun identityNsec(): String = DesktopSecrets.get(nsecKey()) ?: ""
 
     actual fun hasIdentity(): Boolean =
         runCatching {
             SonarNativeLoader.ensureLoaded()
-            val saved = DesktopSecrets.get("nsec")?.trim() ?: return@runCatching false
+            val saved = DesktopSecrets.get(nsecKey())?.trim() ?: return@runCatching false
             SonarIdentity.import(saved)
             true
         }
@@ -970,10 +1152,10 @@ actual object SonarCore {
         SonarNativeLoader.ensureLoaded()
         lock.withLock {
             if (npub.isNotBlank()) return@withLock npub
-            val saved = DesktopSecrets.get("nsec")
+            val saved = DesktopSecrets.get(nsecKey())
             if (saved != null) return@withLock SonarIdentity.import(saved).npub()
             val identity = SonarIdentity.generate()
-            DesktopSecrets.put("nsec", identity.nsec())
+            DesktopSecrets.put(nsecKey(), identity.nsec())
             identity.npub()
         }
     }
@@ -989,7 +1171,7 @@ actual object SonarCore {
         lock.withLock {
             stickerOperationLock.write {
                 val previousIdentity = DesktopSecrets
-                    .get("nsec")
+                    .get(nsecKey())
                     ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
                 // Same guard as Android: re-pasting the signed-in key must not
                 // wipe the store and fall back to whatever Blossom last held.
@@ -1000,15 +1182,35 @@ actual object SonarCore {
                     lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
                     return@write npub
                 }
+                // Already another account on this phone: a switch, never a
+                // replacement of the active slot (the host checks this too).
+                if (accounts().accounts.any { it.pubkeyHex == identity.pubkeyHex() }) {
+                    sonarLog("Identity", "import is a registered account — switching instead of replacing")
+                    lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
+                    return@write switchAccountLocked(identity.pubkeyHex())
+                }
                 closeNode()
-                val marmotDir = marmotDir()
+                val activeStoreDir = File(marmotDbPath()).parentFile!!
                 try {
-                    wipeMarmotStorage(marmotDir)
-                    DesktopSecrets.put("nsec", identity.nsec())
+                    // Only the ACTIVE account's store: other accounts and the
+                    // registry survive a restore of this one.
+                    val replacedHex = activeAccount().pubkeyHex
+                    wipeActiveStore()
+                    DesktopSecrets.put(nsecKey(), identity.nsec())
                     npub = identity.npub()
                     pubkeyHex = identity.pubkeyHex()
-                    tryRestoreAccountBackupLocked(identity, marmotDir).also {
+                    tryRestoreAccountBackupLocked(identity, activeStoreDir).also {
                         lastImportBackupOutcomeValue = it
+                    }
+                    // The row this restore replaced in place now holds the new
+                    // key under the same directory and secret names.
+                    if (replacedHex.isNotEmpty()) {
+                        runCatching {
+                            uniffi.sonar_ffi.accountRegistryReplacePubkey(
+                                marmotDir().absolutePath, replacedHex, identity.pubkeyHex(),
+                            )
+                        }.onFailure { sonarLog("Accounts", "could not repoint the restored row: ${it.message}") }
+                        invalidateRegistry()
                     }
                     npub
                 } catch (importError: Throwable) {
@@ -1054,25 +1256,89 @@ actual object SonarCore {
             SonarNativeLoader.ensureLoaded()
             lock.withLock {
                 stickerOperationLock.write {
-                    val nsec = DesktopSecrets.get("nsec") ?: error("no identity to back up")
-                    val dir = marmotDir()
-                    val dbPath = File(dir, "marmot.sqlite").absolutePath
+                    // A new attempt retires the previous seal BEFORE anything
+                    // can fail: callers never re-upload old bytes (a retry is
+                    // a new seal), and a seal that fails here must record its
+                    // failure against the account it ran for, never against
+                    // the account a retained earlier seal belonged to.
+                    forgetSeal(null)
+                    uploaded.set(null)
+                    val nsec = DesktopSecrets.get(nsecKey()) ?: error("no identity to back up")
+                    val dbPath = marmotDbPath()
                     val dbKeyHex = loadOrCreateDbKey()
+                    val forPubkeyHex = activeAccount().pubkeyHex
                     closeNode()
-                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex)
+                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex).also {
+                        seal.set(SealRecord(forPubkeyHex, nsec, sha256Hex(it)))
+                    }
                 }
             }
         }
 
+    /** What the last [sealAccountBackup] produced: the account it ran for,
+     *  the nsec captured then, and the SHA-256 of the ciphertext. One
+     *  immutable record replaced as a whole, so an upload or a bookkeeping
+     *  write that captured it keeps a consistent view even when a newer seal
+     *  lands meanwhile. Clearing is compare-and-set against the record the
+     *  caller holds: a finished upload never erases a newer seal. */
+    private class SealRecord(val pubkeyHex: String, val nsec: String, val digest: String)
+    private val seal = java.util.concurrent.atomic.AtomicReference<SealRecord?>(null)
+    /** The record the most recent [uploadSealedAccountBackup] signed with,
+     *  handed to the bookkeeping call that follows it. Bookkeeping must bind
+     *  to the upload that completed, not to whatever [seal] holds by then: if
+     *  a newer seal landed in between, reading [seal] would credit A's upload
+     *  to B and forget B's credential. Callers also serialize seal → upload →
+     *  record under their backup mutex; this keeps the core correct without
+     *  relying on that. */
+    private val uploaded = java.util.concurrent.atomic.AtomicReference<SealRecord?>(null)
+
+    /** The record bookkeeping is for: the completed upload's, else (no upload
+     *  happened, e.g. a metered abort right after sealing) the current seal. */
+    private fun takeBookkeepingRecord(): SealRecord? = uploaded.getAndSet(null) ?: seal.get()
+
+    private fun sha256Hex(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    /** Forget a seal-time credential: [record] only, and only while it is
+     *  still the current one; `null` forgets whatever is current (wipe). */
+    private fun forgetSeal(record: SealRecord?) {
+        if (record == null) seal.set(null) else seal.compareAndSet(record, null)
+    }
+
+    /** Store whose backup is being recorded: the one the seal ran for, which
+     *  is the active one unless a switch happened while the upload was out.
+     *  Bookkeeping must land on the account that was uploaded. */
+    /** Held across "is the sealed account still registered?" + the FFI write,
+     *  and across the registry removal + store deletion, so a removal cannot
+     *  land between the lookup and the write (which would recreate the
+     *  deleted directory with a stray policy sidecar). A plain monitor: the
+     *  record paths are not suspend functions. */
+    private val bookkeepingMonitor = Any()
+
+    private fun sealedAccountDbPath(record: SealRecord?): String? {
+        val sealed = record?.pubkeyHex ?: return marmotDbPath()
+        // The sealed account was removed while the upload was out: there is
+        // no store to record against. Never substitute the active account.
+        return accounts().accounts.firstOrNull { it.pubkeyHex == sealed }?.dbPath
+    }
+
     actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
-        val nsec = DesktopSecrets.get("nsec") ?: error("no identity to back up")
-        val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
+        // Sign with the key captured at seal time, and ONLY for the ciphertext
+        // it was captured for: a switch between seal and upload must never
+        // pair A's ciphertext with B's nsec, and there is deliberately no
+        // fallback to the active account's key — without a matching seal the
+        // caller must seal again.
+        val record = seal.get() ?: error("no sealed backup to upload; seal again")
+        check(record.digest == sha256Hex(sealed)) {
+            "the sealed backup is not the most recent seal; seal again"
+        }
+        // Set before the call so a failure's bookkeeping binds to it too.
+        uploaded.set(record)
+        val info = uniffi.sonar_ffi.uploadSealedAccountBackup(record.nsec, sealed, null)
         "uploaded ${info.size} bytes"
     }
 
-    private fun marmotDbPath(): String =
-        File(marmotDir(), "marmot.sqlite").absolutePath
 
     actual fun getBackupPolicy(): BackupPolicySnapshot {
         SonarNativeLoader.ensureLoaded()
@@ -1101,7 +1367,7 @@ actual object SonarCore {
 
     actual suspend fun previewAccountBackup(): AccountBackupPreview = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
-        val nsec = DesktopSecrets.get("nsec") ?: error("no identity to preview")
+        val nsec = DesktopSecrets.get(nsecKey()) ?: error("no identity to preview")
         // No lock, no closeNode: the preview never touches the live store. The
         // DB path only places the scratch copy beside the account data.
         val info = uniffi.sonar_ffi.previewAccountBackup(nsec, marmotDbPath(), null)
@@ -1127,22 +1393,44 @@ actual object SonarCore {
 
     actual fun recordBackupSuccess(sizeBytes: Long?) {
         SonarNativeLoader.ensureLoaded()
-        val dbKeyHex = runCatching { loadOrCreateDbKey() }.getOrNull()
-        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong(), dbKeyHex)
+        synchronized(bookkeepingMonitor) {
+            val record = takeBookkeepingRecord()
+            val target = sealedAccountDbPath(record) ?: run {
+                sonarLog("Backup", "upload finished for a removed account — not recorded")
+                forgetSeal(record)
+                return
+            }
+            // The key is only for the message count and must belong to the same
+            // store: a foreign (non-active) target records without a count.
+            val dbKeyHex = if (target == marmotDbPath()) runCatching { loadOrCreateDbKey() }.getOrNull() else null
+            uniffi.sonar_ffi.recordBackupSuccess(target, sizeBytes?.toULong(), dbKeyHex)
+            // The upload this seal was for is done: the credential has no
+            // further use. A failed upload keeps it, so the retry of the same
+            // ciphertext signs with the right key (see uploadSealedAccountBackup).
+            forgetSeal(record)
+        }
     }
 
     actual fun recordBackupFailure(error: String) {
         SonarNativeLoader.ensureLoaded()
-        uniffi.sonar_ffi.recordBackupFailure(marmotDbPath(), error)
+        synchronized(bookkeepingMonitor) {
+            val record = takeBookkeepingRecord()
+            val target = sealedAccountDbPath(record) ?: run {
+                sonarLog("Backup", "upload failed for a removed account — not recorded")
+                forgetSeal(record)
+                return
+            }
+            uniffi.sonar_ffi.recordBackupFailure(target, error)
+        }
     }
 
     actual suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
         lock.withLock {
             stickerOperationLock.write {
-                val nsec = DesktopSecrets.get("nsec")
+                val nsec = DesktopSecrets.get(nsecKey())
                     ?: return@write AccountBackupRestoreOutcome.Missing
-                tryRestoreAccountBackupLocked(SonarIdentity.import(nsec), marmotDir())
+                tryRestoreAccountBackupLocked(SonarIdentity.import(nsec), File(marmotDbPath()).parentFile!!)
             }
         }
     }
@@ -1158,13 +1446,13 @@ actual object SonarCore {
             val dbKeyHex = uniffi.sonar_ffi.restoreAccountFromBlossom(identity.nsec(), dbPath, null)
             require(dbKeyHex.matches(Regex("^[0-9a-fA-F]{64}$"))) { "restored db key malformed" }
             try {
-                DesktopSecrets.put("dbKeyHex", dbKeyHex)
+                DesktopSecrets.put(dbKeyKey(), dbKeyHex)
                 uniffi.sonar_ffi.commitAccountRestore(dbPath)
                 AccountBackupRestoreOutcome.Restored
             } catch (persistError: Throwable) {
                 if (uniffi.sonar_ffi.accountRestoreStagingPresent(dbPath)) {
                     runCatching { uniffi.sonar_ffi.abortAccountRestore(dbPath) }
-                    DesktopSecrets.clear("dbKeyHex")
+                    DesktopSecrets.clear(dbKeyKey())
                 }
                 throw persistError
             }
@@ -1200,14 +1488,35 @@ actual object SonarCore {
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             stickerOperationLock.write {
+                // Every account's secret names, read BEFORE anything is torn
+                // down or deleted. When the registry cannot be read, the
+                // `accounts/<tag>` directory names ARE the tags: never leave
+                // a key behind because the list that named it was corrupt.
+                val snap = accounts()
+                val accountsDir = File(marmotDir(), "accounts")
+                val dirTags = if (accountsDir.exists()) {
+                    // null here is an I/O failure, not "empty": deleting the
+                    // stores would then orphan keys we could not enumerate.
+                    // Nothing has been closed or removed yet, so the abort
+                    // leaves the account exactly as it was.
+                    accountsDir.listFiles()?.filter { it.isDirectory }?.map { it.name }
+                        ?: error("cannot list ${accountsDir.path}; wipe aborted before deleting anything")
+                } else {
+                    emptyList()
+                }
+                val tags = (snap.accounts.map { it.secretTag } + dirTags).toSet()
+                val accountKeys = tags.flatMap { listOf(accountSecretKeyName(NSEC_SECRET_BASE, it), accountSecretKeyName(DB_KEY_SECRET_BASE, it)) }
                 closeNode()
+                forgetSeal(null)
+                uploaded.set(null)
                 npub = ""; pubkeyHex = ""
                 // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
                 // the exported diagnostics zips live in a sibling dir, so drop them
                 // too — at verbose level they can contain peer npubs and must not
                 // survive a wipe (Account Key Durability / privacy rule).
-                val marmotDir = marmotDir()
-                val wipeFailure = runCatching { wipeMarmotStorage(marmotDir) }.exceptionOrNull()
+                // The whole root: every account's store, the registry, logs.
+                val wipeFailure = runCatching { wipeMarmotStorage(marmotDir()) }.exceptionOrNull()
+                invalidateRegistry()
                 DesktopEnv.file("diagnostics").deleteRecursively()
                 // EVERY key DesktopSecrets owns, not just the account pair.
                 // The mesh Noise key and Ed25519 announce seed used to live in
@@ -1218,6 +1527,9 @@ actual object SonarCore {
                 // passive BLE listener. Driven off MANAGED_KEYS so adding a key
                 // cannot silently miss the wipe. (Account Key Durability Rule 5.)
                 DesktopSecrets.clear(*DesktopSecrets.MANAGED_KEYS.toTypedArray())
+                // Per-account names (`nsec.<hex>` / `dbKeyHex.<hex>`) are not in
+                // MANAGED_KEYS; the registry listed them (Durability rule 5).
+                if (accountKeys.isNotEmpty()) DesktopSecrets.clear(*accountKeys.toTypedArray())
                 DesktopEnv.clear()
                 wipeFailure?.let { throw it }
                 Unit
@@ -1233,8 +1545,7 @@ actual object SonarCore {
                     // Delete ONLY the encrypted Marmot DB — keep nsec, DB key,
                     // nickname and prefs. start() reopens a fresh empty DB with the
                     // SAME identity + key.
-                    val marmotDir = marmotDir()
-                    wipeMarmotStorage(marmotDir)
+                    wipeActiveStore()
                 }
             }
         }
@@ -1260,15 +1571,19 @@ actual object SonarCore {
 
     /** Reopen the previous account locally when a fallible identity wipe fails. */
     private fun connectLocalIdentity(identity: SonarIdentity): SonarNode {
-        val dir = marmotDir()
+        val dbPath = marmotDbPath()
+        val dbKeyHex = loadOrCreateDbKey()
+        runCatching { uniffi.sonar_ffi.reconcileAccountRestore(dbPath, dbKeyHex) }
+            .onFailure { if (uniffi.sonar_ffi.accountRestoreStagingPresent(dbPath)) throw it }
         installCoreLogging(diagnosticsVerbose())
-        return SonarNode.connect(
-            identity,
-            emptyList(),
-            File(dir, "marmot.sqlite").absolutePath,
-            loadOrCreateDbKey(),
-            null,
-        )
+        return SonarNode.connect(identity, emptyList(), dbPath, dbKeyHex, null)
+    }
+
+    /** Erase-chats / nsec restore: the ACTIVE account's store, sidecars and
+     *  DB key only. Other accounts, the registry and the logs survive. */
+    private fun wipeActiveStore() {
+        wipeMarmotDatabase(marmotDbPath())
+        DesktopSecrets.clear(dbKeyKey())
     }
 
     /** Preserve the FFI wipe tombstone if deleting the cache fails midway. */
@@ -1277,14 +1592,14 @@ actual object SonarCore {
         check(marmotDir.deleteRecursively()) { "failed to remove Marmot storage" }
         // Match iOS wipeDatabase: drop the host SQLCipher key so a soft-failed
         // Blossom restore cannot reopen a fresh empty DB with a prior key.
-        DesktopSecrets.clear("dbKeyHex")
+        DesktopSecrets.clear(dbKeyKey())
     }
 
     private fun loadOrCreateIdentity(): SonarIdentity {
         // Stored in the OS keystore (macOS Keychain), NOT plaintext prefs — the nsec
         // also derives the wallet seed. [DesktopSecrets.get] migrates a legacy
         // plaintext nsec in transparently.
-        val saved = DesktopSecrets.get("nsec")
+        val saved = DesktopSecrets.get(nsecKey())
         if (saved != null) {
             return SonarIdentity.import(saved)
         }
@@ -1303,12 +1618,12 @@ actual object SonarCore {
             )
         }
         val id = SonarIdentity.generate()
-        DesktopSecrets.put("nsec", id.nsec())
+        DesktopSecrets.put(nsecKey(), id.nsec())
         return id
     }
 
     private fun loadOrCreateDbKey(): String {
-        val existing = DesktopSecrets.get("dbKeyHex")
+        val existing = DesktopSecrets.get(dbKeyKey())
         if (existing != null) {
             require(existing.matches(Regex("^[0-9a-fA-F]{64}$"))) {
                 "database key malformed — refusing to overwrite (would lose history)"
@@ -1325,9 +1640,15 @@ actual object SonarCore {
             "database key unreadable (keystore fault) — refusing to generate a new one, " +
                 "which would make existing chats undecryptable"
         }
+        // A store with no key is unrecoverable; a fresh key beside it would
+        // make the core's open-failure self-heal wipe the history. Surface it.
+        val db = File(activeAccount().dbPath)
+        check(!(db.isFile && db.length() > 0)) {
+            "database key missing for an existing store — refusing to generate a new one"
+        }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }
-        DesktopSecrets.put("dbKeyHex", hex)
+        DesktopSecrets.put(dbKeyKey(), hex)
         return hex
     }
 

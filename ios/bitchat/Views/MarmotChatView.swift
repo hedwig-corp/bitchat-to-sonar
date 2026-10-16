@@ -416,7 +416,8 @@ final class MarmotChatModel: ObservableObject {
         case invalidated
     }
 
-    private static let nsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
+    /// Active account's nsec item — per account since the switcher.
+    private static var nsecKeychainKey: String { SonarAccountKeyExport.marmotNsecKey }
     /// Raw encoded sticker bytes stay bounded independently from the 100 MiB
     /// disk cache. Decoded SwiftUI images have their own framework caches, so
     /// retaining hundreds of multi-megabyte Data values here only adds memory
@@ -1147,6 +1148,15 @@ final class MarmotChatModel: ObservableObject {
                 storedNsec = fresh
             }
             self.npub = np
+            // First launch on a registry build: name the single store the app
+            // has always opened as this account, in place. No file or secret
+            // moves; a no-op once registered.
+            SonarAccountRegistry.registerLegacyIfNeeded(pubkey: np)
+            SonarAccountRegistry.retryPendingSecretCleanup(keychain: keychain)
+            // A restore that replaced this slot's key but died before
+            // repointing the row leaves the row naming the old key. The key
+            // that actually opens the store is the truth; repoint now.
+            SonarAccountRegistry.healActiveRowIfNeeded(openedNpub: np)
         } catch {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot identity load failed: \(desc)", category: .session)
@@ -1348,10 +1358,21 @@ final class MarmotChatModel: ObservableObject {
             )
             return .unchanged
         }
+        // Already another account on this phone: a switch, never a replacement
+        // of the active slot (the store checks this too; this is the layer
+        // that would otherwise wipe).
+        if SonarAccountRegistry.snapshot().accounts.contains(where: { $0.pubkeyHex == incoming.pubkeyHex() }) {
+            SecureLogger.info("ℹ️ Identity import is a registered account — switching instead of replacing", category: .session)
+            try await switchAccount(toPubkeyHex: incoming.pubkeyHex())
+            return .unchanged
+        }
         // Block connectIfNeeded while the old node, database, and identity-bound
         // caches are invalidated and the replacement identity is connected.
         busy = true
         defer { busy = false }
+        // The registry row this restore replaces in place (empty before the
+        // registry exists); repointed once the new store is open.
+        let replacedPubkeyHex = (try? SonarAccountRegistry.resolveActive())?.pubkeyHex ?? ""
         // Identity restore is an account replacement, not a reconnect. Match
         // the Compose import path: invalidate memory first, then wipe the old
         // core database (including its sticker caches) before opening the new
@@ -1360,7 +1381,7 @@ final class MarmotChatModel: ObservableObject {
         let service = self.service
         do {
             try await prepareForIdentityReplacement {
-                try await service.wipeDatabase()
+                try await service.wipeDatabase(scope: .activeAccount)
             }
         } catch {
             _ = await performConnect()
@@ -1388,7 +1409,7 @@ final class MarmotChatModel: ObservableObject {
             // the prior key so callers never observe an account/key mismatch.
             do {
                 try await prepareForIdentityReplacement {
-                    try await service.wipeDatabase()
+                    try await service.wipeDatabase(scope: .activeAccount)
                 }
             } catch {
                 throw MarmotService.ServiceError.core(
@@ -1416,7 +1437,117 @@ final class MarmotChatModel: ObservableObject {
             }
             throw MarmotService.ServiceError.core(replacementError)
         }
+        SonarAccountRegistry.replacePubkey(old: replacedPubkeyHex, new: incoming.pubkeyHex())
         return backupOutcome
+    }
+
+    // MARK: - Multi-account switcher
+
+    /// Switch the live store to another registered account. Same teardown as
+    /// an nsec restore (`prepareForIdentityReplacement`) minus the wipe: the
+    /// current store is CLOSED, never erased, and the target's store opens
+    /// through the ordinary local-first `performConnect`. When the target
+    /// cannot open, the registry pointer rolls back and the previous account
+    /// reopens, so the user is never left on an account without a store.
+    func switchAccount(toPubkeyHex target: String) async throws {
+        let previous = try SonarAccountRegistry.resolveActive()
+        guard previous.pubkeyHex != target else { return }
+        guard !busy else { throw MarmotService.ServiceError.core("Still finishing a previous account change") }
+        busy = true
+        defer { busy = false }
+        let service = self.service
+        do {
+            try await prepareForIdentityReplacement {
+                await service.closeNode()
+            }
+            _ = try SonarAccountRegistry.setActive(pubkey: target)
+        } catch {
+            // Closed but never activated: reopen what was open.
+            throw await rollBackAccountChange(to: previous, because: error.localizedDescription)
+        }
+        guard await performConnect() else {
+            throw await rollBackAccountChange(to: previous, because: errorText ?? "failed to open the account")
+        }
+        SecureLogger.info("Account switch: now on \(target.prefix(8))…", category: .session)
+    }
+
+    /// Point the registry back at `previous` and reopen it. The error
+    /// returned names BOTH failures when the rollback itself fails, so the
+    /// caller never reports "reopened the previous account" for a phone
+    /// that has no account open.
+    private func rollBackAccountChange(to previous: SonarAccount, because why: String) async -> Error {
+        SecureLogger.warning("⚠️ Account change failed — rolling back: \(why)", category: .session)
+        var problems = [why]
+        if previous.pubkeyHex.isEmpty {
+            SonarAccountRegistry.invalidate()
+        } else {
+            do {
+                _ = try SonarAccountRegistry.setActive(pubkey: previous.pubkeyHex)
+            } catch {
+                problems.append("could not restore the previous account pointer: \(error.localizedDescription)")
+            }
+        }
+        if await performConnect() == false {
+            problems.append("the previous account could not be reopened: \(errorText ?? "unknown")")
+        }
+        return MarmotService.ServiceError.core(problems.joined(separator: "; "))
+    }
+
+    /// Add an account and switch to it. `nsec == nil` generates a fresh key;
+    /// a pasted key is imported and its Blossom backup, when one exists, is
+    /// restored into the new account's own directory before the first open.
+    /// Nothing belonging to the current account is touched. Adding a key
+    /// that is already registered is a switch (R-023: never a replacement).
+    @discardableResult
+    func addAccount(nsec raw: String?, label: String?) async throws -> (account: SonarAccount, backup: AccountBackupRestoreOutcome) {
+        let identity: SonarIdentity
+        let nsec: String
+        if let raw {
+            nsec = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            identity = try SonarIdentity.import(nsec: nsec)
+        } else {
+            identity = SonarIdentity.generate()
+            nsec = identity.nsec()
+        }
+        let hex = identity.pubkeyHex()
+        if let existing = SonarAccountRegistry.snapshot().accounts.first(where: { $0.pubkeyHex == hex }) {
+            try await switchAccount(toPubkeyHex: hex)
+            return (existing, .unchanged)
+        }
+        guard !busy else { throw MarmotService.ServiceError.core("Still finishing a previous account change") }
+        busy = true
+        defer { busy = false }
+        let previous = try SonarAccountRegistry.resolveActive()
+        let entry = try SonarAccountRegistry.add(pubkey: hex, label: label)
+        // The key lands under the new account's own name BEFORE the account
+        // becomes active. A crash after this leaves a registered account with
+        // its key — openable later — never a key-less entry that invites a
+        // replacement to be minted (Account Key Durability, invariant 2).
+        // When the key cannot be stored, the row goes too: a key-less row
+        // would be found by the "already registered" check and switched to.
+        guard keychain.saveIdentityKey(Data(nsec.utf8), forKey: entry.nsecKeychainKey) else {
+            SonarAccountRegistry.discardUnopenedRow(pubkey: hex, keychain: keychain)
+            throw MarmotService.ServiceError.core("failed to persist the new account key")
+        }
+        let service = self.service
+        do {
+            try await prepareForIdentityReplacement {
+                await service.closeNode()
+            }
+            _ = try SonarAccountRegistry.setActive(pubkey: hex)
+        } catch {
+            throw await rollBackAccountChange(to: previous, because: error.localizedDescription)
+        }
+        var backup: AccountBackupRestoreOutcome = .unchanged
+        if raw != nil {
+            // Restores into the (now active) new directory; the DB key it
+            // returns is persisted under the new account's name.
+            backup = await service.tryRestoreAccountFromBlossom(nsec: nsec)
+        }
+        guard await performConnect() else {
+            throw await rollBackAccountChange(to: previous, because: errorText ?? "failed to open the new account")
+        }
+        return (entry, backup)
     }
 
     /// Seal under exclusive access, reconnect so chat is live, then upload.
@@ -1470,7 +1601,7 @@ final class MarmotChatModel: ObservableObject {
             )
         }
 
-        var sealedBundle: (nsec: String, dbPath: String, sealed: Data)?
+        var sealedBundle: (nsec: String, dbPath: String, sealed: Data, pubkeyHex: String)?
         var sealError: Error?
         var sealSkippedUnchanged = false
         do {
@@ -1576,10 +1707,10 @@ final class MarmotChatModel: ObservableObject {
                 nsec: sealedBundle.nsec,
                 sealed: sealedBundle.sealed
             )
-            try? service.noteBackupSuccess(sizeBytes: UInt64(sealedBundle.sealed.count))
+            try? service.noteBackupSuccess(sizeBytes: UInt64(sealedBundle.sealed.count), dbPath: sealedBundle.dbPath, accountPubkeyHex: sealedBundle.pubkeyHex)
         } catch {
             uploadError = error
-            try? service.noteBackupFailure(error.localizedDescription)
+            try? service.noteBackupFailure(error.localizedDescription, dbPath: sealedBundle.dbPath, accountPubkeyHex: sealedBundle.pubkeyHex)
         }
         let outcome = MarmotAccountBackupFlow.outcome(
             uploadSucceeded: uploadError == nil,
@@ -5515,7 +5646,7 @@ final class MarmotChatModel: ObservableObject {
         pendingConversationRefreshGroups = []
         clearIdentityScopedState()
         do {
-            try await service.wipeDatabase()
+            try await service.wipeDatabase(scope: .activeAccount)
         } catch {
             errorText = Self.describe(error)
             return

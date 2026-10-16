@@ -37,6 +37,10 @@ enum SonarNotificationKeys {
     /// Marks app-generated Marmot/Transponder banners whose tap must force
     /// catch-up even though the original remote-push keys are no longer present.
     static let marmotWake = "sonarMarmotWake"
+    /// Hex pubkey of the account the NSE drained this banner from. Absent on
+    /// app-generated banners (always the active account). A tap on another
+    /// account's banner switches before opening.
+    static let accountPubkey = "sonarAccountPubkey"
 }
 
 /// Pure helpers for which delivered notifications belong to a conversation.
@@ -57,6 +61,13 @@ enum SonarNotificationHandoff {
         guard let id = userInfo[SonarNotificationKeys.messageId] as? String else { return nil }
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func accountPubkeyHex(from userInfo: [AnyHashable: Any]) -> String? {
+        guard let hex = userInfo[SonarNotificationKeys.accountPubkey] as? String else { return nil }
+        let trimmed = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard trimmed.count == 64, trimmed.allSatisfy({ $0.isHexDigit && $0.isASCII }) else { return nil }
+        return trimmed
     }
 
     static func isMarmotWake(from userInfo: [AnyHashable: Any]) -> Bool {

@@ -4368,6 +4368,237 @@ public func FfiConverterTypeAccountBackupUploadInfo_lower(_ value: AccountBackup
 
 
 /**
+ * One registered account (see `sonar_core::accounts`).
+ */
+public struct AccountInfo: Equatable, Hashable {
+    /**
+     * 64-char lowercase hex x-only public key.
+     */
+    public var pubkeyHex: String
+    public var npub: String
+    public var label: String?
+    /**
+     * Absolute path of this account's `marmot.sqlite`; every core sidecar
+     * hangs off it. Pass it to `SonarNode.connect` and the `db_path` exports.
+     */
+    public var dbPath: String
+    /**
+     * Suffix for host secret names: `""` keeps the legacy unsuffixed names,
+     * otherwise `account_secret_key_name(base, tag)` gives `base.tag`.
+     */
+    public var secretTag: String
+    public var isLegacy: Bool
+    public var isActive: Bool
+    public var addedAt: UInt64
+    public var lastActiveAt: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * 64-char lowercase hex x-only public key.
+         */pubkeyHex: String, npub: String, label: String?,
+        /**
+         * Absolute path of this account's `marmot.sqlite`; every core sidecar
+         * hangs off it. Pass it to `SonarNode.connect` and the `db_path` exports.
+         */dbPath: String,
+        /**
+         * Suffix for host secret names: `""` keeps the legacy unsuffixed names,
+         * otherwise `account_secret_key_name(base, tag)` gives `base.tag`.
+         */secretTag: String, isLegacy: Bool, isActive: Bool, addedAt: UInt64, lastActiveAt: UInt64) {
+        self.pubkeyHex = pubkeyHex
+        self.npub = npub
+        self.label = label
+        self.dbPath = dbPath
+        self.secretTag = secretTag
+        self.isLegacy = isLegacy
+        self.isActive = isActive
+        self.addedAt = addedAt
+        self.lastActiveAt = lastActiveAt
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AccountInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAccountInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountInfo {
+        return
+            try AccountInfo(
+                pubkeyHex: FfiConverterString.read(from: &buf),
+                npub: FfiConverterString.read(from: &buf),
+                label: FfiConverterOptionString.read(from: &buf),
+                dbPath: FfiConverterString.read(from: &buf),
+                secretTag: FfiConverterString.read(from: &buf),
+                isLegacy: FfiConverterBool.read(from: &buf),
+                isActive: FfiConverterBool.read(from: &buf),
+                addedAt: FfiConverterUInt64.read(from: &buf),
+                lastActiveAt: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AccountInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.pubkeyHex, into: &buf)
+        FfiConverterString.write(value.npub, into: &buf)
+        FfiConverterOptionString.write(value.label, into: &buf)
+        FfiConverterString.write(value.dbPath, into: &buf)
+        FfiConverterString.write(value.secretTag, into: &buf)
+        FfiConverterBool.write(value.isLegacy, into: &buf)
+        FfiConverterBool.write(value.isActive, into: &buf)
+        FfiConverterUInt64.write(value.addedAt, into: &buf)
+        FfiConverterUInt64.write(value.lastActiveAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountInfo_lift(_ buf: RustBuffer) throws -> AccountInfo {
+    return try FfiConverterTypeAccountInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountInfo_lower(_ value: AccountInfo) -> RustBuffer {
+    return FfiConverterTypeAccountInfo.lower(value)
+}
+
+
+/**
+ * Registry snapshot for the switcher UI and the NSE.
+ */
+public struct AccountRegistryInfo: Equatable, Hashable {
+    public var accounts: [AccountInfo]
+    /**
+     * Resolved active account (explicit pointer, else most recently active).
+     */
+    public var activePubkeyHex: String?
+    public var maxAccounts: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(accounts: [AccountInfo],
+        /**
+         * Resolved active account (explicit pointer, else most recently active).
+         */activePubkeyHex: String?, maxAccounts: UInt32) {
+        self.accounts = accounts
+        self.activePubkeyHex = activePubkeyHex
+        self.maxAccounts = maxAccounts
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AccountRegistryInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAccountRegistryInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountRegistryInfo {
+        return
+            try AccountRegistryInfo(
+                accounts: FfiConverterSequenceTypeAccountInfo.read(from: &buf),
+                activePubkeyHex: FfiConverterOptionString.read(from: &buf),
+                maxAccounts: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AccountRegistryInfo, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeAccountInfo.write(value.accounts, into: &buf)
+        FfiConverterOptionString.write(value.activePubkeyHex, into: &buf)
+        FfiConverterUInt32.write(value.maxAccounts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountRegistryInfo_lift(_ buf: RustBuffer) throws -> AccountRegistryInfo {
+    return try FfiConverterTypeAccountRegistryInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountRegistryInfo_lower(_ value: AccountRegistryInfo) -> RustBuffer {
+    return FfiConverterTypeAccountRegistryInfo.lower(value)
+}
+
+
+/**
+ * Outcome of `account_registry_remove`.
+ */
+public struct AccountRemovalInfo: Equatable, Hashable {
+    public var removed: AccountInfo
+    public var newActive: AccountInfo
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(removed: AccountInfo, newActive: AccountInfo) {
+        self.removed = removed
+        self.newActive = newActive
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AccountRemovalInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAccountRemovalInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountRemovalInfo {
+        return
+            try AccountRemovalInfo(
+                removed: FfiConverterTypeAccountInfo.read(from: &buf),
+                newActive: FfiConverterTypeAccountInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AccountRemovalInfo, into buf: inout [UInt8]) {
+        FfiConverterTypeAccountInfo.write(value.removed, into: &buf)
+        FfiConverterTypeAccountInfo.write(value.newActive, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountRemovalInfo_lift(_ buf: RustBuffer) throws -> AccountRemovalInfo {
+    return try FfiConverterTypeAccountRemovalInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountRemovalInfo_lower(_ value: AccountRemovalInfo) -> RustBuffer {
+    return FfiConverterTypeAccountRemovalInfo.lower(value)
+}
+
+
+/**
  * Auto-backup policy snapshot for Settings / host executors.
  */
 public struct BackupPolicyInfo: Equatable, Hashable {
@@ -9312,6 +9543,30 @@ fileprivate struct FfiConverterOptionTypeSonarSuspendLatch: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeAccountInfo: FfiConverterRustBuffer {
+    typealias SwiftType = AccountInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAccountInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAccountInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCallEventInfo: FfiConverterRustBuffer {
     typealias SwiftType = CallEventInfo?
 
@@ -9763,6 +10018,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterData.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeAccountInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [AccountInfo]
+
+    public static func write(_ value: [AccountInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeAccountInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [AccountInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [AccountInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeAccountInfo.read(from: &buf))
         }
         return seq
     }
@@ -10306,12 +10586,118 @@ public func abortAccountRestore(dbPath: String)throws   {try rustCallWithError(F
 }
 }
 /**
+ * Add `pubkey` (hex or npub) under `<data_dir>/accounts/<hex>/`. An already
+ * registered key is returned unchanged (treat as a switch, never a
+ * replacement). Does not change the active account.
+ */
+public func accountRegistryAdd(dataDir: String, pubkey: String, label: String?)throws  -> AccountInfo  {
+    return try  FfiConverterTypeAccountInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_account_registry_add(
+        FfiConverterString.lower(dataDir),
+        FfiConverterString.lower(pubkey),
+        FfiConverterOptionString.lower(label),$0
+    )
+})
+}
+/**
+ * Load `<data_dir>/accounts.json`. Missing ⇒ empty registry; a file that
+ * does not parse is an error — hosts fall back to the legacy single-account
+ * path for that launch and never mint a key or store because of it.
+ */
+public func accountRegistryLoad(dataDir: String)throws  -> AccountRegistryInfo  {
+    return try  FfiConverterTypeAccountRegistryInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_account_registry_load(
+        FfiConverterString.lower(dataDir),$0
+    )
+})
+}
+public func accountRegistryMaxAccounts() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_account_registry_max_accounts($0
+    )
+})
+}
+/**
+ * Register the pre-registry store (`<data_dir>/marmot.sqlite`, unsuffixed
+ * secrets) in place as `pubkey` (hex or npub). Idempotent; refuses a second
+ * key for the legacy slot. Returns the full registry after the change.
+ */
+public func accountRegistryRegisterLegacy(dataDir: String, pubkey: String)throws  -> AccountRegistryInfo  {
+    return try  FfiConverterTypeAccountRegistryInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_account_registry_register_legacy(
+        FfiConverterString.lower(dataDir),
+        FfiConverterString.lower(pubkey),$0
+    )
+})
+}
+/**
+ * Remove `pubkey`: wipes its store and sidecars and its `accounts/<hex>`
+ * directory, never the data dir. Refuses the last account. Call with no
+ * live node on that store; clear the account's secrets afterwards using
+ * `removed.secret_tag`.
+ */
+public func accountRegistryRemove(dataDir: String, pubkey: String)throws  -> AccountRemovalInfo  {
+    return try  FfiConverterTypeAccountRemovalInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_account_registry_remove(
+        FfiConverterString.lower(dataDir),
+        FfiConverterString.lower(pubkey),$0
+    )
+})
+}
+/**
+ * After an nsec restore replaced the key behind `old_pubkey` in place: point
+ * the registry row at `new_pubkey`. Returns the row, or `None` when `old`
+ * was never registered (pre-registry install). Refuses a `new` that already
+ * has its own row.
+ */
+public func accountRegistryReplacePubkey(dataDir: String, oldPubkey: String, newPubkey: String)throws  -> AccountInfo?  {
+    return try  FfiConverterOptionTypeAccountInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_account_registry_replace_pubkey(
+        FfiConverterString.lower(dataDir),
+        FfiConverterString.lower(oldPubkey),
+        FfiConverterString.lower(newPubkey),$0
+    )
+})
+}
+/**
+ * Make `pubkey` active. Hosts close the current node first and open the
+ * returned `db_path` afterwards.
+ */
+public func accountRegistrySetActive(dataDir: String, pubkey: String)throws  -> AccountInfo  {
+    return try  FfiConverterTypeAccountInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_account_registry_set_active(
+        FfiConverterString.lower(dataDir),
+        FfiConverterString.lower(pubkey),$0
+    )
+})
+}
+public func accountRegistrySetLabel(dataDir: String, pubkey: String, label: String?)throws  -> AccountInfo  {
+    return try  FfiConverterTypeAccountInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_account_registry_set_label(
+        FfiConverterString.lower(dataDir),
+        FfiConverterString.lower(pubkey),
+        FfiConverterOptionString.lower(label),$0
+    )
+})
+}
+/**
  * True when `*.sonar-restore-staging` still exists (DB not yet promoted).
  */
 public func accountRestoreStagingPresent(dbPath: String) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_func_account_restore_staging_present(
         FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+/**
+ * Host secret name for `base` under `secret_tag` (`base` or `base.tag`).
+ */
+public func accountSecretKeyName(base: String, secretTag: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_account_secret_key_name(
+        FfiConverterString.lower(base),
+        FfiConverterString.lower(secretTag),$0
     )
 })
 }
@@ -10985,7 +11371,34 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_abort_account_restore() != 48901) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_account_registry_add() != 33781) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_account_registry_load() != 8821) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_account_registry_max_accounts() != 22578) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_account_registry_register_legacy() != 55049) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_account_registry_remove() != 30972) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_account_registry_replace_pubkey() != 54719) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_account_registry_set_active() != 22069) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_account_registry_set_label() != 44993) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_account_restore_staging_present() != 58444) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_account_secret_key_name() != 33882) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_account_storage_bytes() != 38156) {

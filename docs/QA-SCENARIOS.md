@@ -1266,6 +1266,90 @@ real mint and need the maintainer's approval of the amounts.
   the amount never on screen; Compose ignored that amount and paid the typed
   one.
 
+## Accounts (multi-account switcher)
+
+Several Marmot accounts per install, one online at a time (Telegram / White
+Noise shape). Core registry `sonar_core::accounts` (`<data dir>/accounts.json`,
+`accounts/<hex>/marmot.sqlite`); hosts keep per-account secrets under
+`marmot-nsec.<hex>` / `nsec.<hex>`. Design: `docs/plans/2026-10-15-multi-account-switcher.md`.
+
+### QA-168 — Adding an account never touches the first one
+- **Platforms:** iOS (SwiftUI), Android (Compose), desktop.
+- **Steps:** on an install with chats, Settings → Accounts → Add account →
+  *Create new account*. Then switch back to the first account.
+- **Expect:** the new account opens with an empty chat list within the chat-open
+  budget; the first account's chats, nickname-in-kind-0, wallet balance and
+  backup setting are exactly as before. Registry has two rows, the legacy row
+  still at `<data dir>/marmot.sqlite` with the bare secret names.
+- **Guard:** `sonar_core::accounts::tests::added_accounts_get_their_own_dir_and_tag`,
+  `AccountSwitchTest.legacyTagKeepsTheBareSecretNames`,
+  `SonarAccountRegistryTests.testRegistryRoundTripThroughFfi`
+- **Origin:** PR multi-account switcher (2026-10-15).
+
+### QA-169 — Switching paints from local storage, offline
+- **Platforms:** iOS, Android, desktop.
+- **Steps:** two accounts with history. Airplane mode. Long-press the home
+  avatar (or Settings → Accounts) and pick the other account.
+- **Expect:** the target's chat list paints from its local index with no relay
+  wait; sending queues a local echo. No wipe, no Blossom restore, no key
+  regenerated. Switching back shows the first account unchanged.
+- **Guard:** `AccountSwitchTest.orderedPutsTheActiveFirstThenMostRecent`;
+  manual (relay-free paint).
+- **Origin:** PR multi-account switcher (2026-10-15).
+
+### QA-170 — Adding the key you already have is a switch, never a replacement
+- **Platforms:** iOS, Android, desktop.
+- **Steps:** Settings → Accounts → Add account → paste the nsec of an account
+  already on the phone (the active one, or another one).
+- **Expect:** the app switches to that account; nothing is wiped or restored
+  (R-023 scoped to the switcher).
+- **Guard:** `sonar_core::accounts::tests::adding_a_registered_key_returns_it_unchanged`
+- **Origin:** PR multi-account switcher (2026-10-15).
+
+### QA-174 — Restoring a key that is already another account switches to it
+- **Platforms:** iOS, Android, desktop.
+- **Steps:** accounts A (active) and B registered. Settings → Restore account →
+  paste B's nsec.
+- **Expect:** the app switches to B. A's store is untouched and A's keychain
+  items still hold A's key. Replacing here would have wiped A's store and
+  written B's key under A's slot names, destroying A.
+- **Guard:** `AccountSwitchTest.restoringARegisteredKeyIsFoundAsASwitchTarget`
+- **Origin:** codex review of the multi-account switcher PR (2026-10-15).
+
+### QA-171 — Removing an account clears only that account
+- **Platforms:** iOS, Android, desktop.
+- **Steps:** three accounts. Remove a NON-active one, then remove the active
+  one, then try to remove the last one.
+- **Expect:** each removal deletes that account's store directory and its
+  secrets only; the active removal first hands over to the most recently
+  active other account; the last account is refused with a pointer to
+  Emergency wipe. The removed account's `sonar-cashu/<id>/` stays on disk.
+- **Guard:** `sonar_core::accounts::tests::remove_wipes_only_the_removed_dir_and_refuses_the_last`,
+  `AccountSwitchTest.nextActiveAfterRemovingPicksTheMostRecentOther`
+- **Origin:** PR multi-account switcher (2026-10-15).
+
+### QA-172 — A push for a background account still lands
+- **Platforms:** iOS (NSE), Android (FCM service). Manual.
+- **Steps:** account B is registered but not active. From another device send
+  B a message while the app is backgrounded (iOS) or killed (Android).
+- **Expect:** iOS shows B's decorated banner (the NSE drains the active account
+  first, then peeks the others); tapping it switches to B and opens the chat.
+  Android shows "New messages for <B>"; tapping it switches to B. A push
+  while the app is foreground on A degrades to the generic banner (one store
+  open per process, as before).
+- **Guard:** none (device-only); covered by the manual walk.
+- **Origin:** PR multi-account switcher (2026-10-15).
+
+### QA-173 — Emergency wipe clears every account
+- **Platforms:** iOS, Android, desktop.
+- **Steps:** two accounts, then Settings → Emergency wipe.
+- **Expect:** onboarding appears; `<data dir>` holds no `accounts.json`, no
+  `accounts/`, no store; every `marmot-nsec*` / `nsec*` and DB key item is
+  gone (Account Key Durability invariant 5, now N accounts wide).
+- **Guard:** `DesktopWipeClearsSecretsTest.*` (desktop, bare names);
+  per-tag items are manual.
+- **Origin:** PR multi-account switcher (2026-10-15).
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs

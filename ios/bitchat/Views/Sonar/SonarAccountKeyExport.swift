@@ -13,8 +13,11 @@ import Foundation
 /// iOS must not FIFO-wait on `MarmotService.workQueue`, which sync/relay work
 /// can park for seconds.
 enum SonarAccountKeyExport {
-    /// Keychain item that stores the account `nsec1…` (same as onboarding).
-    static let marmotNsecKey = "marmot-nsec"
+    /// Keychain item that stores the ACTIVE account's `nsec1…` (same as
+    /// onboarding). Resolved per read: the legacy account keeps the bare
+    /// `marmot-nsec`, every account added later gets `marmot-nsec.<hex>` —
+    /// see `SonarAccountRegistry`.
+    static var marmotNsecKey: String { SonarAccountRegistry.activeNsecKeychainKey() }
 
     /// Durable `nsec1…` from keychain, or nil when missing / unreadable.
     ///

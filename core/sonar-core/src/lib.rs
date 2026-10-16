@@ -5,6 +5,7 @@
 //! crate and stay UI-only.
 
 pub mod account_backup;
+pub mod accounts;
 pub mod call;
 pub mod client;
 pub mod conversation_index;
