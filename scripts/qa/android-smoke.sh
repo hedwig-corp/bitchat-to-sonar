@@ -876,7 +876,14 @@ qa164() { # cold launch on slow mobile data: first frame never waits for push's 
   for ((i = 1; i <= runs; i++)); do
     adb -s "$QA_SERIAL" shell am force-stop chat.bitchat.sonar >/dev/null 2>&1
     sleep 2
-    t0="$(adb -s "$QA_SERIAL" shell date +%s | tr -d '\r')"
+    t0="$(adb -s "$QA_SERIAL" shell date +%s 2>/dev/null | tr -d '\r')"
+    # An emulator that dropped off adb answers nothing; `logcat -T .000`
+    # would then wait forever. Stop here and say so.
+    if [[ ! "$t0" =~ ^[0-9]+$ ]]; then
+      qa164_restore
+      record QA-164 FAIL "inconclusive: $QA_SERIAL did not answer (offline?) before run $i:$detail"
+      return
+    fi
     # TotalTime = launch → first frame. MainActivity defers that frame until
     # boot()'s SonarCore.start() returns, so a start() queued behind the
     # push attach shows up here directly.

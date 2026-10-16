@@ -80,7 +80,10 @@ actual object SonarCore {
         // window stayed up for 5–15 s. The node, once opened, is the same
         // object this call would hand back, so answer from the published
         // state and let the attach finish on its own.
-        if (node != null && npub.isNotEmpty()) return@withContext npub
+        // One read of `npub`: a wipe racing this call could otherwise pass the
+        // non-empty check and then hand back the cleared value.
+        val published = npub
+        if (node != null && published.isNotEmpty()) return@withContext published
         val waitStartNs = System.nanoTime()
         lock.withLock {
             val waitedMs = (System.nanoTime() - waitStartNs) / 1_000_000
