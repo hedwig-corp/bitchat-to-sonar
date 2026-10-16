@@ -82,14 +82,24 @@ final class MarmotStoreLock: @unchecked Sendable {
 
     /// Blocking exclusive lock — used by the main app around `SonarNode.connect`.
     /// Waits if the NSE currently holds the wake lock (bounded by NSE lifetime).
-    /// Signals the NSE first so that wait is the NSE's abort latency, not its
-    /// relay timeouts.
-    static func acquireExclusive(fileManager: FileManager = .default) throws -> MarmotStoreLock {
+    ///
+    /// `askHolderToYield` (the default) signals the NSE first so that wait is
+    /// the NSE's abort latency, not its relay timeouts. The store OPEN paths
+    /// want that: a user is looking at the launch surface. The account-backup
+    /// seal passes `false`: a backup is invisible and retries later, while
+    /// the banner the NSE is decorating is not, so there the old behaviour
+    /// (wait for the wake to finish) is the right one.
+    static func acquireExclusive(
+        fileManager: FileManager = .default,
+        askHolderToYield: Bool = true
+    ) throws -> MarmotStoreLock {
         #if os(iOS)
         guard let url = lockFileURL(fileManager: fileManager, createDirectory: true) else {
             throw StoreLockError.appGroupUnavailable
         }
-        signalHostWantsStore()
+        if askHolderToYield {
+            signalHostWantsStore()
+        }
         do {
             return try openAndLock(url: url, nonBlocking: false)
         } catch StoreLockError.busy {

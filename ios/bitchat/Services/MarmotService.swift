@@ -1952,7 +1952,9 @@ final class MarmotService: @unchecked Sendable {
                 service.storeLock = nil
                 return held
             }
-            return try MarmotStoreLock.acquireExclusive()
+            // Do not ask an NSE wake to yield for a backup: the wake is
+            // decorating a banner the user will see, the seal can wait.
+            return try MarmotStoreLock.acquireExclusive(askHolderToYield: false)
         }
         #endif
 
