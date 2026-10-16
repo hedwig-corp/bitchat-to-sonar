@@ -5567,6 +5567,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A wallet on a mint whose ACTIVE keyset charges 1000 ppk, funded with
+    /// `receives` × 255 sats (8 proofs each).
+    fn wallet_on_fee_keyset(
+        dir: &Path,
+        receives: usize,
+    ) -> (CdkWallet, Arc<test_mint::FakeMint>, Arc<Recorder>) {
+        let mint = Arc::new(test_mint::FakeMint::with_input_fee(1_000));
+        let w = reopen(dir, &mint);
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        for _ in 0..receives {
+            receive_paid_bolt11(&w, &mint, 255);
+        }
+        (w, mint, recorder)
+    }
+
+    fn outgoing_row(w: &CdkWallet, id: &str) -> Payment {
+        w.list_recent_payments(50)
+            .unwrap()
+            .into_iter()
+            .find(|p| !p.incoming && p.id == id)
+            .expect("the send is in history")
+    }
+
+    /// A melt that swaps first pays two NUT-02 input fees: the swap's, on
+    /// the proofs it splits, and the melt's own, on the proofs the swap
+    /// made. CDK 0.18.1 prices the melt's transaction from the melt's inputs
+    /// alone, so the swap fee dropped out of the send result, its event and
+    /// history. Against a real cdk-mintd 0.18.1 at 1000 ppk (#666 QA) a
+    /// 1300-sat send cost 42 sats over its amount and history said 6. Every
+    /// figure must be what left the balance, less the amount.
+    #[test]
+    fn a_send_that_swaps_first_reports_the_swap_fee_too() {
+        let dir = scratch("swap-fee-reported");
+        let (w, mint, recorder) = wallet_on_fee_keyset(&dir, 5);
+        let before = w.balance().unwrap().confirmed_sats;
+        let prepared = prepare(&w, &test_invoice(Some(1_000_000)), None).unwrap();
+        let quoted = prepared.fees_sats.unwrap();
+        assert!(prepared.amount_sats + quoted <= before, "fee {quoted}");
+        let swaps = mint.calls("post_swap");
+
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete, "{payment:?}");
+        assert_eq!(mint.calls("post_swap"), swaps + 1, "the melt swapped first");
+        let cost = before - w.balance().unwrap().confirmed_sats - 1_000;
+        assert!(cost <= quoted, "cost {cost} over the quoted {quoted}");
+        assert_eq!(payment.fees_sats, Some(cost), "the send result");
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id).is_some()));
+        assert_eq!(
+            sent_outcome(&recorder, &payment.id).unwrap().fees_sats,
+            Some(cost),
+            "the PaymentSent event"
+        );
+        assert_eq!(
+            outgoing_row(&w, &payment.id).fees_sats,
+            Some(cost),
+            "history"
+        );
+
+        // History is rebuilt from the store: the figure survives a relaunch.
+        drop(w);
+        let w = reopen(&dir, &mint);
+        w.connect().unwrap();
+        assert_eq!(
+            outgoing_row(&w, &payment.id).fees_sats,
+            Some(cost),
+            "history after a relaunch"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same send, answered Pending and settled later by the watcher:
+    /// the swap ran inside the confirm, but the row the fee is read from is
+    /// finalized when the mint settles.
+    #[test]
+    fn a_swapped_melt_settled_later_reports_the_swap_fee_too() {
+        let dir = scratch("swap-fee-settled-later");
+        let (w, mint, recorder) = wallet_on_fee_keyset(&dir, 5);
+        let before = w.balance().unwrap().confirmed_sats;
+        mint.set_melt_outcome(test_mint::MeltOutcome::Pending);
+        let prepared = prepare(&w, &test_invoice(Some(1_000_000)), None).unwrap();
+        let swaps = mint.calls("post_swap");
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Pending, "{payment:?}");
+        assert_eq!(mint.calls("post_swap"), swaps + 1, "the melt swapped first");
+
+        mint.resolve_melt(
+            &payment.id,
+            test_mint::MeltOutcome::Paid {
+                preimage: Some(PREIMAGE.into()),
+            },
+        );
+        w.sync_wallet().unwrap();
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id).is_some()));
+        let cost = before - w.balance().unwrap().confirmed_sats - 1_000;
+        let settled = sent_outcome(&recorder, &payment.id).unwrap();
+        assert_eq!(settled.status, PaymentStatus::Complete);
+        assert_eq!(settled.fees_sats, Some(cost), "the settling event");
+        assert_eq!(
+            outgoing_row(&w, &payment.id).fees_sats,
+            Some(cost),
+            "history"
+        );
+        assert_eq!(
+            w.outgoing_payment_outcome(&payment.id)
+                .unwrap()
+                .expect("the quote is known")
+                .fees_sats,
+            Some(cost),
+            "a host's lookup of the row"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A melt that spends its proofs as they are, with no swap, was already
+    /// reported right; counting swap fees must not change it. With a fee on
+    /// the keyset CDK always swaps, so this is the other way a melt runs:
+    /// retired-keyset proofs that cannot pay for their own swap, topped up
+    /// and melted directly ([`prepare_funded_melt`]).
+    #[test]
+    fn a_send_with_no_swap_reports_the_melt_fee_alone() {
+        let dir = scratch("no-swap-fee");
+        let (w, mint) = wallet_with_retired_fee_proofs(&dir, 1_000, 5);
+        // One more receive, on the new free keyset, to top the selection up.
+        receive_paid_bolt11(&w, &mint, 255);
+        let before = w.balance().unwrap().confirmed_sats;
+        // The 40 retired proofs (1,275 sats) cover 1,250 + reserve 2 but
+        // not their own 40-sat swap fee as well.
+        let amount = 1_250;
+        let prepared = prepare(&w, &test_invoice(Some(amount * 1_000)), None).unwrap();
+        let swaps = mint.calls("post_swap");
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete, "{payment:?}");
+        assert_eq!(mint.calls("post_swap"), swaps, "melted directly, no swap");
+        let cost = before - w.balance().unwrap().confirmed_sats - amount;
+        assert_eq!(payment.fees_sats, Some(cost), "the send result");
+        assert_eq!(
+            outgoing_row(&w, &payment.id).fees_sats,
+            Some(cost),
+            "history"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Proofs a send in flight holds are not spendable. A second send that
     /// only the TOTAL could cover is refused by the hosts' check, because
     /// the balance and the price both count unreserved proofs only.
