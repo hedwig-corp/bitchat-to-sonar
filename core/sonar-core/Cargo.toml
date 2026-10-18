@@ -109,6 +109,9 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true
+# A mute WebSocket relay for the lookup-quorum test; same version the relay
+# pool already links (async-wsocket), so no new crate is pulled in.
+tokio-tungstenite = "0.26"
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 # Content-addressing for the in-test mock Blossom server (media e2e).

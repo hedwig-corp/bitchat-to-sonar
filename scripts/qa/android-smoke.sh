@@ -844,6 +844,30 @@ qa093() { # turning sharing off withdraws your time; a peer's revoke clears the 
   fi
 }
 
+qa150() { # a send from a chat opened at the unread divider lands on screen (i3/A3)
+  [[ -n "$APP_NPUB" ]] || { record QA-150 SKIP "needs QA-001 (or QA_APP_NPUB)"; return; }
+  local title="Agent $RUN"
+  "$PEERS" new "agent-$RUN" >/dev/null || { record QA-150 FAIL "peer init failed"; return; }
+  "$PEERS" seed-agent "agent-$RUN" "$APP_NPUB" 40 "$title" >/dev/null \
+    || { record QA-150 FAIL "seeding 40 agent replies failed"; return; }
+  go_home || { record QA-150 FAIL "could not reach the chat list"; return; }
+  "$UI" wait "$title" 60 >/dev/null || { record QA-150 FAIL "no '$title' row after 60s"; return; }
+  open_chat_row "$title" || { record QA-150 FAIL "could not open '$title'"; return; }
+  "$UI" wait "Unread messages" 15 >/dev/null \
+    || { record QA-150 FAIL "no unread divider: the open did not land in history"; return; }
+  focus_composer
+  ui type "qa150 sent $RUN"
+  ui tapx "Send" || { record QA-150 FAIL "no 'Send' control"; return; }
+  sleep 4
+  if [[ -n "$("$UI" find "qa150 sent $RUN" 2>/dev/null)" ]]; then
+    record QA-150 PASS "own send on screen after an unread-divider open"
+  else
+    "$UI" shot "$QA_HOME/qa150-$RUN.png" >/dev/null 2>&1 || true
+    record QA-150 FAIL "own send not on screen: the reader stayed at the divider ($QA_HOME/qa150-$RUN.png)"
+  fi
+  ui key 4
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -860,7 +884,7 @@ sleep 3
 # opens QA-004's, and QA-040 inspects the chat
 # QA-005 left open. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
+for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa150 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

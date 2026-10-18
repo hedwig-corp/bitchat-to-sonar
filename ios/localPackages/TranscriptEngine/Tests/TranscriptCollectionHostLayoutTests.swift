@@ -93,6 +93,59 @@ struct TranscriptCollectionHostLayoutTests {
         return visibleBottom - lastRowBottomInViewport
     }
 
+    /// QA-150 at the real call site: open 60 rows with 40 unread (the viewport
+    /// parks at the divider, far above the tail), append the reader's own send
+    /// with `ownSendRevision` bumped, and the transcript must rest on the live
+    /// edge. The control append (no revision bump — a peer's row) must leave
+    /// the reader where they were, which is what every send did before.
+    @Test
+    func ownSendFromAnUnreadOpenLandsOnTheLiveEdge() async {
+        let (window, vc) = await makeHost(rows: 60, viewportHeight: 700)
+        defer { window.isHidden = true }
+        let collection = vc.collectionView
+        let day = Date(timeIntervalSince1970: 1_700_000_000)
+        var entries = (0..<60).map {
+            TranscriptHostEntry(id: "m-\($0)", date: day.addingTimeInterval(Double($0)))
+        }
+        // The unread count settles after the first paint (the app's capture
+        // lags a cold open): the host resolves the divider and parks there.
+        vc.apply(
+            entries: entries,
+            unreadCountAtOpen: 40,
+            expectedNewestDate: nil,
+            loadOlder: nil,
+            loadNewest: nil
+        )
+        await settle(window)
+        // Precondition: the unread open left the tail well below the fold.
+        #expect(gapBelowLastRow(collection) < -Self.rowHeight * 10)
+
+        // Control: a peer's message arrives — the reader stays in history.
+        entries.append(TranscriptHostEntry(id: "peer-1", date: day.addingTimeInterval(60)))
+        vc.apply(
+            entries: entries,
+            unreadCountAtOpen: 40,
+            expectedNewestDate: nil,
+            loadOlder: nil,
+            loadNewest: nil
+        )
+        await settle(window)
+        #expect(gapBelowLastRow(collection) < -Self.rowHeight * 10)
+
+        // The reader's own send: snap to the live edge.
+        entries.append(TranscriptHostEntry(id: "echo-1", date: day.addingTimeInterval(61)))
+        vc.apply(
+            entries: entries,
+            unreadCountAtOpen: 40,
+            expectedNewestDate: nil,
+            ownSendRevision: 1,
+            loadOlder: nil,
+            loadNewest: nil
+        )
+        await settle(window)
+        #expect(abs(gapBelowLastRow(collection)) < 1)
+    }
+
     @Test
     func shortFeedRestsOnTheComposerInsteadOfLeavingAnEmptyBand() async {
         let (window, vc) = await makeHost(rows: 2, viewportHeight: 844)

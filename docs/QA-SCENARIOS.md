@@ -746,6 +746,63 @@ share a zone with the app and report the zone the app shared with it.
   Max on alpha.15.1. The Pixel header read "Nearby · Bluetooth" instead of
   the iPhone's time.
 
+## Agent chats (Hermes-shaped)
+
+A chat with an agent is the heaviest DM a user has: dozens of 3 KB replies
+in `[1/N]` chunks, media attachments, and hundreds of unread rows after a
+long turn. `scripts/qa/peers.sh seed-agent <peer> <app-npub> [count]` builds
+one in seconds (300 rows in 17 s on 2026-09-30). The real agent
+(`docs/HERMES-AGENT.md`) only answers allow-listed npubs, so these scenarios
+use a seeded peer; the relay path is the same.
+
+### QA-150 — A send from a chat opened at the unread divider lands on screen
+- **Platforms:** both (Android automated; iOS by `ios-drive.sh`)
+- **Steps:** seed 40+ long replies into a chat while it is closed; open it
+  (the transcript parks at "Unread messages", far above the tail); type and
+  send.
+- **Expect:** the sent bubble is on screen within a few seconds — the
+  transcript moves to the live edge on an outgoing message, as Signal does
+  (`CVScrollAction` on send), and keeps following replies afterwards. A
+  peer's row arriving while the reader is still in history must *not* move
+  the view (QA-005 keeps the divider).
+- **How:** `android-smoke.sh` QA-150 · iOS: `ios-drive.sh heavy
+  "activate;tapc:<row>;wait:5;tapid:sonar-message-composer;wait:1;type:qa150;tapid:sonar-message-send;expect:qa150@10"`
+  · Guard: `TranscriptScrollPolicyTests.ownSendInHistorySnapsToTheTailAndRePins`,
+  `TranscriptCollectionHostLayoutTests.ownSendFromAnUnreadOpenLandsOnTheLiveEdge`
+  (iOS, real host), `TranscriptOwnSendFollowTest` (Compose)
+- **Origin:** i3/A3, 2026-09-30 Hermes simulation pass. Five sends from the
+  iOS simulator reached the relays in 200–600 ms each (`send_first_ack`)
+  and none was visible; the Android emulator showed the same. This is the
+  "the app does not respond when I write to the agent" report: the core
+  had sent, the reader never saw it.
+
+### QA-151 — A pending bubble is announced as "Sending", not "Sent at"
+- **Platforms:** iOS (Compose has no time label on the bubble)
+- **Steps:** with VoiceOver, or `ios-drive.sh … "tree:t"`, send into a chat
+  whose group is still being created (first message to a fresh npub).
+- **Expect:** the bubble's accessibility label ends in "Sending" while the
+  footer says "Sending · internet", "Couldn't send" when it failed, and
+  "Sent at <time>" only once it was sent. Before the fix every outgoing
+  row read "Sent at …" — the QA driver's `expect:Sent` passed 15 s before
+  the message left the device.
+- **Guard:** `SNBubbleDeliveryAccessibilityLabelTests`
+- **Origin:** i1, 2026-09-30.
+
+### QA-152 — Starting a chat does not wait on a relay that never answers
+- **Platforms:** both (core); CLI reproduces it headlessly
+- **Steps:** with `relay.damus.io` in the relay list (it stays connected but
+  answers no REQ after a failed NIP-42 AUTH, see `docs/HERMES-AGENT.md`),
+  start a chat with a fresh peer and time the first message:
+  `time sonar-cli --home <peer> send --to <npub> --text probe`.
+- **Expect:** well under 5 s (3 s of it is the push settle). Before the fix
+  the KeyPackage fetch waited for every relay, 10 s (`FETCH_TIMEOUT`) per
+  lookup; the simulator's first message left the device 34 s after
+  "Start secure chat". Each lookup now resolves on the relays that answer.
+- **Guard:** `client.rs::key_package_lookup_does_not_wait_on_a_mute_relay`
+  (a mute WebSocket relay beside a mock relay; fails at 10.0 s without the
+  fix, passes in ~1 s with it)
+- **Origin:** i2, 2026-09-30.
+
 ## Settings
 
 ### QA-060 — Settings copy matches behaviour
