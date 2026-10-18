@@ -35,4 +35,15 @@ pub enum WalletError {
     Timeout,
     #[error("tracked receive outcome is unknown: {0}")]
     UnknownReceive(String),
+    /// The prepared send's quote expired, or was too close to expiry to be
+    /// paid safely, before any payment request left the wallet. Nothing was
+    /// sent; the caller may prepare a fresh quote for the same destination
+    /// and amount and send that one, under the fee it already agreed to.
+    #[error("the payment quote expired before it was sent")]
+    QuoteExpired,
+    /// Paying the prepared send would cost more in fees than `fees_sats` of
+    /// the [`crate::PreparedSend`] the caller agreed to. Nothing was sent;
+    /// `fees_sats` is the new fee to ask about.
+    #[error("the fee for this payment is now up to {fees_sats} sats")]
+    FeeChanged { fees_sats: u64 },
 }

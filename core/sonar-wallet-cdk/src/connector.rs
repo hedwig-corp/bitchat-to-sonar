@@ -329,7 +329,10 @@ impl MintConnector for RecordingConnector {
             .await;
         match &result {
             Err(e) if !mint_answered(e) => {
-                tracing::warn!("melt {quote_id}: no answer from the mint ({e})");
+                tracing::warn!(
+                    "melt {}: no answer from the mint ({e})",
+                    crate::quote_tag(&quote_id)
+                );
                 self.unanswered.record(&quote_id);
             }
             _ => self.unanswered.clear(&quote_id),

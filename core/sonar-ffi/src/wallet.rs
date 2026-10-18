@@ -18,6 +18,13 @@
 //! let quote = wallet.prepare_send(dest, amount)       // fee is known here — show it
 //! let paid  = wallet.send(quote, note)                // Pending is not an error
 //! ```
+//!
+//! `send` answers `QuoteExpired` when the quote ran out (or nearly) before
+//! any payment request left the wallet: nothing was sent, so prepare again
+//! for the same destination and amount and send the new quote — after the
+//! same balance and fee checks, and after re-linking any record kept under
+//! the old quote id. `FeeChanged` means paying would cost more than the
+//! `fees_sats` passed in: nothing was sent; ask about the new fee.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,8 +38,10 @@ use sonar_wallet_cdk::CdkWallet;
 
 /// Why a wallet call failed. Non-flat, with typed variants the hosts branch
 /// on: `InsufficientFunds` sizes a send down, `NotConnected`/`Timeout`/
-/// `Network` drive the reconnect UI. Fields are named `reason`, never
-/// `message` — that name collides with `Throwable.message` in Kotlin.
+/// `Network` drive the reconnect UI, `QuoteExpired` re-quotes a send and
+/// `FeeChanged` asks about a new fee — neither of those two sent anything.
+/// Fields are named `reason`, never `message` — that name collides with
+/// `Throwable.message` in Kotlin.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum WalletFfiError {
     #[error("wallet is not connected")]
@@ -53,6 +62,14 @@ pub enum WalletFfiError {
     Timeout,
     #[error("wallet error: {reason}")]
     Backend { reason: String },
+    /// The quote expired, or was too close to expiry to pay safely, before
+    /// any payment request left the wallet. Nothing was sent: prepare again.
+    #[error("the payment quote expired before it was sent")]
+    QuoteExpired,
+    /// Paying would cost more in fees than the `fees_sats` passed to `send`.
+    /// Nothing was sent; `fees_sats` here is the new fee to ask about.
+    #[error("the fee for this payment is now up to {fees_sats} sats")]
+    FeeChanged { fees_sats: u64 },
 }
 
 impl From<WalletError> for WalletFfiError {
@@ -67,6 +84,8 @@ impl From<WalletError> for WalletFfiError {
             WalletError::Network(reason) => Self::Network { reason },
             WalletError::Timeout => Self::Timeout,
             WalletError::Backend(reason) => Self::Backend { reason },
+            WalletError::QuoteExpired => Self::QuoteExpired,
+            WalletError::FeeChanged { fees_sats } => Self::FeeChanged { fees_sats },
             // `WalletError` is non-exhaustive; a new variant is a backend
             // failure until this mapping learns it.
             other => Self::Backend {
@@ -201,15 +220,24 @@ pub struct WalletDestination {
 }
 
 /// A priced send, from `prepare_send`: what the user is agreeing to. Pass it
-/// back unchanged to `send`. `fees_sats` is the mint's fee RESERVE — the most
-/// the payment can cost on top of `amount_sats`; unused reserve returns.
+/// back to `send`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WalletPreparedSend {
     pub quote_id: String,
     pub destination: String,
     pub kind: WalletDestinationKind,
     pub amount_sats: u64,
+    /// The most the payment can cost on top of `amount_sats`: the mint's
+    /// Lightning fee reserve (unused reserve returns) plus its input fees on
+    /// the ecash this payment spends. Check `amount_sats + fees_sats`
+    /// against the balance. On the way back into `send` it is the fee the
+    /// user agreed to: `send` pays no more (`FeeChanged`), so a host may
+    /// raise it to a ceiling the user accepted, never lower it to hide a fee.
     pub fees_sats: Option<u64>,
+    /// When the quote stops being payable (unix seconds, the mint's clock);
+    /// `send` answers `QuoteExpired` once it is too close. For display and
+    /// diagnostics: the wallet enforces its own stored copy.
+    pub expires_at_secs: Option<u64>,
 }
 
 impl WalletPreparedSend {
@@ -223,6 +251,7 @@ impl WalletPreparedSend {
             },
             amount_sats: self.amount_sats,
             fees_sats: self.fees_sats,
+            expires_at_secs: self.expires_at_secs,
             token: PreparedSendToken::Opaque(self.quote_id),
         }
     }
@@ -425,13 +454,15 @@ impl SonarCashuWallet {
             kind: prepared.destination.kind.into(),
             amount_sats: prepared.amount_sats,
             fees_sats: prepared.fees_sats,
+            expires_at_secs: prepared.expires_at_secs,
         })
     }
 
     /// Pay a prepared send — the one spending call. A result with
     /// `status: Pending` is NOT a failure: the payment may be routing, and
     /// its outcome arrives as an event with the same `id`. Never retry a
-    /// Pending send with a new quote; that can pay twice.
+    /// Pending send with a new quote; that can pay twice. `QuoteExpired` and
+    /// `FeeChanged` are the errors that guarantee nothing was sent.
     pub fn send(&self, prepared: WalletPreparedSend, note: String) -> WalletResult<WalletPayment> {
         Ok(self.inner.send(&prepared.into_core(), &note)?.into())
     }
@@ -688,5 +719,86 @@ mod tests {
             WalletFfiError::from(WalletError::Timeout),
             WalletFfiError::Timeout
         ));
+    }
+
+    /// The two "nothing was sent" refusals reach the hosts typed, not as a
+    /// generic backend string the hosts render as "Payment failed".
+    #[test]
+    fn quote_expired_and_fee_changed_stay_typed_across_the_boundary() {
+        assert!(matches!(
+            WalletFfiError::from(WalletError::QuoteExpired),
+            WalletFfiError::QuoteExpired
+        ));
+        assert!(matches!(
+            WalletFfiError::from(WalletError::FeeChanged { fees_sats: 42 }),
+            WalletFfiError::FeeChanged { fees_sats: 42 }
+        ));
+    }
+
+    /// A valid BOLT12 offer (LDK's parse test vectors).
+    const OFFER: &str =
+        "lno1pgx9getnwss8vetrw3hhyuc5qqtzzqhwcuj966ma9n9nqwqtl032xeyv6755yeflt235pmww58egx6rxry";
+
+    fn funded_wallet(
+        name: &str,
+        sats: u64,
+    ) -> (Arc<SonarCashuWallet>, Arc<FakeMint>, std::path::PathBuf) {
+        let dir = scratch(name);
+        let (wallet, mint) = fake_wallet(&dir);
+        wallet.connect().unwrap();
+        wallet.receive_offer().unwrap();
+        let quote = mint.mint_quote_ids().pop().unwrap();
+        mint.pay(&quote, sats);
+        wallet.sync().unwrap();
+        assert_eq!(wallet.balance().unwrap().confirmed_sats, sats);
+        (wallet, mint, dir)
+    }
+
+    /// The prepared send the hosts get carries the quote's expiry, and a
+    /// quote too close to it comes back `QuoteExpired` with no melt — the
+    /// hosts re-quote, and the fresh quote pays.
+    #[test]
+    fn a_near_expiry_quote_is_refused_typed_and_a_fresh_one_pays() {
+        let (wallet, mint, dir) = funded_wallet("near-expiry", 1_000);
+        mint.set_melt_quote_ttl(5);
+        let stale = wallet.prepare_send(OFFER.into(), Some(300)).unwrap();
+        let expiry = stale.expires_at_secs.expect("melt quotes expire");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(expiry <= now + 5, "expiry {expiry}");
+        assert!(matches!(
+            wallet.send(stale.clone(), String::new()),
+            Err(WalletFfiError::QuoteExpired)
+        ));
+        assert_eq!(mint.calls("post_melt"), 0);
+
+        mint.set_melt_quote_ttl(120);
+        let fresh = wallet.prepare_send(OFFER.into(), Some(300)).unwrap();
+        assert_ne!(fresh.quote_id, stale.quote_id);
+        assert_eq!(fresh.amount_sats, stale.amount_sats);
+        let paid = wallet.send(fresh.clone(), String::new()).unwrap();
+        assert_eq!(paid.id, fresh.quote_id, "the payment id is the new quote's");
+        assert!(matches!(paid.status, WalletPaymentStatus::Complete));
+        assert_eq!(mint.calls("post_melt"), 1);
+        wallet.disconnect().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `fees_sats` handed back to `send` is the fee the user agreed to.
+    #[test]
+    fn a_send_above_the_agreed_fee_is_refused_with_the_new_fee() {
+        let (wallet, mint, dir) = funded_wallet("fee-consent", 1_000);
+        let mut prepared = wallet.prepare_send(OFFER.into(), Some(300)).unwrap();
+        let fee = prepared.fees_sats.unwrap();
+        prepared.fees_sats = Some(fee - 1);
+        match wallet.send(prepared, String::new()) {
+            Err(WalletFfiError::FeeChanged { fees_sats }) => assert_eq!(fees_sats, fee),
+            other => panic!("expected FeeChanged, got {other:?}"),
+        }
+        assert_eq!(mint.calls("post_melt"), 0);
+        wallet.disconnect().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

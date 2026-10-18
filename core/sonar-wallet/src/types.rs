@@ -251,8 +251,19 @@ pub struct PreparedSend {
     pub destination: Destination,
     /// Net amount that will reach the payee.
     pub amount_sats: u64,
-    /// Fee this wallet will pay, when the backend can quote one up front.
+    /// The most this wallet will pay in fees on top of `amount_sats`, when
+    /// the backend can quote it up front. Callers check `amount_sats +
+    /// fees_sats` against the balance and show this figure as the fee, so it
+    /// must cover every fee the send can incur — for Cashu, the Lightning
+    /// fee reserve plus the mint's input fees on the proofs the send spends.
+    /// [`crate::WalletBackend::send`] refuses with
+    /// [`crate::WalletError::FeeChanged`] rather than pay more.
     pub fees_sats: Option<u64>,
+    /// When the quote behind this send stops being payable (unix seconds,
+    /// on the quoting party's clock), or `None` when it does not expire.
+    /// Past it, `send` answers [`crate::WalletError::QuoteExpired`] and the
+    /// caller prepares again.
+    pub expires_at_secs: Option<u64>,
     pub token: PreparedSendToken,
 }
 
