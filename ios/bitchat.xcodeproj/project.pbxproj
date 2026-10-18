@@ -499,7 +499,7 @@
 				A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "localPackages/SonarCore" */,
 				A15C0DE100000000000000B1 /* XCLocalSwiftPackageReference "localPackages/SonarWalletKit" */,
 				A15C0DE200000000000000C1 /* XCLocalSwiftPackageReference "localPackages/TranscriptEngine" */,
-				FCE6EED212F8EC310C71459F /* XCRemoteSwiftPackageReference "breez-sdk-liquid-swift" */,
+				A15C0DE300000000000000D1 /* XCLocalSwiftPackageReference "localPackages/BreezSDKLiquid" */,
 				418698187D457440F125E654 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
 			);
 			preferredProjectObjectVersion = 90;
@@ -572,8 +572,12 @@
 			shellPath = /bin/sh;
 			shellScript = (
 				"set -e",
-				"if [ \"${PLATFORM_NAME}\" = \"macosx\" ]; then",
-				"  rm -rf \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/breez_sdk_liquidFFI.framework\"",
+				"# The macOS slice of breez_sdk_liquidFFI.xcframework is a dynamic framework",
+				"# since the 0.12.4 mirror (ios/localPackages/BreezSDKLiquid/MIRROR.md) and",
+				"# must stay embedded. Only a static archive wrapper is dead weight.",
+				"FW=\"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/breez_sdk_liquidFFI.framework\"",
+				"if [ \"${PLATFORM_NAME}\" = \"macosx\" ] && [ -e \"$FW/breez_sdk_liquidFFI\" ] && file -L \"$FW/breez_sdk_liquidFFI\" | grep -q \"ar archive\"; then",
+				"  rm -rf \"$FW\"",
 				"fi",
 				"",
 			);
@@ -1242,6 +1246,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/Arti;
 		};
+		A15C0DE300000000000000D1 /* XCLocalSwiftPackageReference "localPackages/BreezSDKLiquid" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = localPackages/BreezSDKLiquid;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -1259,14 +1267,6 @@
 			requirement = {
 				kind = exactVersion;
 				version = 0.23.2;
-			};
-		};
-		FCE6EED212F8EC310C71459F /* XCRemoteSwiftPackageReference "breez-sdk-liquid-swift" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/breez/breez-sdk-liquid-swift";
-			requirement = {
-				kind = exactVersion;
-				version = 0.12.4;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
@@ -1337,7 +1337,6 @@
 		};
 		F758224FFCADDAB1B95B5A73 /* BreezSDKLiquid */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = FCE6EED212F8EC310C71459F /* XCRemoteSwiftPackageReference "breez-sdk-liquid-swift" */;
 			productName = BreezSDKLiquid;
 		};
 		A15C0DE000000000000000D2 /* SonarCore */ = {
