@@ -118,6 +118,15 @@ say why none applies. When you measure a cost you are not fixing, open an issue
 with the number. Between two correct designs, prefer the one that does less
 work: lazy, bounded, cached, coalesced.
 
+## Notification-Sync — Known Watch Items (verify with a real device push)
+
+The notif-sync stack (#252 / #254 / #255) is unit-tested and code-reviewed, and cold-start / catch-up / local-first were device-validated on a real 43-group account. The forced-sync path, "Catching up…" UX, send-under-load, and push-while-refreshing could not be exercised via CLI (no background→foreground or real push-tap injection) and **must** be verified with a real APNs push on a physical device before trusting them in production:
+
+- Forced-sync + "Catching up…" UX on a real device push (#262)
+- Send-while-forced-sync contention on the serial engine queue (#263)
+- Push arriving while `refreshAfterForeground` is in flight may wait a cycle (#264)
+- Cold-start `t3→t4` dominated by `t3a_published` (KeyPackage/profile publish) (#265)
+
 ## Local Secrets Rule
 
 Do not commit payment, wallet, relay, signing, or API secrets. The Breez wallet key must stay in gitignored local configuration (`ios/Configs/Local.xcconfig` with `BREEZ_API_KEY = ...`) or an equivalent CI secret. When creating a new workspace/worktree or rebuilding for device testing, preserve the local secret by recreating/copying the gitignored config or passing the key through the build environment; verify presence without printing the value.
