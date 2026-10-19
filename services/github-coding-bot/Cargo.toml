@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/config",
+    "crates/domain",
+    "crates/github",
+    "crates/server",
+    "crates/store",
+    "crates/worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+rust-version = "1.92"
+
+[workspace.dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+globset = "0.4"
+jsonwebtoken = { version = "10.4", default-features = false, features = ["rust_crypto"] }
+metrics = "0.24"
+octocrab = { version = "0.54", default-features = false, features = ["default-client", "follow-redirect", "retry", "rustls", "rustls-ring", "timeout", "tokio", "tracing", "jwt-rust-crypto"] }
+rmcp = { version = "2.2", features = ["transport-io"] }
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.8.6", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2.5"
+uuid = { version = "1.17", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
