@@ -348,9 +348,10 @@ messages and `0x53` announces with a BIP‑353 address are affected.
   vendored Breez Swift package from the unmerged `claude/upgrade-breez-sdk-0.12.4`
   branch: on `main` the project still points at the deleted
   `breez-sdk-liquid-swift` repository and cannot resolve packages on a fresh
-  machine. No BLEService-level test drives the 0x20/0x21 flows end to end
-  (there is no Noise-session harness in `BLEServiceCoreTests`); that wiring is
-  reviewed and compiled, not exercised.
+  machine. `BLEServicePrivateMediaTests` drives the real `BLEService` through
+  the packet seams: XX handshake, unprompted 0x21, a Noise 0x20 file surfacing
+  as a private image, our media leaving as 0x20 once the peer proved the
+  capability, and the signed 0x22 fallback when it did not.
 * Both platforms record a peer's proven capabilities from `0x21` without
   requiring its signing key to equal the announce-pinned key (a mismatch is
   logged). Upstream iOS treats that mismatch as a downgrade signal.
