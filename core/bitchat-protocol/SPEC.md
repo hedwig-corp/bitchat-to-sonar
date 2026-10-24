@@ -386,14 +386,14 @@ Regenerate with `scripts/bitchat-vectors/regenerate.sh` (`--only ios|android`,
 drops the generator into its test target, runs it there, normalizes the dump
 (`normalize.py`) and diffs it case by case against the committed file
 (`diff.py`), naming every case whose bytes moved, appeared or vanished. CI runs
-exactly this against both upstream HEADs weekly and on every PR that touches
+exactly this against both upstream HEADs daily and on every PR that touches
 the crate (`.github/workflows/bitchat-upstream-drift.yml`), so an upstream
 wire change shows up as a failing diff with the case names, not as a field
 report. When it fails: update the header revisions here and the pins in
 `scripts/check-bitchat-upstream-drift.sh`, and decide — a changed expected
 value is a wire change, not a test update. The generators cover the codecs
 listed in the header; a NEW upstream codec or TLV does not change the
-vectors, which is what the file-level drift check below is for. `scripts/check-bitchat-upstream-drift.sh` (weekly and on every PR that
+vectors, which is what the file-level drift check below is for. `scripts/check-bitchat-upstream-drift.sh` (daily and on every PR that
 touches the crate, `.github/workflows/bitchat-upstream-drift.yml`) compares
 upstream HEAD against the pinned revisions for exactly those files and fails
 on drift, so "compatible with upstream" is re-verified rather than assumed.

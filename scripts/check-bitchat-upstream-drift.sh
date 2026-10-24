@@ -15,7 +15,7 @@
 #   exit 1  drift (lists the changed files and the upstream commits)
 #   exit 2  could not reach an upstream repository
 #
-# Runs weekly and on every PR that touches the crate
+# Runs daily and on every PR that touches the crate
 # (.github/workflows/bitchat-upstream-drift.yml).
 set -euo pipefail
 

@@ -3,16 +3,24 @@ name: bitchat upstream drift
 # Sonar must stay byte-compatible with permissionlesstech/bitchat and
 # bitchat-android. core/bitchat-protocol pins both at the revisions its vectors
 # were generated from; this job turns a newer upstream codec into a visible
-# failure instead of a silent assumption. Weekly, plus on every PR that touches
-# the crate or this check.
+# failure instead of a silent assumption. Daily, on every push to main and on
+# every PR that touches the crate or this check.
 
 on:
   schedule:
-    - cron: "17 6 * * 1"
+    - cron: "17 6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "core/bitchat-protocol/**"
+      - "scripts/check-bitchat-upstream-drift.sh"
+      - "scripts/bitchat-vectors/**"
+      - ".github/workflows/bitchat-upstream-drift.yml"
   pull_request:
     paths:
       - "core/bitchat-protocol/**"
       - "scripts/check-bitchat-upstream-drift.sh"
+      - "scripts/bitchat-vectors/**"
       - ".github/workflows/bitchat-upstream-drift.yml"
   workflow_dispatch:
 
