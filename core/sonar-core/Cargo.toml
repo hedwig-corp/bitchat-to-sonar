@@ -48,6 +48,8 @@ base64 = "0.22"
 # be opened by SQLCipher, so it must be cleaned up even on an error path.
 tempfile.workspace = true
 sonar-stickers = { path = "../sonar-stickers" }
+# The bitchat BLE mesh wire protocol (packets, TLVs, Noise framing, signing).
+bitchat-protocol = { path = "../bitchat-protocol" }
 serde_json.workspace = true
 mdk-core.workspace = true
 mdk-storage-traits.workspace = true

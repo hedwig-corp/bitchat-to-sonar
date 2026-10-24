@@ -95,6 +95,51 @@ is the build under test on a dedicated QA emulator/simulator.
   reads "Nearby · Bluetooth".
 - **Origin:** A13/A14/A8 (#616)
 
+### QA-164 — A long signed mesh message crosses iOS ↔ Android
+- **Platforms:** iOS ↔ Android (one iPhone, one Android or emulator with a
+  BLE bridge), and Sonar Android ↔ a stock bitchat client.
+- **Steps:** with the two in Bluetooth range, send a public (channel) message
+  of 150+ repetitive characters from each side to the other; set a 40+
+  character nickname on one side and let it announce; on a Sonar peer with a
+  BIP-353 address set, watch the other side's Radar.
+- **Expect:** every message arrives; the long-nickname peer shows up in
+  Radar with its name; the BIP-353 peer upgrades to a Sonar badge (its `0x53`
+  verified). Nothing is logged as "unverified" or dropped.
+- **Guard:** `vectors.rs::bitchat_ios_vectors`, `vectors.rs::bitchat_android_vectors`,
+  `mesh_engine.rs::compressed_announce_from_a_reference_encoder_is_accepted`,
+  `signing.rs::compressed_payload_verifies_from_wire_bytes_not_a_recompression`
+- **Origin:** 2026-10-24 codec diff against upstream HEAD (R-058). Payloads
+  of 100+ low-entropy bytes travel DEFLATE-compressed and are signed in that
+  form; the Rust decoder dropped every compressed frame and the iOS verifier
+  rebuilt the signature preimage with its own compressor, so these shapes
+  failed in both directions while short DMs (Noise, high entropy) worked.
+
+### QA-165 — A long DM or a reply to a stock bitchat user arrives
+- **Platforms:** Sonar (either platform) → stock bitchat iOS or Android.
+- **Steps:** from Sonar, DM a stock bitchat peer with a 600-character text,
+  and reply to one of its messages with a short text.
+- **Expect:** the stock client shows the long text as three consecutive
+  messages and the reply as a plain message (no reply chrome). Between two
+  Sonars the same actions arrive as one message and a real reply.
+- **Guard:** `mesh_engine.rs::long_text_and_replies_to_a_stock_peer_use_only_legacy_tlvs`,
+  `mesh_engine.rs::sonar_peer_receives_extended_tlvs_in_one_message`
+- **Origin:** 2026-10-24 (R-058). Both stock decoders reject a private
+  message carrying any TLV they do not know, so Sonar's long-field and
+  reply TLVs made the whole message vanish; now they go only to a peer that
+  sent a verified Sonar `0x53`.
+
+### QA-166 — A dropped Bluetooth frame does not end the conversation
+- **Platforms:** Android ↔ iOS; Android ↔ Android.
+- **Steps:** with a Noise session up, walk one phone to the edge of range
+  while sending ten short DMs, then come back and send ten more.
+- **Expect:** the later messages all arrive without a new handshake; at most
+  the messages sent while out of range are missing.
+- **Guard:** `mesh_engine.rs::a_lost_frame_does_not_kill_the_noise_session`,
+  `noise.rs::lost_and_reordered_messages_inside_the_window_are_accepted`
+- **Origin:** 2026-10-24 (R-059). The Rust transport required the wire nonce
+  to equal its own counter, so one lost frame rejected every later message
+  until a re-handshake; the reference clients use a 1024-entry sliding window.
+
 ## Media
 
 ### QA-010 — Send a photo

@@ -24,11 +24,14 @@ final class SecureNoiseSession: NoiseSession {
             throw NoiseSecurityError.sessionExhausted
         }
         
-        // Validate message size
-        guard NoiseSecurityValidator.validateMessageSize(plaintext) else {
+        // Validate message size. A private file (Noise payload 0x20) is the one
+        // typed payload allowed past the Noise ceiling, up to the framed-file cap.
+        let isPrivateFile = NoisePayloadType.isPrivateFile(rawValue: plaintext.first)
+            && NoiseSecurityValidator.validatePrivateFileMessageSize(plaintext)
+        guard NoiseSecurityValidator.validateMessageSize(plaintext) || isPrivateFile else {
             throw NoiseSecurityError.messageTooLarge
         }
-        
+
         let encrypted = try super.encrypt(plaintext)
         messageCount += 1
         lastActivityTime = Date()
@@ -42,11 +45,15 @@ final class SecureNoiseSession: NoiseSession {
             throw NoiseSecurityError.sessionExpired
         }
         
-        // Validate message size
-        guard NoiseSecurityValidator.validateMessageSize(ciphertext) else {
+        // Validate message size. The type byte is inside the ciphertext, so a
+        // frame over the Noise ceiling is admitted up to the private-file
+        // budget here; `NoiseEncryptionService.decrypt` rejects it after
+        // decryption unless the plaintext really is a `.privateFile`.
+        guard NoiseSecurityValidator.validateCiphertextSize(ciphertext)
+                || NoiseSecurityValidator.validatePrivateFileCiphertextSize(ciphertext) else {
             throw NoiseSecurityError.messageTooLarge
         }
-        
+
         let decrypted = try super.decrypt(ciphertext)
         lastActivityTime = Date()
         

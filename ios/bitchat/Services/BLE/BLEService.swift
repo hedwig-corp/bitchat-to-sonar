@@ -87,6 +87,20 @@ final class BLEService: NSObject {
         var lastSeen: Date
     }
     private var peers: [PeerID: PeerInfo] = [:]
+    /// Peers whose Sonar discovery announce (0x53) verified under the signing
+    /// key pinned by their bitchat announce. Gates every Sonar wire extension a
+    /// stock bitchat client would reject (extended private-message TLVs, reply
+    /// parents) — mirror of `sonar_fps` in `mesh_engine.rs`. Same discipline
+    /// as `peers`: `collectionsQueue` only.
+    private var sonarVerifiedPeers: Set<PeerID> = []
+    /// Capabilities each peer PROVED inside its current Noise session (payload
+    /// 0x21). An announce only advertises; this is what the private-media send
+    /// path trusts. Reset when the session is replaced. `collectionsQueue` only.
+    private var provenPeerCapabilities: [PeerID: PeerCapabilities] = [:]
+    private static let maxProvenPeerCapabilities = 512
+    /// Peers we already proved our own state (0x21) to in their current
+    /// session — bitchat sends it once per completed handshake.
+    private var peerStateSentForSession: Set<PeerID> = []
     /// Consecutive Noise decrypt failures per peer, guarded by its own lock so
     /// the inbound decrypt path does not contend with `collectionsQueue`.
     private var decryptFailures = NoiseDecryptFailureTracker()
@@ -258,6 +272,14 @@ final class BLEService: NSObject {
         let spacingMs: Int?
         let repeatCount: Int
         let repeatGapMs: Int
+
+        /// A user-visible media send: a plaintext 0x22, or a private file
+        /// riding encrypted in a 0x11 (Noise payload 0x20). Both get a transfer
+        /// slot and progress; `sendEncrypted`'s MTU-driven fragmentation of
+        /// ordinary Noise frames carries no `transferId` and stays out of it.
+        var isMediaTransfer: Bool {
+            packet.type == MessageType.fileTransfer.rawValue || transferId != nil
+        }
     }
     private var pendingPeripheralWrites: [String: [PendingWrite]] = [:]
     private var pendingFragmentTransfers: [PendingFragmentTransfer] = []
@@ -565,6 +587,9 @@ final class BLEService: NSObject {
             pendingNotifications.removeAll()
             pendingDirectedRelays.removeAll()
             pendingSonarAnnounces.removeAll()
+            sonarVerifiedPeers.removeAll()
+            provenPeerCapabilities.removeAll()
+            peerStateSentForSession.removeAll()
             ingressByMessageID.removeAll()
             recentPacketTimestamps.removeAll()
             scheduledRelays.values.forEach { $0.cancel() }
@@ -758,6 +783,9 @@ final class BLEService: NSObject {
         collectionsQueue.sync(flags: .barrier) {
             pendingNotifications.removeAll()
             pendingSonarAnnounces.removeAll()
+            sonarVerifiedPeers.removeAll()
+            provenPeerCapabilities.removeAll()
+            peerStateSentForSession.removeAll()
         }
 
         // Stop timer
@@ -791,6 +819,9 @@ final class BLEService: NSObject {
             pendingNoisePayloadsAfterHandshake.removeAll()
             pendingDirectedRelays.removeAll()
             pendingSonarAnnounces.removeAll()
+            sonarVerifiedPeers.removeAll()
+            provenPeerCapabilities.removeAll()
+            peerStateSentForSession.removeAll()
             return entries
         }
 
@@ -1026,16 +1057,36 @@ final class BLEService: NSObject {
         }
         messageQueue.async { [weak self] in
             guard let self = self else { return }
-            guard let payload = filePacket.encode() else {
-                SecureLogger.error("❌ Failed to encode file packet for private send", category: .session)
-                return
-            }
             guard let targetID = self.routingPeerID(for: peerID) else {
                 SecureLogger.error("❌ No routing peer for private file transfer: \(peerID)", category: .session)
                 return
             }
+            // The 0x05 message-id TLV is a Sonar extension: bitchat-android
+            // builds that predate its #826 drop the whole file on an unknown
+            // tag, so it rides only to a peer that proved it is Sonar with a
+            // verified 0x53 (the same gate the Rust engine applies). A stock
+            // peer never returns a media receipt anyway.
+            var wirePacket = filePacket
+            if !self.isSonarPeer(targetID) {
+                wirePacket.messageID = nil
+            }
+            guard let payload = wirePacket.encode() else {
+                SecureLogger.error("❌ Failed to encode file packet for private send", category: .session)
+                return
+            }
             guard let recipientData = Data(hexString: targetID.id) else {
                 SecureLogger.error("❌ Invalid recipient peer ID for file transfer: \(peerID)", category: .session)
+                return
+            }
+
+            // The peer proved (inside its Noise session, payload 0x21) that it
+            // receives media as Noise payload 0x20: encrypt the whole file TLV
+            // and fragment the 0x11 frame. End-to-end confidential; relays see
+            // nothing. If the session refuses it, fall through to the legacy
+            // wire form — a signed, directed, plaintext 0x22 — which every
+            // bitchat client accepts from a peer with a verified signing key.
+            if self.provenCapabilities(for: targetID).contains(.privateMedia),
+               self.sendPrivateFileOverNoise(payload, to: targetID, recipientData: recipientData, transferId: transferId) {
                 return
             }
 
@@ -1060,7 +1111,41 @@ final class BLEService: NSObject {
         return true
     }
 
-    
+
+    /// Send an already-encoded `BitchatFilePacket` as Noise payload 0x20 to a
+    /// peer that proved `.privateMedia`. The whole file TLV is one Noise
+    /// message (the `.privateFile` budget, not the ordinary ceiling), carried in
+    /// a directed 0x11 frame through the SAME fragment scheduler, slot
+    /// accounting and progress as a 0x22 — keyed by `transferId`, so cancel and
+    /// completion keep working. Returns false when the session refuses the
+    /// payload so the caller can fall back to the signed plaintext form.
+    private func sendPrivateFileOverNoise(_ filePayload: Data, to peerID: PeerID, recipientData: Data, transferId: String) -> Bool {
+        guard noiseService.hasEstablishedSession(with: peerID) else { return false }
+        var plaintext = Data(capacity: 1 + filePayload.count)
+        plaintext.append(NoisePayloadType.privateFile.rawValue)
+        plaintext.append(filePayload)
+        do {
+            let encrypted = try noiseService.encryptPrivateFilePayload(plaintext, for: peerID)
+            let packet = BitchatPacket(
+                type: MessageType.noiseEncrypted.rawValue,
+                senderID: myPeerIDData,
+                recipientID: recipientData,
+                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                payload: encrypted,
+                signature: nil,
+                ttl: messageTTL,
+                // v1's payload length field is u16; a file over it needs v2.
+                version: encrypted.count > Int(UInt16.max) ? 2 : 1
+            )
+            SecureLogger.debug("📁 Sending private file inside Noise session to \(peerID.id.prefix(8))… bytes=\(filePayload.count)", category: .session)
+            sendFragmentedPacket(packet, pad: false, maxChunk: nil, directedOnlyPeer: peerID, transferId: transferId)
+            return true
+        } catch {
+            SecureLogger.warning("⚠️ Noise private file send to \(peerID.id.prefix(8))… failed (\(error)); falling back to signed 0x22", category: .session)
+            return false
+        }
+    }
+
     func sendReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {
         // Create typed payload: [type byte] + [message ID]
         var payload = Data([NoisePayloadType.readReceipt.rawValue])
@@ -1541,6 +1626,55 @@ final class BLEService: NSObject {
             return
         }
 
+        let isPrivateMessage = PeerID(hexData: packet.recipientID) == myPeerID
+        ingestFilePacket(
+            filePacket,
+            from: peerID,
+            senderNickname: senderNickname,
+            isPrivateMessage: isPrivateMessage,
+            timestampMs: packet.timestamp
+        )
+    }
+
+    /// Noise payload 0x20: a `BitchatFilePacket` that arrived encrypted inside
+    /// the sender's session. The session already authenticated the sender (its
+    /// static key is the identity), so there is no packet-signature gate; the
+    /// decoded file takes exactly the path a verified directed 0x22 takes.
+    private func handlePrivateFile(_ body: Data, from peerID: PeerID, timestampMs: UInt64) {
+        guard let filePacket = BitchatFilePacket.decode(body) else {
+            SecureLogger.error("❌ Failed to decode private file payload", category: .session)
+            #if DEBUG
+            appendBleDebugReport("file rejected peer=\(peerID.id) reason=private-file-decode bytes=\(body.count)")
+            #endif
+            return
+        }
+        let peersSnapshot = collectionsQueue.sync { peers }
+        let senderNickname: String
+        if let info = peersSnapshot[peerID] {
+            let hasCollision = peersSnapshot.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.peerID != peerID } || (myNickname == info.nickname)
+            senderNickname = hasCollision ? info.nickname + "#" + String(peerID.id.prefix(4)) : info.nickname
+        } else {
+            senderNickname = "anon" + String(peerID.id.prefix(4))
+        }
+        ingestFilePacket(
+            filePacket,
+            from: peerID,
+            senderNickname: senderNickname,
+            isPrivateMessage: true,
+            timestampMs: timestampMs
+        )
+    }
+
+    /// Everything after a file's sender has been authenticated — by a packet
+    /// signature (0x22) or by the Noise session (0x20): size/MIME/magic gates,
+    /// retry dedup, quota, disk write, transcript row and the delivery receipt.
+    private func ingestFilePacket(
+        _ filePacket: BitchatFilePacket,
+        from peerID: PeerID,
+        senderNickname: String,
+        isPrivateMessage: Bool,
+        timestampMs: UInt64
+    ) {
         guard FileTransferLimits.isValidPayload(filePacket.content.count) else {
             SecureLogger.warning("🚫 Dropping file transfer exceeding size cap (\(filePacket.content.count) bytes)", category: .security)
             return
@@ -1557,8 +1691,6 @@ final class BLEService: NSObject {
             SecureLogger.warning("🚫 MAGIC REJECT: MIME='\(mime)' size=\(filePacket.content.count)b prefix=[\(prefix)] from \(peerID.id.prefix(8))...", category: .security)
             return
         }
-
-        let isPrivateMessage = PeerID(hexData: packet.recipientID) == myPeerID
 
         // A re-send after a lost receipt must return a fresh ack, not a second
         // row — and this has to run BEFORE the quota sweep and the file write.
@@ -1615,7 +1747,7 @@ final class BLEService: NSObject {
             updatePeerLastSeen(peerID)
         }
 
-        let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
+        let ts = Date(timeIntervalSince1970: Double(timestampMs) / 1000)
         // The sender-supplied messageID is receipt-only: it is echoed back in the
         // delivery receipt, but is deliberately NOT used as this local row's id,
         // because a peer could otherwise pick an id that collides with one of my
@@ -1778,6 +1910,9 @@ final class BLEService: NSObject {
         _ = collectionsQueue.sync(flags: .barrier) {
             // Remove the peer when they leave
             peers.removeValue(forKey: peerID)
+            sonarVerifiedPeers.remove(peerID)
+            provenPeerCapabilities.removeValue(forKey: peerID)
+            peerStateSentForSession.remove(peerID)
         }
         // Remove any stored announcement for sync purposes
         gossipSyncManager?.removeAnnouncementForPeer(peerID)
@@ -2000,7 +2135,10 @@ final class BLEService: NSObject {
             nickname: myNickname,
             noisePublicKey: noisePub,
             signingPublicKey: signingPub,
-            directNeighbors: connectedPeerIDs
+            directNeighbors: connectedPeerIDs,
+            // Advertised only (TLV 0x05); peers act on the set we PROVE inside
+            // the Noise session (0x21). Stock clients skip the unknown TLV.
+            capabilities: .sonarLocal
         )
         
         guard let payload = announcement.encode() else {
@@ -3482,7 +3620,14 @@ extension BLEService {
             // to one — rehandshake, peer restart, reconnect after a leave — so
             // no earlier session's partial failure run can be spent against it.
             self?.clearDecryptFailures(for: peerID)
+            // A fresh session also resets what the peer PROVED in the previous
+            // one, and lets us prove ours again: bitchat emits the authenticated
+            // peer state (0x21) after every completed handshake. The clear is a
+            // barrier enqueued now, so it lands before any 0x21 this session
+            // can decrypt (FIFO on collectionsQueue).
+            self?.forgetProvenSessionState(for: peerID)
             self?.messageQueue.async { [weak self] in
+                self?.sendAuthenticatedPeerState(to: peerID)
                 self?.sendPendingMessagesAfterHandshake(for: peerID)
                 self?.sendPendingNoisePayloadsAfterHandshake(for: peerID)
             }
@@ -3757,26 +3902,52 @@ extension BLEService {
     
     // MARK: Private Message Handling
     
+    /// The Noise plaintexts (`[0x01][PrivateMessagePacket TLV]`) for one private
+    /// text, shaped for the recipient. A peer that sent a verified Sonar 0x53
+    /// gets the extended TLVs (reply parent, long fields) in one message; any
+    /// other peer is assumed to run stock bitchat, whose decoders REJECT unknown
+    /// TLVs and one-byte lengths over 255 — so the reply parent is dropped and
+    /// long text goes out as `id`, `id#2`, `id#3`, ... legacy pieces. The first
+    /// keeps the caller's id so its delivery ack still maps onto the bubble.
+    /// Mirror of `mesh_engine::try_send_text`.
+    private func privateMessagePlaintexts(
+        content: String,
+        messageID: String,
+        replyTo: String?,
+        to peerID: PeerID
+    ) -> [(messageID: String, plaintext: Data)]? {
+        let peerIsSonar = isSonarPeer(peerID)
+        guard let frames = PrivateMessagePacket.wireFrames(
+            messageID: messageID,
+            content: content,
+            replyTo: replyTo,
+            peerIsSonar: peerIsSonar
+        ) else { return nil }
+        if frames.count > 1 {
+            SecureLogger.debug("📨 Legacy peer \(peerID.id.prefix(8))…: splitting PM \(messageID.prefix(8))… into \(frames.count) pieces", category: .session)
+        } else if !peerIsSonar, let replyTo, !replyTo.isEmpty {
+            SecureLogger.debug("📨 Legacy peer \(peerID.id.prefix(8))…: dropping reply parent from PM \(messageID.prefix(8))…", category: .session)
+        }
+        return frames.map { frame in
+            var plaintext = Data([NoisePayloadType.privateMessage.rawValue])
+            plaintext.append(frame.tlv)
+            return (frame.messageID, plaintext)
+        }
+    }
+
     private func sendPrivateMessage(_ content: String, to recipientID: PeerID, messageID: String, replyTo: String? = nil) {
         SecureLogger.debug("📨 Sending PM to \(recipientID): \(content.prefix(30))...", category: .session)
-        
+
         // Check if we have an established Noise session
         if noiseService.hasEstablishedSession(with: recipientID) {
             // Encrypt and send
             do {
-                // Create TLV-encoded private message
-                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content, replyTo: replyTo)
-                guard let tlvData = privateMessage.encode() else {
+                // Create TLV-encoded private message(s), shaped for the recipient
+                guard let plaintexts = privateMessagePlaintexts(content: content, messageID: messageID, replyTo: replyTo, to: recipientID) else {
                     SecureLogger.error("Failed to encode private message with TLV")
                     return
                 }
-                
-                // Create message payload with TLV: [type byte] + [TLV data]
-                var messagePayload = Data([NoisePayloadType.privateMessage.rawValue])
-                messagePayload.append(tlvData)
-                
-                let encrypted = try noiseService.encrypt(messagePayload, for: recipientID)
-                
+
                 // Convert recipientID to Data (assuming it's a hex string)
                 var recipientData = Data()
                 var tempID = recipientID.id
@@ -3793,18 +3964,20 @@ extension BLEService {
                     }
                 }
 
-                let packet = BitchatPacket(
-                    type: MessageType.noiseEncrypted.rawValue,
-                    senderID: myPeerIDData,
-                    recipientID: recipientData,
-                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
-                    payload: encrypted,
-                    signature: nil,
-                    ttl: messageTTL
-                )
-                
-                broadcastPacket(packet)
-                
+                for (_, plaintext) in plaintexts {
+                    let encrypted = try noiseService.encrypt(plaintext, for: recipientID)
+                    let packet = BitchatPacket(
+                        type: MessageType.noiseEncrypted.rawValue,
+                        senderID: myPeerIDData,
+                        recipientID: recipientData,
+                        timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                        payload: encrypted,
+                        signature: nil,
+                        ttl: messageTTL
+                    )
+                    broadcastPacket(packet)
+                }
+
                 // Notify delegate that message was sent
                 notifyUI { [weak self] in
                     self?.delegate?.didUpdateMessageDeliveryStatus(messageID, status: .sent)
@@ -3836,48 +4009,48 @@ extension BLEService {
     private func sendPrivateMessageNowOnQueue(_ content: String, to recipientID: PeerID, messageID: String) {
         guard noiseService.hasEstablishedSession(with: recipientID) else { return }
         do {
-            let privateMessage = PrivateMessagePacket(messageID: messageID, content: content)
-            guard let tlvData = privateMessage.encode() else {
+            // Call control only ever targets a Sonar peer, so this is one
+            // extended frame in practice; the shaping is shared regardless.
+            guard let plaintexts = privateMessagePlaintexts(content: content, messageID: messageID, replyTo: nil, to: recipientID) else {
                 SecureLogger.error("Failed to encode immediate private message with TLV")
                 return
             }
 
-            var messagePayload = Data([NoisePayloadType.privateMessage.rawValue])
-            messagePayload.append(tlvData)
+            for (_, plaintext) in plaintexts {
+                let encrypted = try noiseService.encrypt(plaintext, for: recipientID)
+                let packet = BitchatPacket(
+                    type: MessageType.noiseEncrypted.rawValue,
+                    senderID: myPeerIDData,
+                    recipientID: Data(hexString: recipientID.id),
+                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                    payload: encrypted,
+                    signature: nil,
+                    ttl: messageTTL
+                )
 
-            let encrypted = try noiseService.encrypt(messagePayload, for: recipientID)
-            let packet = BitchatPacket(
-                type: MessageType.noiseEncrypted.rawValue,
-                senderID: myPeerIDData,
-                recipientID: Data(hexString: recipientID.id),
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
-                payload: encrypted,
-                signature: nil,
-                ttl: messageTTL
-            )
-
-            let pad = padPolicy(for: packet.type)
-            guard let data = packet.toBinaryData(padding: pad) else { return }
-            if data.count > TransportConfig.bleCallControlFragmentSize {
-                SecureLogger.debug(
-                    "SonarCall: immediate BLE control fragmenting target=\(recipientID.id) bytes=\(data.count)",
-                    category: .session
-                )
-                sendFragmentedPacket(
-                    packet,
-                    pad: pad,
-                    maxChunk: TransportConfig.bleCallControlFragmentSize,
-                    directedOnlyPeer: recipientID,
-                    spacingMs: TransportConfig.bleCallControlFragmentSpacingMs,
-                    repeatCount: TransportConfig.bleCallControlFragmentRepeatCount,
-                    repeatGapMs: TransportConfig.bleCallControlFragmentRoundSpacingMs
-                )
-            } else {
-                SecureLogger.debug(
-                    "SonarCall: immediate BLE control sending target=\(recipientID.id) bytes=\(data.count)",
-                    category: .session
-                )
-                sendOnAllLinks(packet: packet, data: data, pad: pad, directedOnlyPeer: recipientID)
+                let pad = padPolicy(for: packet.type)
+                guard let data = packet.toBinaryData(padding: pad) else { return }
+                if data.count > TransportConfig.bleCallControlFragmentSize {
+                    SecureLogger.debug(
+                        "SonarCall: immediate BLE control fragmenting target=\(recipientID.id) bytes=\(data.count)",
+                        category: .session
+                    )
+                    sendFragmentedPacket(
+                        packet,
+                        pad: pad,
+                        maxChunk: TransportConfig.bleCallControlFragmentSize,
+                        directedOnlyPeer: recipientID,
+                        spacingMs: TransportConfig.bleCallControlFragmentSpacingMs,
+                        repeatCount: TransportConfig.bleCallControlFragmentRepeatCount,
+                        repeatGapMs: TransportConfig.bleCallControlFragmentRoundSpacingMs
+                    )
+                } else {
+                    SecureLogger.debug(
+                        "SonarCall: immediate BLE control sending target=\(recipientID.id) bytes=\(data.count)",
+                        category: .session
+                    )
+                    sendOnAllLinks(packet: packet, data: data, pad: pad, directedOnlyPeer: recipientID)
+                }
             }
         } catch {
             SecureLogger.error("Failed to encrypt immediate private message: \(error)")
@@ -3925,31 +4098,29 @@ extension BLEService {
         // Send each pending message directly (we know session is established)
         for (content, messageID, replyTo) in messages {
             do {
-                // Use the same TLV format as normal sends to keep receiver decoding consistent
-                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content, replyTo: replyTo)
-                guard let tlvData = privateMessage.encode() else {
+                // Use the same TLV shaping as normal sends to keep receiver decoding consistent
+                guard let plaintexts = privateMessagePlaintexts(content: content, messageID: messageID, replyTo: replyTo, to: peerID) else {
                     SecureLogger.error("Failed to encode pending private message TLV")
                     failedMessages.append((content, messageID, replyTo))
                     continue
                 }
 
-                var messagePayload = Data([NoisePayloadType.privateMessage.rawValue])
-                messagePayload.append(tlvData)
+                for (_, plaintext) in plaintexts {
+                    let encrypted = try noiseService.encrypt(plaintext, for: peerID)
 
-                let encrypted = try noiseService.encrypt(messagePayload, for: peerID)
+                    let packet = BitchatPacket(
+                        type: MessageType.noiseEncrypted.rawValue,
+                        senderID: myPeerIDData,
+                        recipientID: Data(hexString: peerID.id),
+                        timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                        payload: encrypted,
+                        signature: nil,
+                        ttl: messageTTL
+                    )
 
-                let packet = BitchatPacket(
-                    type: MessageType.noiseEncrypted.rawValue,
-                    senderID: myPeerIDData,
-                    recipientID: Data(hexString: peerID.id),
-                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
-                    payload: encrypted,
-                    signature: nil,
-                    ttl: messageTTL
-                )
-
-                // We're already on messageQueue from the callback
-                broadcastPacket(packet)
+                    // We're already on messageQueue from the callback
+                    broadcastPacket(packet)
+                }
 
                 // Notify delegate that message was sent
                 notifyUI { [weak self] in
@@ -4004,7 +4175,7 @@ extension BLEService {
             repeatCount: max(1, repeatCount),
             repeatGapMs: max(0, repeatGapMs)
         )
-        if packet.type == MessageType.fileTransfer.rawValue {
+        if context.isMediaTransfer {
             let shouldQueue = collectionsQueue.sync {
                 self.activeTransfers.count >= TransportConfig.bleMaxConcurrentTransfers
             }
@@ -4034,7 +4205,7 @@ extension BLEService {
 
     private func startFragmentedPacket(_ context: PendingFragmentTransfer) {
         let packet = context.packet
-        let isFileTransfer = packet.type == MessageType.fileTransfer.rawValue
+        let isFileTransfer = context.isMediaTransfer
         var reservedTransferId: String?
 
         let releaseReservedSlot: (String) -> Void = { id in
@@ -4311,8 +4482,12 @@ extension BLEService {
             // Check cumulative size before storing this fragment
             let currentSize = incomingFragments[key]?.values.reduce(0) { $0 + $1.count } ?? 0
             let assemblyLimit: Int = {
-                if originalType == MessageType.fileTransfer.rawValue {
+                if originalType == MessageType.fileTransfer.rawValue
+                    || originalType == MessageType.noiseEncrypted.rawValue {
                     // Allow headroom for TLV metadata and binary framing overhead.
+                    // A 0x11 can carry a private file (Noise payload 0x20) of the
+                    // same size, encrypted; `NoiseEncryptionService.decrypt`
+                    // re-checks the budget against the payload type.
                     return FileTransferLimits.maxFramedFileBytes
                 }
                 return FileTransferLimits.maxPayloadBytes
@@ -4820,6 +4995,12 @@ extension BLEService {
             return
         }
 
+        // A verified 0x53 is the proof that this peer decodes Sonar's private
+        // message extensions; everything else on the mesh is assumed stock.
+        collectionsQueue.sync(flags: .barrier) {
+            sonarVerifiedPeers.insert(peerID)
+        }
+
         NotificationCenter.default.post(
             name: .sonarPeerProfileUpdated,
             object: nil,
@@ -4828,6 +5009,96 @@ extension BLEService {
                 SonarDiscoveryUserInfoKey.profile: announce
             ]
         )
+    }
+
+    /// Did this peer send a verified Sonar discovery announce (0x53)?
+    private func isSonarPeer(_ peerID: PeerID) -> Bool {
+        collectionsQueue.sync { sonarVerifiedPeers.contains(peerID) }
+    }
+
+    /// Capabilities this peer proved inside its current Noise session (0x21);
+    /// empty until it does.
+    private func provenCapabilities(for peerID: PeerID) -> PeerCapabilities {
+        collectionsQueue.sync { provenPeerCapabilities[peerID] ?? [] }
+    }
+
+    /// A Noise session is gone (torn down, replaced, or the peer left): what it
+    /// proved goes with it, and the next session gets our proof again.
+    private func forgetProvenSessionState(for peerID: PeerID) {
+        collectionsQueue.async(flags: .barrier) { [weak self] in
+            self?.provenPeerCapabilities.removeValue(forKey: peerID)
+            self?.peerStateSentForSession.remove(peerID)
+        }
+    }
+
+    /// Noise payload 0x21 from a peer: record what it proved inside this
+    /// session and prove ours back once, so message-3 / proof reordering across
+    /// links converges with both sides holding the other's state (mirror of the
+    /// `AUTHENTICATED_PEER_STATE` arm in `mesh_engine.rs`).
+    private func handleAuthenticatedPeerState(_ body: Data, from peerID: PeerID) {
+        guard let state = AuthenticatedPeerStatePacket.decode(from: body) else {
+            SecureLogger.warning("⚠️ Ignoring malformed peer state from \(peerID.id.prefix(8))…", category: .security)
+            return
+        }
+        if let pinned = collectionsQueue.sync(execute: { peers[peerID]?.signingPublicKey }),
+           pinned != state.signingPublicKey {
+            // The announce pin and the session-proven key disagree. The SESSION
+            // authenticates the capabilities (same as the Rust engine), and the
+            // only effect of recording them is sending media encrypted inside it
+            // instead of as signed plaintext, so keep them — but make it visible.
+            SecureLogger.warning("⚠️ Peer state signing key differs from the announce pin for \(peerID.id.prefix(8))…", category: .security)
+        }
+        collectionsQueue.sync(flags: .barrier) {
+            if provenPeerCapabilities.count >= Self.maxProvenPeerCapabilities {
+                provenPeerCapabilities.removeAll()
+            }
+            provenPeerCapabilities[peerID] = state.capabilities
+        }
+        SecureLogger.debug("🔐 Peer \(peerID.id.prefix(8))… proved capabilities 0x\(String(state.capabilities.rawValue, radix: 16))", category: .session)
+        sendAuthenticatedPeerState(to: peerID)
+    }
+
+    /// Prove our capabilities to `peerID` inside the Noise session: payload
+    /// 0x21 carrying `PeerCapabilities.sonarLocal` and the Ed25519 key our
+    /// announces are signed with. At most once per session; a failed send
+    /// releases the once-guard so the echo path can retry.
+    private func sendAuthenticatedPeerState(to peerID: PeerID) {
+        guard noiseService.hasEstablishedSession(with: peerID) else { return }
+        let alreadySent = collectionsQueue.sync(flags: .barrier) { () -> Bool in
+            if peerStateSentForSession.contains(peerID) { return true }
+            peerStateSentForSession.insert(peerID)
+            return false
+        }
+        if alreadySent { return }
+        let state = AuthenticatedPeerStatePacket(
+            capabilities: .sonarLocal,
+            signingPublicKey: noiseService.getSigningPublicKeyData()
+        )
+        guard let body = state.encode() else {
+            SecureLogger.error("❌ Failed to encode authenticated peer state", category: .session)
+            return
+        }
+        var plaintext = Data([NoisePayloadType.authenticatedPeerState.rawValue])
+        plaintext.append(body)
+        do {
+            let encrypted = try noiseService.encrypt(plaintext, for: peerID)
+            let packet = BitchatPacket(
+                type: MessageType.noiseEncrypted.rawValue,
+                senderID: myPeerIDData,
+                recipientID: Data(hexString: peerID.id),
+                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                payload: encrypted,
+                signature: nil,
+                ttl: messageTTL
+            )
+            broadcastPacket(packet)
+            SecureLogger.debug("🔐 Sent authenticated peer state to \(peerID.id.prefix(8))…", category: .session)
+        } catch {
+            SecureLogger.error("❌ Failed to send authenticated peer state to \(peerID): \(error)")
+            collectionsQueue.async(flags: .barrier) { [weak self] in
+                self?.peerStateSentForSession.remove(peerID)
+            }
+        }
     }
 
     private func queuePendingSonarAnnounce(_ packet: BitchatPacket, from peerID: PeerID) {
@@ -5034,7 +5305,8 @@ extension BLEService {
             let payloadType = decrypted[0]
             let payloadData = decrypted.dropFirst()
             
-            switch NoisePayloadType(rawValue: payloadType) {
+            // `decoded` folds the prerelease 0x09 alias into `.privateFile`.
+            switch NoisePayloadType.decoded(rawValue: payloadType) {
             case .privateMessage:
                 let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
                 notifyUI { [weak self] in
@@ -5060,6 +5332,15 @@ extension BLEService {
                 notifyUI { [weak self] in
                     self?.delegate?.didReceiveNoisePayload(from: peerID, type: .verifyResponse, payload: Data(payloadData), timestamp: ts)
                 }
+            case .privateFile:
+                // A complete BitchatFilePacket encrypted inside the session —
+                // how current bitchat-android and Sonar Android send media to a
+                // peer that proved `.privateMedia`. The session authenticates
+                // the sender, so no packet signature applies; from here it is
+                // the same file as a verified directed 0x22.
+                handlePrivateFile(Data(payloadData), from: peerID, timestampMs: packet.timestamp)
+            case .authenticatedPeerState:
+                handleAuthenticatedPeerState(Data(payloadData), from: peerID)
             case .none:
                 SecureLogger.warning("⚠️ Unknown noise payload type: \(payloadType)")
             }
@@ -5110,6 +5391,7 @@ extension BLEService {
             }
             SecureLogger.error("❌ \(TransportConfig.noiseDecryptFailuresBeforeSessionReset) consecutive decrypt failures from \(peerID) - clearing session and re-initiating handshake")
             noiseService.clearSession(for: peerID)
+            forgetProvenSessionState(for: peerID)
             initiateNoiseHandshake(with: peerID)
         }
     }

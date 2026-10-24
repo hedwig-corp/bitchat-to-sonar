@@ -1,0 +1,33 @@
+[package]
+name = "bitchat-protocol"
+description = "The bitchat BLE mesh wire protocol: packet framing, TLVs, Noise transport framing, signing — byte-compatible with permissionlesstech/bitchat and bitchat-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "bitchat_protocol"
+
+[dependencies]
+# Raw DEFLATE for the `isCompressed` payload path. Pure-Rust backend so the
+# crate cross-compiles to iOS/Android with no C toolchain in the loop.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha2 = "0.10"
+# Ed25519 packet signatures (RFC 8032; interoperates with CryptoKit and
+# the JVM implementation upstream Android uses).
+ed25519-dalek = "2"
+# Noise_XX_25519_ChaChaPoly_SHA256 handshake. The transport phase is NOT
+# snow's: bitchat frames every message as `[u32 BE nonce][ct||tag]` and uses a
+# sliding replay window, so the crate derives the split keys from snow
+# (`risky-raw-split`) and runs its own ChaCha20-Poly1305 cipher states.
+snow = { version = "0.9", features = ["risky-raw-split"] }
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+hex.workspace = true
+base64 = "0.22"
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

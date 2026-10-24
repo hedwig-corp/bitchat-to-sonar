@@ -248,6 +248,39 @@ used correctly once generated, stay review questions. The rule exists because
 this class of bug is silent by construction — see the script header for the
 COLDCARD firmware disclosure that motivated it.
 
+## bitchat Wire Protocol Rule
+
+The bitchat BLE mesh wire format (packets, TLVs, Noise transport framing,
+signatures, peer ids) is owned by one crate, `core/bitchat-protocol`, with its
+spec in [`core/bitchat-protocol/SPEC.md`](core/bitchat-protocol/SPEC.md) and
+byte-exact vectors generated from the reference clients
+(permissionlesstech/bitchat and bitchat-android) in `core/bitchat-protocol/vectors/`.
+Sonar must stay interoperable with both reference clients at all times.
+
+1. Never add or change a wire format in `sonar-core`, `sonar-ffi`, the Compose
+   app or the Swift copy (`ios/bitchat/Protocols`, `ios/bitchat/Noise`)
+   directly. Change the crate, pin it with a vector (regenerate from upstream
+   when the reference emits that shape, hand-derive otherwise), update
+   `SPEC.md`, then mirror it on iOS until iOS consumes the crate.
+2. Before extending anything a stock client decodes, read BOTH upstream
+   decoders and state in `SPEC.md` what each does with the extension
+   (skipped / rejected / dropped). An extension a stock client rejects
+   (private-message TLVs, the file `0x05` tag) is gated on a verified Sonar
+   `0x53` announce — see `Engine::peer_is_sonar`.
+3. Sign what you send, verify what you received: signature preimages come
+   from `Packet::wire_payload`, never from re-compressing a payload.
+4. The vectors are re-derived from upstream, not maintained by hand:
+   `scripts/bitchat-vectors/regenerate.sh` runs the generators inside both
+   upstream repositories (HEAD by default) and diffs case by case against
+   the committed files; `scripts/check-bitchat-upstream-drift.sh` flags any
+   change to the upstream codec files the generators do not yet cover. CI
+   runs both weekly and on every PR touching the crate
+   (`.github/workflows/bitchat-upstream-drift.yml`). A changed expected
+   value is a wire change that needs a decision in `SPEC.md`, not a test
+   edit; a new upstream codec needs a generator extension plus a Rust
+   harness arm. Drop-in replay tests for the upstream repositories live in
+   `core/bitchat-protocol/upstream/`.
+
 ## Regression Invariant Rule
 
 Some bugs in this repo have been fixed more than once. [`docs/REGRESSIONS.md`](docs/REGRESSIONS.md)
