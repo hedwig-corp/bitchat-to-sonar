@@ -1,5 +1,6 @@
 package chat.bitchat.sonar.push
 
+import chat.bitchat.sonar.activeAccountPubkeyHexForNotification
 import chat.bitchat.sonar.MUTE_BLOB_KEY
 import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
@@ -79,7 +80,13 @@ internal object SonarWakeNotifications {
         profileFetchBudgetMs: Long = PROFILE_FETCH_BUDGET_MS,
         tryClaimPost: () -> Boolean = { true },
     ): Int {
+        // These banners belong to the account whose store is drained here.
+        // Name it explicitly (the Notifier fallback would read the active
+        // account at POST time), and drop the batch if a switch lands while
+        // the drain runs: the summaries could then be the other account's.
+        val account = activeAccountPubkeyHexForNotification()
         val summaries = SonarCore.conversationSummaries()
+        if (activeAccountPubkeyHexForNotification() != account) return 0
         val unread = summaries.filter { it.unreadCount > 0 }
         if (unread.isEmpty()) return 0
 
@@ -133,6 +140,7 @@ internal object SonarWakeNotifications {
             // The inline fallback can stop awaiting us while a blocking UniFFI
             // call is still running. Its gate is the final authority: never
             // post a titled banner after that caller has degraded to generic.
+            if (activeAccountPubkeyHexForNotification() != account) return notified
             if (notif != null && tryClaimPost()) {
                 Notifier.notify(
                     id = notif.id,
@@ -145,6 +153,7 @@ internal object SonarWakeNotifications {
                         SonarNotificationSound.Default
                     },
                     conversationId = summary.groupIdHex,
+                    accountPubkeyHex = account,
                 )
                 notified++
             }

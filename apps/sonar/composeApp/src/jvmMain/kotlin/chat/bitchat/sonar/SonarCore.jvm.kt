@@ -1485,6 +1485,9 @@ actual object SonarCore {
         DesktopEnv.putString("blob.$key", value)
     }
 
+    // DesktopEnv persists every write synchronously (atomic rename).
+    actual fun flushBlobs() = Unit
+
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             stickerOperationLock.write {

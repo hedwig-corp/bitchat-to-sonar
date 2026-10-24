@@ -1336,6 +1336,12 @@ expect object SonarCore {
     /** Generic persisted key/value blobs (⚡PAY ledger, BIP-353 address, …). */
     fun loadBlob(key: String): String
     fun saveBlob(key: String, value: String)
+    /** Make every blob/pref write so far durable before returning. Android
+     *  `apply()` writes asynchronously in-process; an account switch calls
+     *  this before the core commits the new active account, so a crash can
+     *  never leave the new account active over the previous account's live
+     *  values. Desktop writes are already synchronous. */
+    fun flushBlobs()
 
     /** Wipe all on-device data (identity, chats, prefs). */
     suspend fun wipe()

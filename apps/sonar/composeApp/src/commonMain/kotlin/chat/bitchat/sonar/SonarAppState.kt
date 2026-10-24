@@ -4990,9 +4990,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         ),
     )
 
-    /** Set [pubkeyHex]'s per-account values aside, BEFORE the teardown resets them. */
+    /** Set [pubkeyHex]'s per-account values aside, BEFORE the teardown resets
+     *  them. A record still pending for it (an earlier restore that failed
+     *  part-way) is replayed first, so parking never overwrites the account's
+     *  real values with the partial ones that failure left live. */
     private fun parkAccountLocalState(pubkeyHex: String) {
+        AccountLocalStateParking.unpark(
+            pubkeyHex,
+            parkedLocalValues(),
+            load = { SonarCore.loadBlob(it) },
+            save = { k, v -> SonarCore.saveBlob(k, v) },
+        )
         AccountLocalStateParking.park(pubkeyHex, parkedLocalValues()) { k, v -> SonarCore.saveBlob(k, v) }
+    }
+
+    /** After the core committed the switch: restore the incoming account's
+     *  values without letting a storage error abort the rest of the switch.
+     *  A failure leaves its record in place; the next boot or park replays it. */
+    private fun restoreIncomingAccountLocalState(pubkeyHex: String) {
+        runCatching { unparkAccountLocalState(pubkeyHex) }
+            .onFailure { sonarLog("Accounts", "restoring parked values failed (replayed on next boot): ${it.message}") }
     }
 
     /** Bring [pubkeyHex]'s values back (if it has a record) and reload the
@@ -5013,11 +5030,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         backupOverCellular = SonarCore.loadBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF) == "1"
         PaymentActivityStore.reload()
     }
-
-    /** Set by a switch or add: the next boot re-seeds verification marks once
-     *  the incoming account's chats are loaded (the first seed runs before
-     *  them, against an empty list). */
-    private var reseedVerifiedAfterChatsLoad = false
 
     /** Re-read the registry. Cheap: the core actual caches until a write. */
     fun refreshAccounts() {
@@ -5054,6 +5066,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     leaving?.let(::unparkAccountLocalState)
                     throw error
                 }
+                // The record and the reset values reach disk before the core
+                // makes the new account durable.
+                SonarCore.flushBlobs()
                 val newNpub = try {
                     SonarCore.switchAccount(pubkeyHex)
                 } catch (error: Throwable) {
@@ -5066,8 +5081,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         error,
                     )
                 }
-                unparkAccountLocalState(pubkeyHex)
-                reseedVerifiedAfterChatsLoad = true
+                restoreIncomingAccountLocalState(pubkeyHex)
                 finishAccountChange(newNpub)
             }
             endAccountChange(acquired)
@@ -5117,6 +5131,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     leaving?.let(::unparkAccountLocalState)
                     throw error
                 }
+                SonarCore.flushBlobs()
                 val newNpub = try {
                     SonarCore.addAccount(key, label?.trim()?.takeIf { it.isNotEmpty() })
                 } catch (error: Throwable) {
@@ -5128,10 +5143,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                         error,
                     )
                 }
-                // A new account has no record (its values stay reset); the key
-                // of an account already on this phone (R-023) gets its own back.
-                SonarCore.accounts().active?.pubkeyHex?.let(::unparkAccountLocalState)
-                reseedVerifiedAfterChatsLoad = true
+                // The key of an account already on this phone (R-023) gets its
+                // own values back. A genuinely new account starts reset: a
+                // record left by an earlier removal of the same key (a crash
+                // before its discard) must not replay values the user removed.
+                SonarCore.accounts().active?.pubkeyHex?.let { added ->
+                    if (alreadyRegistered) {
+                        restoreIncomingAccountLocalState(added)
+                    } else {
+                        AccountLocalStateParking.discard(added) { k, v -> SonarCore.saveBlob(k, v) }
+                        reloadParkedLocalValues()
+                    }
+                }
                 finishAccountChange(newNpub)
                 when (SonarCore.lastImportBackupOutcome()) {
                     AccountBackupRestoreOutcome.Restored ->
@@ -7218,10 +7241,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                 localCoreReady = true
                 refreshChats()
-                if (reseedVerifiedAfterChatsLoad) {
-                    reseedVerifiedAfterChatsLoad = false
-                    seedVerifiedChatIds()
-                }
+                // The first seed ran against the chat snapshot. After a switch
+                // (or a crash mid-switch, or a failed switch) that snapshot
+                // was cleared, so seed again now the chats are loaded. Skipped
+                // whenever the snapshot already produced marks.
+                if (verifiedChatIds.isEmpty()) seedVerifiedChatIds()
                 recomputeConversations()
                 homeMessagesHydrated = true
 

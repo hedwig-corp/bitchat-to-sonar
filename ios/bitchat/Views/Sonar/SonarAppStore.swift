@@ -3499,7 +3499,10 @@ final class SonarAppStore: ObservableObject {
     /// switch to it. The current account keeps everything.
     func addAccount(nsec: String?, label: String? = nil) async throws {
         let key = nsec?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let key { _ = try SonarIdentity.import(nsec: key) }
+        let incomingPubkey = try key.map { try SonarIdentity.import(nsec: $0).pubkeyHex() }
+        let alreadyRegistered = incomingPubkey.map { pk in
+            SonarAccountRegistry.snapshot().accounts.contains { $0.pubkeyHex == pk }
+        } ?? false
         try beginAccountChange()
         defer { endAccountChange() }
         let leaving = SonarAccountRegistry.snapshot().active?.pubkeyHex
@@ -3519,10 +3522,17 @@ final class SonarAppStore: ObservableObject {
             if let registryError = error as? SonarAccountRegistry.RegistryError { throw registryError }
             throw SonarAccountRestoreError.accountSwitchFailed(error.localizedDescription)
         }
-        // A new account has no record (its values stay reset); the key of an
-        // account already on this phone (R-023) gets its own back.
+        // The key of an account already on this phone (R-023) gets its own
+        // values back. A genuinely new account starts reset: a record left by
+        // an earlier removal of the same key must not replay values the user
+        // removed.
         if let added = SonarAccountRegistry.snapshot().active?.pubkeyHex {
-            unparkAccountLocalState(added)
+            if alreadyRegistered {
+                unparkAccountLocalState(added)
+            } else {
+                SonarAccountLocalState.clearRecord(for: added, defaults: defaults)
+                reloadParkedLocalState()
+            }
         }
         finishAccountChange()
         switch outcome {
@@ -3602,8 +3612,16 @@ final class SonarAppStore: ObservableObject {
     /// The nickname lives in `ChatViewModel`'s defaults; parked as a field.
     private static let parkedNicknameField = "nickname"
 
-    /// Set `pubkeyHex`'s per-account values aside, BEFORE the clear resets them.
+    /// Set `pubkeyHex`'s per-account values aside, BEFORE the clear resets
+    /// them. A record still pending for it (a restore that never completed)
+    /// is replayed first, so parking never overwrites the account's real
+    /// values with the partial ones left live.
     private func parkAccountLocalState(_ pubkeyHex: String) {
+        if let pending = SonarAccountLocalState.record(for: pubkeyHex, defaults: defaults) {
+            SonarAccountLocalState.apply(pending, keys: parkedDefaultsKeys, to: defaults)
+            chatViewModel.restoreNicknameAfterAccountSwitch(pending[Self.parkedNicknameField] as? String ?? "")
+            SonarAccountLocalState.clearRecord(for: pubkeyHex, defaults: defaults)
+        }
         var record = SonarAccountLocalState.capture(keys: parkedDefaultsKeys, from: defaults)
         record[Self.parkedNicknameField] = chatViewModel.persistedNickname
         SonarAccountLocalState.park(record, for: pubkeyHex, defaults: defaults)
