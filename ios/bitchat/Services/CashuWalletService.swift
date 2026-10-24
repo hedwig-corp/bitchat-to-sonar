@@ -840,10 +840,25 @@ final class CashuWalletService: ObservableObject {
                         guard feeFromAmount, let full = requested, full > fee else {
                             throw Self.shortfall(prepared.amountSats, fee, confirmed)
                         }
-                        prepared = try n.prepareSend(destination: dest, amountSats: full - fee)
-                        fee = prepared.feesSats ?? 0
-                        if Self.exceeds(prepared.amountSats, fee, confirmed) {
-                            throw Self.shortfall(prepared.amountSats, fee, confirmed)
+                        // Max. On ecash that pays input fees the fee depends on
+                        // the amount (the proofs it spends, the outputs it
+                        // splits into), so one subtraction can land a sat or
+                        // two over the balance (#666 QA: 1,530 quoted 95;
+                        // 1,435 then quoted 97). Step down by the overshoot, a
+                        // few quotes at most.
+                        var target = full - fee
+                        var steps = 0
+                        while true {
+                            prepared = try n.prepareSend(destination: dest, amountSats: target)
+                            fee = prepared.feesSats ?? 0
+                            guard Self.exceeds(prepared.amountSats, fee, confirmed) else { break }
+                            steps += 1
+                            let total = prepared.amountSats.addingReportingOverflow(fee)
+                            let over = total.overflow ? UInt64.max : total.partialValue - confirmed
+                            guard steps < Self.maxSizingQuotes, over < target else {
+                                throw Self.shortfall(prepared.amountSats, fee, confirmed)
+                            }
+                            target -= over
                         }
                     }
                     // The fee the user saw is a promise: a higher fee on the
@@ -923,6 +938,9 @@ final class CashuWalletService: ObservableObject {
 
     /// Fresh quotes a send may take after its quote expired unsent.
     nonisolated static let maxRequotes = 2
+
+    /// Quotes a Max send may take to find an amount its fee fits.
+    nonisolated static let maxSizingQuotes = 3
 
     private nonisolated static func exceeds(_ amount: UInt64, _ fee: UInt64, _ balance: UInt64) -> Bool {
         let (total, overflow) = amount.addingReportingOverflow(fee)

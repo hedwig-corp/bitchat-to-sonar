@@ -325,6 +325,26 @@ final class CashuWalletServiceTests: XCTestCase {
         await service.releaseQuietly()
     }
 
+    /// Max on ecash that pays input fees is not one subtraction away. The
+    /// figures are from #666 QA against cdk-mintd 0.18.1 (1000 ppk, 61
+    /// proofs, BOLT12 offer). 1,530 sats quoted 95. 1,530 - 95 = 1,435 then
+    /// quoted 97, two sats over the balance: the mint charges per output
+    /// proof too, and 1,435 splits into more of them. 1,434 quoted 89 and
+    /// paid. Max must pay an amount the fees allow, not refuse. Mirror of
+    /// `CashuWalletEngineTest.maxStillPaysWhenTheReducedAmountQuotesAHigherFee`.
+    func testMaxStillPaysWhenTheReducedAmountQuotesAHigherFee() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 1_530
+        native.nextFees = [95, 97, 89]
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        _ = try await service.send(destination: "lno1peer", amountSats: 1_530, note: "", feeFromAmount: true, maxFeeSats: 95)
+        XCTAssertEqual(native.sentPrepared.count, 1, "exactly one payment")
+        await service.releaseQuietly()
+    }
+
     // MARK: The fee the user consented to (maintainer review, #614)
 
     private let feeChanged40 = "The network fee is now up to \(sonarFormatSats(40)). Nothing was sent — try again to pay it."
