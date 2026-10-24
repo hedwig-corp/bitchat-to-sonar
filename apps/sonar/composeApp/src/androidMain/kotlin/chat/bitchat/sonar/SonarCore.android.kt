@@ -1621,9 +1621,10 @@ actual object SonarCore {
         prefs().edit().putString("blob.$key", value).apply()
     }
 
-    // commit() writes the whole current map, earlier apply()s included.
+    // commit() writes the whole current map, earlier apply()s included. A
+    // failed write (storage full) must stop the account switch, not pass.
     actual fun flushBlobs() {
-        prefs().edit().commit()
+        check(prefs().edit().commit()) { "local preferences could not be written (storage full?)" }
     }
 
     actual suspend fun wipe() = withContext(Dispatchers.IO) {

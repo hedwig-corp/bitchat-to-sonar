@@ -5066,10 +5066,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     leaving?.let(::unparkAccountLocalState)
                     throw error
                 }
-                // The record and the reset values reach disk before the core
-                // makes the new account durable.
-                SonarCore.flushBlobs()
                 val newNpub = try {
+                    // The record and the reset values reach disk before the
+                    // core makes the new account durable. A failed flush is
+                    // handled like a failed switch: the leaving account stays.
+                    SonarCore.flushBlobs()
                     SonarCore.switchAccount(pubkeyHex)
                 } catch (error: Throwable) {
                     // The core has already reopened the previous account.
@@ -5131,8 +5132,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                     leaving?.let(::unparkAccountLocalState)
                     throw error
                 }
-                SonarCore.flushBlobs()
                 val newNpub = try {
+                    // A genuinely new pasted key may have a record left by an
+                    // earlier removal of the same key (a crash before its
+                    // discard): drop it BEFORE the add commits, so it can never
+                    // replay values the user removed. A generated key is new.
+                    if (!alreadyRegistered && key != null) {
+                        canonicalNpubHex(SonarCore.validateIdentity(key))?.let { hex ->
+                            AccountLocalStateParking.discard(hex) { k, v -> SonarCore.saveBlob(k, v) }
+                        }
+                    }
+                    SonarCore.flushBlobs()
                     SonarCore.addAccount(key, label?.trim()?.takeIf { it.isNotEmpty() })
                 } catch (error: Throwable) {
                     leaving?.let(::unparkAccountLocalState)
@@ -5144,15 +5154,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                     )
                 }
                 // The key of an account already on this phone (R-023) gets its
-                // own values back. A genuinely new account starts reset: a
-                // record left by an earlier removal of the same key (a crash
-                // before its discard) must not replay values the user removed.
+                // own values back; a genuinely new account starts reset.
                 SonarCore.accounts().active?.pubkeyHex?.let { added ->
                     if (alreadyRegistered) {
                         restoreIncomingAccountLocalState(added)
                     } else {
-                        AccountLocalStateParking.discard(added) { k, v -> SonarCore.saveBlob(k, v) }
-                        reloadParkedLocalValues()
+                        // Its stale record (if any) was dropped before the add.
+                        runCatching { reloadParkedLocalValues() }
                     }
                 }
                 finishAccountChange(newNpub)
