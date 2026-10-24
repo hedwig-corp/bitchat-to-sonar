@@ -274,7 +274,7 @@ Sonar must stay interoperable with both reference clients at all times.
    upstream repositories (HEAD by default) and diffs case by case against
    the committed files; `scripts/check-bitchat-upstream-drift.sh` flags any
    change to the upstream codec files the generators do not yet cover. CI
-   runs both weekly and on every PR touching the crate
+   runs both daily and on every PR touching the crate
    (`.github/workflows/bitchat-upstream-drift.yml`). A changed expected
    value is a wire change that needs a decision in `SPEC.md`, not a test
    edit; a new upstream codec needs a generator extension plus a Rust
