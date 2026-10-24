@@ -5155,13 +5155,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 // The key of an account already on this phone (R-023) gets its
                 // own values back; a genuinely new account starts reset.
-                SonarCore.accounts().active?.pubkeyHex?.let { added ->
-                    if (alreadyRegistered) {
-                        restoreIncomingAccountLocalState(added)
-                    } else {
-                        // Its stale record (if any) was dropped before the add.
-                        runCatching { reloadParkedLocalValues() }
-                    }
+                // A new account needs nothing here: the teardown already reset
+                // these values on disk and in memory, and its stale record (if
+                // any) was dropped before the add.
+                if (alreadyRegistered) {
+                    SonarCore.accounts().active?.pubkeyHex?.let(::restoreIncomingAccountLocalState)
                 }
                 finishAccountChange(newNpub)
                 when (SonarCore.lastImportBackupOutcome()) {
