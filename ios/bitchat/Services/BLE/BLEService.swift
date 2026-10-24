@@ -189,6 +189,13 @@ final class BLEService: NSObject {
     // Cache it briefly by peerID, then verify it after the announce installs
     // the peer's signing key.
     private var pendingSonarAnnounces: [PeerID: BitchatPacket] = [:]
+    #if DEBUG
+    /// Test seam: sees every packet handed to the outbound funnel
+    /// (`broadcastPacket`, and the pre-fragmentation packet of
+    /// `sendFragmentedPacket`) so a test without a radio can observe what the
+    /// service would have put on the air. Nil in production.
+    var _test_outboundObserver: ((BitchatPacket) -> Void)?
+    #endif
     private let pendingSonarAnnounceCap = 128
     
     // Application state tracking (thread-safe)
@@ -1226,6 +1233,9 @@ final class BLEService: NSObject {
     // MARK: - Packet Broadcasting
     
     private func broadcastPacket(_ packet: BitchatPacket, transferId: String? = nil) {
+        #if DEBUG
+        _test_outboundObserver?(packet)
+        #endif
         // Apply route if recipient exists (centralized route application)
         let packetToSend: BitchatPacket
         if let recipientPeerID = PeerID(hexData: packet.recipientID) {
@@ -4165,6 +4175,9 @@ extension BLEService {
         repeatCount: Int = 1,
         repeatGapMs: Int = 0
     ) {
+        #if DEBUG
+        _test_outboundObserver?(packet)
+        #endif
         let context = PendingFragmentTransfer(
             packet: packet,
             pad: pad,
