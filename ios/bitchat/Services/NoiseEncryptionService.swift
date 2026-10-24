@@ -585,14 +585,42 @@ final class NoiseEncryptionService {
         
         return try sessionManager.encrypt(data, for: peerID)
     }
-    
-    /// Decrypt data from a specific peer
-    func decrypt(_ data: Data, from peerID: PeerID) throws -> Data {
-        // Validate message size
-        guard NoiseSecurityValidator.validateMessageSize(data) else {
+
+    /// Encrypt a `.privateFile` typed payload (`[0x20][BitchatFilePacket]`) for
+    /// a peer. This is the ONLY path allowed past the ordinary Noise message
+    /// ceiling: a whole file TLV (up to the framed-file cap) rides in one
+    /// transport message, exactly as bitchat-android and Sonar Android send it.
+    /// Any other payload type, or a file over the budget, is refused.
+    func encryptPrivateFilePayload(_ data: Data, for peerID: PeerID) throws -> Data {
+        guard NoisePayloadType.isPrivateFile(rawValue: data.first),
+              NoiseSecurityValidator.validatePrivateFileMessageSize(data) else {
             throw NoiseSecurityError.messageTooLarge
         }
-        
+
+        // Check rate limit
+        guard rateLimiter.allowMessage(from: peerID) else {
+            throw NoiseSecurityError.rateLimitExceeded
+        }
+
+        // Check if we have an established session
+        guard hasEstablishedSession(with: peerID) else {
+            onHandshakeRequired?(peerID)
+            throw NoiseEncryptionError.handshakeRequired
+        }
+
+        return try sessionManager.encrypt(data, for: peerID)
+    }
+
+    /// Decrypt data from a specific peer
+    func decrypt(_ data: Data, from peerID: PeerID) throws -> Data {
+        // Validate message size. The payload type is inside the ciphertext, so
+        // a frame over the Noise ceiling is admitted up to the private-file
+        // budget and re-checked against its type once decrypted.
+        let withinNoiseCeiling = NoiseSecurityValidator.validateCiphertextSize(data)
+        guard withinNoiseCeiling || NoiseSecurityValidator.validatePrivateFileCiphertextSize(data) else {
+            throw NoiseSecurityError.messageTooLarge
+        }
+
         // Check rate limit
         guard rateLimiter.allowMessage(from: peerID) else {
             throw NoiseSecurityError.rateLimitExceeded
@@ -602,8 +630,19 @@ final class NoiseEncryptionService {
         guard hasEstablishedSession(with: peerID) else {
             throw NoiseEncryptionError.sessionNotEstablished
         }
-        
-        return try sessionManager.decrypt(data, from: peerID)
+
+        let plaintext = try sessionManager.decrypt(data, from: peerID)
+        // Only a private file may have used the larger budget. An oversized
+        // frame that decrypts to anything else is a protocol violation, not a
+        // session fault — surface it as the same size rejection the pre-check
+        // would have made.
+        if !withinNoiseCeiling {
+            guard NoisePayloadType.isPrivateFile(rawValue: plaintext.first),
+                  NoiseSecurityValidator.validatePrivateFileMessageSize(plaintext) else {
+                throw NoiseSecurityError.messageTooLarge
+            }
+        }
+        return plaintext
     }
     
     // MARK: - Peer Management

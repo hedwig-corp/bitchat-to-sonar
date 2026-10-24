@@ -3254,6 +3254,11 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 }
                 meshService.sendVerifyResponse(to: peerID, noiseKeyHex: tlv.noiseKeyHex, nonceA: tlv.nonceA)
                 // Silent response: no toast needed on responder
+            case .privateFile, .authenticatedPeerState:
+                // Consumed inside BLEService: a private file is stored and
+                // surfaced through `didReceiveMessage` like a directed 0x22;
+                // peer state only updates transport-level capabilities.
+                break
             case .verifyResponse:
                 guard let resp = VerificationService.shared.parseVerifyResponse(payload) else { return }
                 // Check pending for this peer

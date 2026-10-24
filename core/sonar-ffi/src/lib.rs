@@ -52,6 +52,12 @@ pub enum SonarFfiError {
     Core(String),
 }
 
+impl From<sonar_core::mesh::ProtocolError> for SonarFfiError {
+    fn from(e: sonar_core::mesh::ProtocolError) -> Self {
+        SonarFfiError::Core(format!("bitchat protocol: {e}"))
+    }
+}
+
 impl From<sonar_core::Error> for SonarFfiError {
     fn from(err: sonar_core::Error) -> Self {
         Self::Core(err.to_string())
@@ -2771,6 +2777,7 @@ impl SonarNoise {
 // protocol; the Noise crypto stays in `SonarNoise`.
 
 use sonar_core::mesh;
+use sonar_core::mesh::WireEncode;
 
 /// A verified identity announce decoded off the mesh.
 #[derive(uniffi::Record)]
@@ -2870,21 +2877,16 @@ pub fn mesh_build_announce(
     let sender = parse_id8(&sender_id_hex, "sender id")?;
     let noise_pub = hex::decode(&noise_public_key_hex).map_err(invalid("noise public key"))?;
 
-    let announce = mesh::Announce {
-        nickname,
-        noise_public_key: noise_pub,
-        signing_public_key: signer.public_key().to_vec(),
-        direct_neighbors: None,
-    };
+    let announce = mesh::Announce::new(nickname, noise_pub, signer.public_key().to_vec())
+        .with_capabilities(sonar_core::mesh_engine::LOCAL_CAPABILITIES);
     let mut packet = mesh::Packet::new(mesh::msg_type::ANNOUNCE, ttl, timestamp_ms, sender);
     packet.payload = announce
         .encode()
-        .ok_or_else(|| SonarFfiError::Core("announce encode failed".into()))?;
-    if !mesh::sign_packet(&mut packet, &signer) {
-        return Err(SonarFfiError::Core("announce sign failed".into()));
-    }
+        .map_err(|e| SonarFfiError::Core(format!("announce encode failed: {e}")))?;
+    mesh::sign_packet(&mut packet, &signer)
+        .map_err(|e| SonarFfiError::Core(format!("announce sign failed: {e}")))?;
     packet
-        .encode()
+        .encode_wire()
         .ok_or_else(|| SonarFfiError::Core("announce packet encode failed".into()))
 }
 
@@ -2893,11 +2895,11 @@ pub fn mesh_build_announce(
 /// (== iOS `verifyPacketSignature`). Returns None for non-announce/invalid.
 #[uniffi::export]
 pub fn mesh_parse_announce(packet_bytes: Vec<u8>) -> Option<MeshAnnounceInfo> {
-    let packet = mesh::Packet::decode(&packet_bytes)?;
+    let packet = mesh::Packet::decode(&packet_bytes).ok()?;
     if packet.type_ != mesh::msg_type::ANNOUNCE {
         return None;
     }
-    let announce = mesh::Announce::decode(&packet.payload)?;
+    let announce = mesh::Announce::decode(&packet.payload).ok()?;
     if mesh::peer_id_from_noise_key(&announce.noise_public_key) != hex::encode(packet.sender_id) {
         return None;
     }
@@ -2915,7 +2917,7 @@ pub fn mesh_parse_announce(packet_bytes: Vec<u8>) -> Option<MeshAnnounceInfo> {
 /// Decode the outer fields of any mesh packet.
 #[uniffi::export]
 pub fn mesh_decode_packet(packet_bytes: Vec<u8>) -> Option<MeshPacketInfo> {
-    let p = mesh::Packet::decode(&packet_bytes)?;
+    let p = mesh::Packet::decode(&packet_bytes).ok()?;
     Some(MeshPacketInfo {
         packet_type: p.type_,
         ttl: p.ttl,
@@ -2939,7 +2941,7 @@ pub fn mesh_parse_verified_sonar_announce(
     if signing_public_key.len() != 32 {
         return None;
     }
-    let packet = mesh::Packet::decode(&packet_bytes)?;
+    let packet = mesh::Packet::decode(&packet_bytes).ok()?;
     if packet.type_ != mesh::msg_type::SONAR_ANNOUNCE
         || !mesh::verify_packet(&packet, &signing_public_key)
     {
@@ -2966,7 +2968,7 @@ pub fn mesh_build_packet(
     }
     packet.payload = payload;
     packet
-        .encode()
+        .encode_wire()
         .ok_or_else(|| SonarFfiError::Core("packet encode failed".into()))
 }
 
@@ -3001,11 +3003,10 @@ pub fn mesh_build_signed_packet(
         packet.recipient_id = Some(parse_id8(&recipient_id_hex, "recipient id")?);
     }
     packet.payload = payload;
-    if !mesh::sign_packet(&mut packet, &signer) {
-        return Err(SonarFfiError::Core("signed packet sign failed".into()));
-    }
+    mesh::sign_packet(&mut packet, &signer)
+        .map_err(|e| SonarFfiError::Core(format!("signed packet sign failed: {e}")))?;
     packet
-        .encode()
+        .encode_wire()
         .ok_or_else(|| SonarFfiError::Core("signed packet encode failed".into()))
 }
 
@@ -3045,11 +3046,10 @@ pub fn mesh_build_signed_packet_v2(
         packet.route = Some(route);
     }
     packet.payload = payload;
-    if !mesh::sign_packet(&mut packet, &signer) {
-        return Err(SonarFfiError::Core("signed v2 packet sign failed".into()));
-    }
+    mesh::sign_packet(&mut packet, &signer)
+        .map_err(|e| SonarFfiError::Core(format!("signed v2 packet sign failed: {e}")))?;
     packet
-        .encode()
+        .encode_wire()
         .ok_or_else(|| SonarFfiError::Core("signed v2 packet encode failed".into()))
 }
 
@@ -3073,8 +3073,11 @@ pub fn mesh_encode_private_message_with_reply(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
     };
-    mesh::encode_private_message_plaintext(&pm)
-        .ok_or_else(|| SonarFfiError::Core("private message encode failed".into()))
+    // No peer context here: the extended (Sonar) encoding, as this helper has
+    // always produced. Hosts talking to a stock bitchat peer go through the
+    // engine, which gates the extensions on a verified 0x53.
+    mesh::encode_private_message_plaintext(&pm, true)
+        .map_err(|e| SonarFfiError::Core(format!("private message encode failed: {e}")))
 }
 
 /// Parse a decrypted noiseEncrypted plaintext as a private message. Returns None
@@ -3085,7 +3088,7 @@ pub fn mesh_decode_private_message(plaintext: Vec<u8>) -> Option<MeshPrivateMess
     if t != mesh::noise_payload::PRIVATE_MESSAGE {
         return None;
     }
-    let pm = mesh::PrivateMessage::decode(rest)?;
+    let pm = mesh::PrivateMessage::decode(rest).ok()?;
     Some(MeshPrivateMessage {
         message_id: pm.message_id,
         content: pm.content,
@@ -3146,11 +3149,10 @@ pub fn mesh_build_public_message(
     // signed. Sender + timestamp live in the packet header.
     let mut packet = mesh::Packet::new(mesh::msg_type::MESSAGE, ttl, timestamp_ms, sender);
     packet.payload = content.into_bytes();
-    if !mesh::sign_packet(&mut packet, &signer) {
-        return Err(SonarFfiError::Core("public message sign failed".into()));
-    }
+    mesh::sign_packet(&mut packet, &signer)
+        .map_err(|e| SonarFfiError::Core(format!("public message sign failed: {e}")))?;
     packet
-        .encode()
+        .encode_wire()
         .ok_or_else(|| SonarFfiError::Core("public message packet encode failed".into()))
 }
 
@@ -3158,7 +3160,7 @@ pub fn mesh_build_public_message(
 /// the raw UTF-8 content. Returns None for other types / non-UTF-8 input.
 #[uniffi::export]
 pub fn mesh_parse_public_message(packet_bytes: Vec<u8>) -> Option<MeshPublicMessage> {
-    let packet = mesh::Packet::decode(&packet_bytes)?;
+    let packet = mesh::Packet::decode(&packet_bytes).ok()?;
     if packet.type_ != mesh::msg_type::MESSAGE {
         return None;
     }

@@ -146,13 +146,29 @@ struct BinaryProtocol {
         let version = packet.version
         guard version == 1 || version == 2 else { return nil }
 
-        // Try to compress payload when beneficial, keeping original size for later decoding
+        // Only compress when we can represent the original length in the outbound frame
+        let maxRepresentable = version == 2 ? Int(UInt32.max) : Int(UInt16.max)
+
         var payload = packet.payload
         var isCompressed = false
         var originalPayloadSize: Int?
-        if CompressionUtil.shouldCompress(payload) {
-            // Only compress when we can represent the original length in the outbound frame
-            let maxRepresentable = version == 2 ? Int(UInt32.max) : Int(UInt16.max)
+        if let wire = packet.wirePayload, wire.matches(packet.payload) {
+            // Reuse the originator's bytes verbatim — compressed or not — so a
+            // relay re-encode and the signature preimage reproduce the frame
+            // that was signed. Running `shouldCompress`/`compress` here instead
+            // substitutes Apple's DEFLATE stream (or compresses a payload the
+            // sender left plain) and breaks verification of every signed packet
+            // from a foreign encoder with a compressible payload.
+            if wire.compressed {
+                guard packet.payload.count <= maxRepresentable else { return nil }
+                originalPayloadSize = packet.payload.count
+                payload = wire.bytes
+                isCompressed = true
+            } else {
+                payload = wire.bytes
+            }
+        } else if CompressionUtil.shouldCompress(payload) {
+            // Try to compress payload when beneficial, keeping original size for later decoding
             if payload.count <= maxRepresentable,
                let compressedPayload = CompressionUtil.compress(payload) {
                 originalPayloadSize = payload.count
@@ -369,6 +385,7 @@ struct BinaryProtocol {
 
             // Payload: payloadLength is exactly the payload size (+ compression preamble if compressed)
             let payload: Data
+            let wirePayload: WirePayload
             if isCompressed {
                 guard payloadLength >= lengthFieldBytes else { return nil }
                 let originalSize: Int
@@ -392,9 +409,11 @@ struct BinaryProtocol {
                 guard let decompressed = CompressionUtil.decompress(compressed, originalSize: originalSize),
                       decompressed.count == originalSize else { return nil }
                 payload = decompressed
+                wirePayload = WirePayload(bytes: compressed, compressed: true, forPayload: payload)
             } else {
                 guard let rawPayload = readData(payloadLength) else { return nil }
                 payload = rawPayload
+                wirePayload = WirePayload(bytes: rawPayload, compressed: false, forPayload: payload)
             }
 
             var signature: Data? = nil
@@ -405,7 +424,7 @@ struct BinaryProtocol {
 
             guard offset <= buf.count else { return nil }
 
-            return BitchatPacket(
+            var packet = BitchatPacket(
                 type: type,
                 senderID: senderID,
                 recipientID: recipientID,
@@ -417,6 +436,10 @@ struct BinaryProtocol {
                 route: route,
                 isRSR: isRSR
             )
+            // Remember the received payload bytes so `encode` (relay, signing
+            // preimage) reproduces them instead of re-running our compressor.
+            packet.wirePayload = wirePayload
+            return packet
         }
     }
 }

@@ -173,6 +173,9 @@ extension ChatViewModel {
         case .verifyChallenge, .verifyResponse:
             // QR verification payloads over Nostr are not supported; ignore in geohash DMs
             break
+        case .privateFile, .authenticatedPeerState:
+            // Mesh-Noise-only payloads (SPEC §10): Nostr delivery ignores them.
+            break
         }
     }
 
@@ -407,6 +410,9 @@ extension ChatViewModel {
         
         // Explicitly list other cases so we get compile-time check if a new case is added in the future
         case .verifyChallenge, .verifyResponse:
+            break
+        case .privateFile, .authenticatedPeerState:
+            // Mesh-Noise-only payloads (SPEC §10): Nostr delivery ignores them.
             break
         }
     }
@@ -652,6 +658,9 @@ extension ChatViewModel {
                         case .readReceipt:
                             handleReadReceipt(payload, senderPubkey: senderPubkey, convKey: targetPeerID)
                         case .verifyChallenge, .verifyResponse:
+                            break
+                        case .privateFile, .authenticatedPeerState:
+                            // Mesh-Noise-only payloads (SPEC §10): Nostr delivery ignores them.
                             break
                         }
                     }

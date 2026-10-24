@@ -108,7 +108,29 @@ enum NoisePayloadType: UInt8 {
     // Verification (QR-based OOB binding)
     case verifyChallenge = 0x10     // Verification challenge
     case verifyResponse  = 0x11     // Verification response
-    
+    // Private media and session-proven state (upstream bitchat ≥ 1.8 /
+    // bitchat-android ≥ 2.0.3 / Sonar Android; see
+    // core/bitchat-protocol/src/types.rs `noise_payload`).
+    case privateFile = 0x20         // A complete BitchatFilePacket encrypted inside the session
+    case authenticatedPeerState = 0x21 // AuthenticatedPeerStatePacket: capabilities + signing key
+
+    /// Prerelease iOS alias for `.privateFile`: accepted on decode, never emitted.
+    static let prereleasePrivateFileRawValue: UInt8 = 0x09
+
+    /// Decode a type byte, canonicalising the prerelease `0x09` alias to
+    /// `.privateFile`. Use this instead of `init(rawValue:)` on the receive path
+    /// (`fromValue` on Android, `NoisePayloadType::decode` in Rust).
+    static func decoded(rawValue: UInt8) -> NoisePayloadType? {
+        if rawValue == prereleasePrivateFileRawValue { return .privateFile }
+        return NoisePayloadType(rawValue: rawValue)
+    }
+
+    /// Is this plaintext's leading type byte a private file (either spelling)?
+    static func isPrivateFile(rawValue: UInt8?) -> Bool {
+        guard let rawValue else { return false }
+        return decoded(rawValue: rawValue) == .privateFile
+    }
+
     var description: String {
         switch self {
         case .privateMessage: return "privateMessage"
@@ -116,6 +138,8 @@ enum NoisePayloadType: UInt8 {
         case .delivered: return "delivered"
         case .verifyChallenge: return "verifyChallenge"
         case .verifyResponse: return "verifyResponse"
+        case .privateFile: return "privateFile"
+        case .authenticatedPeerState: return "authenticatedPeerState"
         }
     }
 }
