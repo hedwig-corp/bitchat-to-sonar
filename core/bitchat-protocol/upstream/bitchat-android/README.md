@@ -29,6 +29,12 @@ app/src/test/java/com/bitchat/android/protocol/BitchatVectorReplayTest.kt   <- t
 app/src/test/resources/bitchat-vectors/bitchat-android.json                 <- copy of the vector file
 ```
 
+The `wear` module re-runs the app's `protocol/**` tests from a synced mirror of
+`app/src/test/java` but, as of `d1da9716`, mirrors no test resources, so the
+test fails there with "vector file not found" unless `wear/build.gradle.kts`
+also syncs `../app/src/test/resources` into a directory on the wear test
+source set (the upstream PR adds `syncSharedAppTestResources` for that).
+
 It uses only what the `app` module already has on the JVM unit-test classpath:
 JUnit 4, Gson (`libs.gson`, an `implementation` dependency), and upstream's own
 `android.util.Log` stub in `app/src/test/kotlin/android/util/Log.kt`. No
