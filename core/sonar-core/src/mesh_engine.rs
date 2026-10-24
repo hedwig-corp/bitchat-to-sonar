@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use sha2::{Digest, Sha256};
 
-use crate::mesh::{self, msg_type, noise_payload};
+use crate::mesh::{self, msg_type, noise_payload, AuthenticatedPeerState, PeerCapabilities, WireEncode};
 use crate::noise::{NoiseHandshake, NoiseSession};
 
 // ── Wire/behavior constants ──
@@ -42,6 +42,13 @@ use crate::noise::{NoiseHandshake, NoiseSession};
 // the Kotlin implementation (announce cadence interop with iOS, Android GATT
 // MTU realities, bitchat compatibility). Do not tune casually.
 pub const DEFAULT_TTL: u8 = 7;
+/// Capabilities this engine implements and therefore advertises in its announce
+/// (TLV 0x05) and proves in the authenticated peer state (Noise 0x21):
+/// private media as Noise payload 0x20, with delivery receipts. Everything
+/// else bitchat defines (groups, board, couriers, ...) is not implemented and
+/// MUST NOT be advertised.
+pub const LOCAL_CAPABILITIES: PeerCapabilities =
+    PeerCapabilities(PeerCapabilities::PRIVATE_MEDIA.0 | PeerCapabilities::PRIVATE_MEDIA_RECEIPTS.0);
 pub const MAX_CLIENTS: usize = 4;
 pub const CONNECT_ESTABLISH_MS: u64 = 5_000;
 pub const ANNOUNCE_TIMEOUT_MS: u64 = 6_000;
@@ -280,6 +287,17 @@ pub struct Engine {
     identity_map_cap: usize,
     /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
     pending_sonar: HashMap<String, Vec<u8>>,
+    /// Fingerprints that sent a VERIFIED Sonar 0x53 announce. Only these peers
+    /// may receive Sonar's private-message TLV extensions (long fields,
+    /// reply-to): stock bitchat rejects the whole message on an unknown TLV.
+    sonar_fps: HashSet<String>,
+    /// Capabilities each fingerprint PROVED inside its Noise session (0x21).
+    /// The public announce bit is only a discovery hint; this is what selects
+    /// the encrypted private-media path.
+    proven_caps: HashMap<String, PeerCapabilities>,
+    /// Fingerprints we already proved our state to (one 0x21 per peer per
+    /// engine lifetime; a rekey resets through `reset`).
+    peer_state_sent: HashSet<String>,
     seen_broadcasts: HashSet<String>,
     seen_files: HashSet<String>,
     reassembler: mesh::fragment::Reassembler,
@@ -336,6 +354,9 @@ impl Engine {
             identity_refused: 0,
             identity_map_cap: IDENTITY_MAP_CAP,
             pending_sonar: HashMap::new(),
+            sonar_fps: HashSet::new(),
+            proven_caps: HashMap::new(),
+            peer_state_sent: HashSet::new(),
             seen_broadcasts: HashSet::new(),
             seen_files: HashSet::new(),
             reassembler: mesh::fragment::Reassembler::new(),
@@ -830,25 +851,55 @@ impl Engine {
         let route = self.sendable_route(fingerprint)?;
         let peer_id_hex = self.route_peer_id(&route)?;
         let peer_id = parse_id8(&peer_id_hex)?;
+        // The 0x05 message-id TLV is a Sonar extension: bitchat-android builds
+        // that predate its #826 drop the whole file on an unknown tag, so it
+        // rides only to a peer that proved it is Sonar (verified 0x53).
+        let message_id_tlv = self.peer_is_sonar(fingerprint).then(|| message_id.to_string());
         let payload = mesh::file_packet::FilePacket {
             file_name: Some(file_name.to_string()),
             file_size: Some(content.len() as u64),
             mime_type: Some(mime_type.to_string()),
-            message_id: Some(message_id.to_string()),
+            message_id: message_id_tlv,
             content: content.to_vec(),
         }
         .encode()?;
+        let mut out = self.discovery_to_route(&route, now_ms);
+        if self
+            .proven_capabilities(fingerprint)
+            .contains(PeerCapabilities::PRIVATE_MEDIA)
+        {
+            // The peer proved (inside its Noise session) that it receives media
+            // as Noise payload 0x20: encrypt the whole file TLV, then fragment
+            // the 0x11 frame. End-to-end confidential; relays see nothing.
+            let mut plain = Vec::with_capacity(1 + payload.len());
+            plain.push(noise_payload::PRIVATE_FILE);
+            plain.extend(payload);
+            let ciphertext = self.encrypt_on_route(&route, &plain)?;
+            let mut packet = mesh::encrypted_packet(
+                self.my_peer_id,
+                peer_id,
+                DEFAULT_TTL,
+                self.wall(now_ms),
+                ciphertext,
+            );
+            if packet.payload.len() > MAX_V1_FILE_PAYLOAD_BYTES {
+                packet.version = 2;
+            }
+            let bytes = packet.encode_wire()?;
+            self.write_maybe_fragmented(&route, bytes, msg_type::NOISE_ENCRYPTED, now_ms, &mut out);
+            return Some(out);
+        }
+        // Legacy wire form: a signed, directed, plaintext 0x22. Stock iOS
+        // still accepts it from a peer with a verified signing key; relays
+        // can read the file.
         let mut packet = mesh::Packet::new(msg_type::FILE_TRANSFER, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
         packet.recipient_id = Some(peer_id);
         packet.payload = payload;
         if packet.payload.len() > MAX_V1_FILE_PAYLOAD_BYTES {
             packet.version = 2;
         }
-        if !mesh::sign_packet(&mut packet, &self.signer) {
-            return None;
-        }
-        let bytes = packet.encode()?;
-        let mut out = self.discovery_to_route(&route, now_ms);
+        mesh::sign_packet(&mut packet, &self.signer).ok()?;
+        let bytes = packet.encode_wire()?;
         self.write_maybe_fragmented(&route, bytes, msg_type::FILE_TRANSFER, now_ms, &mut out);
         Some(out)
     }
@@ -867,7 +918,7 @@ impl Engine {
         }
         let route = self.sendable_route(fingerprint)?;
         let peer_id = parse_id8(&self.route_peer_id(&route)?)?;
-        let plain = mesh::encode_delivered_plaintext(message_id)?;
+        let plain = mesh::encode_delivered_plaintext(message_id).ok()?;
         let ciphertext = self.encrypt_on_route(&route, &plain)?;
         let packet = mesh::encrypted_packet(
             self.my_peer_id,
@@ -876,7 +927,7 @@ impl Engine {
             self.wall(now_ms),
             ciphertext,
         );
-        let bytes = packet.encode()?;
+        let bytes = packet.encode_wire()?;
         let mut out = Output::default();
         self.write_maybe_fragmented(&route, bytes, msg_type::NOISE_ENCRYPTED, now_ms, &mut out);
         Some(out)
@@ -887,10 +938,10 @@ impl Engine {
     pub fn broadcast(&mut self, text: &str, now_ms: u64) -> Option<Output> {
         let mut packet = mesh::Packet::new(msg_type::MESSAGE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
         packet.payload = text.as_bytes().to_vec();
-        if !mesh::sign_packet(&mut packet, &self.signer) {
+        if mesh::sign_packet(&mut packet, &self.signer).is_err() {
             return None;
         }
-        let bytes = packet.encode()?;
+        let bytes = packet.encode_wire()?;
         // Skip our own echo if it loops back through a relay. The key must use
         // the SAME timestamp the packet carries on the wire.
         self.remember_broadcast(format!("{}-{}", self.my_peer_id_hex, packet.timestamp));
@@ -999,6 +1050,9 @@ impl Engine {
         self.identity_lru.clear();
         self.identity_refused = 0;
         self.pending_sonar.clear();
+        self.sonar_fps.clear();
+        self.proven_caps.clear();
+        self.peer_state_sent.clear();
         self.seen_broadcasts.clear();
         self.seen_files.clear();
         self.reassembler = mesh::fragment::Reassembler::new();
@@ -1078,19 +1132,19 @@ impl Engine {
         if self.nickname.is_empty() {
             return None;
         }
-        let announce = mesh::Announce {
-            nickname: self.nickname.clone(),
-            noise_public_key: hex::decode(&self.noise_public_hex).ok()?,
-            signing_public_key: self.signer.public_key().to_vec(),
-            direct_neighbors: None,
-        };
+        let announce = mesh::Announce::new(
+            self.nickname.clone(),
+            hex::decode(&self.noise_public_hex).ok()?,
+            self.signer.public_key().to_vec(),
+        )
+        .with_capabilities(LOCAL_CAPABILITIES);
         let mut packet =
             mesh::Packet::new(msg_type::ANNOUNCE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
-        packet.payload = announce.encode()?;
-        if !mesh::sign_packet(&mut packet, &self.signer) {
+        packet.payload = announce.encode().ok()?;
+        if mesh::sign_packet(&mut packet, &self.signer).is_err() {
             return None;
         }
-        packet.encode()
+        packet.encode_wire()
     }
 
     fn sonar_bytes(&self, now_ms: u64) -> Option<Vec<u8>> {
@@ -1100,10 +1154,10 @@ impl Engine {
         let mut packet =
             mesh::Packet::new(msg_type::SONAR_ANNOUNCE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
         packet.payload = payload;
-        if !mesh::sign_packet(&mut packet, &self.signer) {
+        if mesh::sign_packet(&mut packet, &self.signer).is_err() {
             return None;
         }
-        packet.encode()
+        packet.encode_wire()
     }
 
     /// Announce + 0x53 to every link and server connection ("heartbeat" /
@@ -1222,6 +1276,7 @@ impl Engine {
         let Some(peer_id) = parse_id8(&peer_id_hex) else {
             return false;
         };
+        let peer_is_sonar = self.peer_is_sonar(fingerprint);
         let pm = mesh::PrivateMessage {
             message_id: message_id.to_string(),
             content: text.to_string(),
@@ -1230,19 +1285,104 @@ impl Engine {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
         };
-        let Some(plain) = mesh::encode_private_message_plaintext(&pm) else {
-            return false;
+        // A stock bitchat client rejects a private message carrying any TLV it
+        // does not know and cannot represent a field over 255 bytes. So for a
+        // peer that never sent a verified Sonar 0x53: the reply parent is not
+        // sent, and long text is delivered as a run of legacy-sized messages
+        // (`id`, `id#2`, `id#3`, ...). The first piece keeps the caller's id so
+        // its delivery ack still maps onto the bubble. Sonar peers get the
+        // extended TLVs in one message.
+        let messages: Vec<mesh::PrivateMessage> = if peer_is_sonar || pm.fits_legacy() {
+            vec![pm]
+        } else {
+            mesh::split_for_legacy(&pm.content, mesh::LEGACY_MAX_FIELD_BYTES)
+                .into_iter()
+                .enumerate()
+                .map(|(i, part)| {
+                    let id = if i == 0 {
+                        pm.message_id.clone()
+                    } else {
+                        format!("{}#{}", pm.message_id, i + 1)
+                    };
+                    mesh::PrivateMessage::new(id, part)
+                })
+                .collect()
         };
-        let Some(ciphertext) = self.encrypt_on_route(&route, &plain) else {
-            return false;
-        };
-        let packet =
-            mesh::encrypted_packet(self.my_peer_id, peer_id, DEFAULT_TTL, self.wall(now_ms), ciphertext);
-        let Some(bytes) = packet.encode() else {
-            return false;
-        };
-        self.write_maybe_fragmented(&route, bytes, msg_type::NOISE_ENCRYPTED, now_ms, out);
+        let mut frames = Vec::with_capacity(messages.len());
+        for m in &messages {
+            let Ok(plain) = mesh::encode_private_message_plaintext(m, peer_is_sonar) else {
+                return false;
+            };
+            let Some(ciphertext) = self.encrypt_on_route(&route, &plain) else {
+                return false;
+            };
+            let packet = mesh::encrypted_packet(
+                self.my_peer_id,
+                peer_id,
+                DEFAULT_TTL,
+                self.wall(now_ms),
+                ciphertext,
+            );
+            let Some(bytes) = packet.encode_wire() else {
+                return false;
+            };
+            frames.push(bytes);
+        }
+        for bytes in frames {
+            self.write_maybe_fragmented(&route, bytes, msg_type::NOISE_ENCRYPTED, now_ms, out);
+        }
         true
+    }
+
+    /// Did this fingerprint send a verified Sonar discovery announce (0x53)?
+    /// Gates every Sonar wire extension a stock bitchat client would reject.
+    pub fn peer_is_sonar(&self, fingerprint: &str) -> bool {
+        self.sonar_fps.contains(&fingerprint.to_lowercase())
+    }
+
+    /// Capabilities this fingerprint proved inside a Noise session (0x21).
+    pub fn proven_capabilities(&self, fingerprint: &str) -> PeerCapabilities {
+        self.proven_caps
+            .get(&fingerprint.to_lowercase())
+            .copied()
+            .unwrap_or(PeerCapabilities::NONE)
+    }
+
+    /// Prove our capabilities to the peer on `route`: the authenticated peer
+    /// state (Noise payload 0x21), sent once after every completed handshake
+    /// and echoed at most once when the peer's own state arrives first.
+    fn send_peer_state(&mut self, route: &Origin, fingerprint: &str, now_ms: u64, out: &mut Output) {
+        let key = fingerprint.to_lowercase();
+        if self.peer_state_sent.contains(&key) {
+            return;
+        }
+        let Some(peer_hex) = self.route_peer_id(route) else {
+            return;
+        };
+        let Some(peer_id) = parse_id8(&peer_hex) else {
+            return;
+        };
+        let state = AuthenticatedPeerState {
+            capabilities: LOCAL_CAPABILITIES,
+            signing_public_key: self.signer.public_key(),
+        };
+        let Ok(body) = state.encode() else {
+            return;
+        };
+        let mut plain = vec![noise_payload::AUTHENTICATED_PEER_STATE];
+        plain.extend(body);
+        let Some(ciphertext) = self.encrypt_on_route(route, &plain) else {
+            return;
+        };
+        let packet = mesh::encrypted_packet(self.my_peer_id, peer_id, DEFAULT_TTL, self.wall(now_ms), ciphertext);
+        let Some(bytes) = packet.encode_wire() else {
+            return;
+        };
+        if self.peer_state_sent.len() >= IDENTITY_MAP_CAP {
+            self.peer_state_sent.clear();
+        }
+        self.peer_state_sent.insert(key);
+        self.write_maybe_fragmented(route, bytes, msg_type::NOISE_ENCRYPTED, now_ms, out);
     }
 
     fn encrypt_on_route(&mut self, route: &Origin, plain: &[u8]) -> Option<Vec<u8>> {
@@ -1289,7 +1429,7 @@ impl Engine {
                 );
                 p.recipient_id = recipient;
                 p.payload = f.encode_payload();
-                if let Some(b) = p.encode() {
+                if let Some(b) = p.encode_wire() {
                     pieces.push(b);
                 }
             }
@@ -1362,7 +1502,7 @@ impl Engine {
 
     fn handle_packet(&mut self, origin: Origin, bytes: &[u8], now_ms: u64) -> Output {
         let mut out = Output::default();
-        let Some(packet) = mesh::Packet::decode(bytes) else {
+        let Ok(packet) = mesh::Packet::decode(bytes) else {
             return out;
         };
         match packet.type_ {
@@ -1371,7 +1511,7 @@ impl Engine {
             msg_type::NOISE_HANDSHAKE => {
                 self.handle_handshake(origin, &packet, now_ms, &mut out)
             }
-            msg_type::NOISE_ENCRYPTED => self.handle_encrypted(origin, &packet, &mut out),
+            msg_type::NOISE_ENCRYPTED => self.handle_encrypted(origin, &packet, now_ms, &mut out),
             msg_type::FRAGMENT => {
                 if let Some(frag) = mesh::fragment::Fragment::decode_payload(&packet.payload) {
                     if let Some(full) = self.reassembler.add(packet.sender_id, &frag, now_ms) {
@@ -1413,7 +1553,7 @@ impl Engine {
         now_ms: u64,
         out: &mut Output,
     ) {
-        let Some(announce) = mesh::Announce::decode(&packet.payload) else {
+        let Ok(announce) = mesh::Announce::decode(&packet.payload) else {
             return;
         };
         let sender_hex = hex::encode(packet.sender_id);
@@ -1508,7 +1648,7 @@ impl Engine {
         });
         // A 0x53 that arrived before this announce can be verified now.
         if let Some(pending) = self.pending_sonar.remove(&sender_key) {
-            if let Some(p) = mesh::Packet::decode(&pending) {
+            if let Ok(p) = mesh::Packet::decode(&pending) {
                 if p.type_ == msg_type::SONAR_ANNOUNCE
                     && mesh::verify_packet(&p, &announce.signing_public_key)
                     && !fp.is_empty()
@@ -1576,7 +1716,7 @@ impl Engine {
                                 self.wall(now_ms),
                                 m1,
                             );
-                            if let Some(b) = p.encode() {
+                            if let Some(b) = p.encode_wire() {
                                 out.commands.push(Command::WriteLink {
                                     conn: id.conn.clone(),
                                     instance: id.instance,
@@ -1723,7 +1863,7 @@ impl Engine {
                     s.bind.peer_id_hex = Some(sender_hex.clone());
                 }
                 if hs.is_finished() {
-                    self.finish_noise_server(&conn, out);
+                    self.finish_noise_server(&conn, now_ms, out);
                 } else {
                     let m2 = match hs.write_message() {
                         Ok(m) => m,
@@ -1740,7 +1880,7 @@ impl Engine {
                         self.wall(now_ms),
                         m2,
                     );
-                    if let Some(b) = p.encode() {
+                    if let Some(b) = p.encode_wire() {
                         out.commands.push(Command::NotifyConn {
                             conn: conn.clone(),
                             bytes: b,
@@ -1781,7 +1921,7 @@ impl Engine {
                         self.wall(now_ms),
                         m3,
                     );
-                    if let Some(b) = p.encode() {
+                    if let Some(b) = p.encode_wire() {
                         out.commands.push(Command::WriteLink {
                             conn: id.conn.clone(),
                             instance: id.instance,
@@ -1796,7 +1936,7 @@ impl Engine {
                     Some(NoiseState::Handshake { hs, .. }) if hs.is_finished()
                 );
                 if finished {
-                    self.finish_noise_client(&id, out);
+                    self.finish_noise_client(&id, now_ms, out);
                 }
             }
         }
@@ -1824,7 +1964,7 @@ impl Engine {
         }
     }
 
-    fn finish_noise_client(&mut self, id: &LinkId, out: &mut Output) {
+    fn finish_noise_client(&mut self, id: &LinkId, now_ms: u64, out: &mut Output) {
         let Some(l) = self.links.get_mut(id) else {
             return;
         };
@@ -1845,12 +1985,16 @@ impl Engine {
                 l.noise = Some(NoiseState::Session(session));
                 l.bind.fingerprint = Some(fp.clone());
                 self.link_established(&fp, out);
+                // A fresh session gets a fresh proof (the peer re-pins per
+                // session, like the reference clients after a rekey).
+                self.peer_state_sent.remove(&fp.to_lowercase());
+                self.send_peer_state(&Origin::Client(id.clone()), &fp, now_ms, out);
             }
             Err(_) => l.noise = None,
         }
     }
 
-    fn finish_noise_server(&mut self, conn: &str, out: &mut Output) {
+    fn finish_noise_server(&mut self, conn: &str, now_ms: u64, out: &mut Output) {
         let Some(s) = self.server_conns.get_mut(conn) else {
             return;
         };
@@ -1870,6 +2014,8 @@ impl Engine {
                 s.noise = Some(NoiseState::Session(session));
                 s.bind.fingerprint = Some(fp.clone());
                 self.link_established(&fp, out);
+                self.peer_state_sent.remove(&fp.to_lowercase());
+                self.send_peer_state(&Origin::Server(conn.to_string()), &fp, now_ms, out);
             }
             Err(_) => s.noise = None,
         }
@@ -1884,7 +2030,7 @@ impl Engine {
         });
     }
 
-    fn handle_encrypted(&mut self, origin: Origin, packet: &mesh::Packet, out: &mut Output) {
+    fn handle_encrypted(&mut self, origin: Origin, packet: &mesh::Packet, now_ms: u64, out: &mut Output) {
         let fp = match &origin {
             Origin::Client(id) => self.links.get(id).and_then(|l| l.bind.fingerprint.clone()),
             Origin::Server(conn) => self
@@ -1908,10 +2054,12 @@ impl Engine {
         // Prefer this route's own session; fall back to the peer's session on
         // its OTHER route (snow does not advance the nonce on a failed
         // decrypt, so the fallback can't desync a healthy session).
+        let bound_fp = fp.clone();
         let plain = self
             .decrypt_on_origin(&origin, &packet.payload)
             .or_else(|| {
-                fp.as_deref()
+                bound_fp
+                    .as_deref()
                     .and_then(|f| self.decrypt_on_any_route(f, &packet.payload))
             });
         let Some(plain) = plain else {
@@ -1921,6 +2069,7 @@ impl Engine {
             return;
         };
         let id_fp = fp
+            .clone()
             .or_else(|| match &origin {
                 Origin::Client(id) => self
                     .links
@@ -1937,7 +2086,7 @@ impl Engine {
             });
         match t {
             noise_payload::PRIVATE_MESSAGE => {
-                let Some(pm) = mesh::PrivateMessage::decode(rest) else {
+                let Ok(pm) = mesh::PrivateMessage::decode(rest) else {
                     return;
                 };
                 out.events.push(AppEvent::TextReceived {
@@ -1959,8 +2108,64 @@ impl Engine {
                     message_id,
                 });
             }
+            noise_payload::PRIVATE_FILE => {
+                // Private media encrypted inside the session (what current
+                // bitchat-android and iOS send to a peer that proved bit 8).
+                // Authenticated by the Noise session, so no packet signature
+                // is required — the same file TLV as the legacy 0x22 path.
+                self.emit_file(id_fp, packet.sender_id, packet.timestamp, rest, out);
+            }
+            noise_payload::AUTHENTICATED_PEER_STATE => {
+                // Only a fingerprint authenticated by this route's handshake
+                // may pin capabilities; an unbound route proves nothing.
+                let Some(f) = fp.as_deref() else {
+                    return;
+                };
+                let Ok(state) = AuthenticatedPeerState::decode(rest) else {
+                    return;
+                };
+                if self.proven_caps.len() >= IDENTITY_MAP_CAP {
+                    self.proven_caps.clear();
+                }
+                self.proven_caps.insert(f.to_lowercase(), state.capabilities);
+                // Echo once so message-3 / proof reordering across links
+                // converges (both sides end up holding the other's state).
+                let f = f.to_string();
+                self.send_peer_state(&origin, &f, now_ms, out);
+            }
             _ => {}
         }
+    }
+
+    /// Deduplicate and surface a decoded file transfer, whichever wire form
+    /// carried it (plaintext signed 0x22 or Noise 0x20).
+    fn emit_file(&mut self, fp: String, sender_id: [u8; 8], timestamp: u64, file_bytes: &[u8], out: &mut Output) {
+        let payload_hash8 = {
+            let d = Sha256::digest(file_bytes);
+            hex::encode(&d[..8])
+        };
+        let transfer_key = format!("{}-{}-{}", hex::encode(sender_id), timestamp, payload_hash8);
+        if self.seen_files.len() > SEEN_CAP {
+            self.seen_files.clear();
+        }
+        if !self.seen_files.insert(transfer_key.clone()) {
+            return;
+        }
+        let Some(file) = mesh::file_packet::FilePacket::decode(file_bytes) else {
+            return;
+        };
+        if file.content.is_empty() || file.content.len() > MAX_FILE_TRANSFER_BYTES {
+            return;
+        }
+        out.events.push(AppEvent::FileReceived {
+            fingerprint: fp,
+            transfer_key,
+            message_id: file.message_id,
+            file_name: file.file_name,
+            mime_type: file.mime_type,
+            content: file.content,
+            timestamp_ms: timestamp,
+        });
     }
 
     fn decrypt_on_origin(&mut self, origin: &Origin, ciphertext: &[u8]) -> Option<Vec<u8>> {
@@ -2031,37 +2236,7 @@ impl Engine {
         let Some(fp) = fp else {
             return;
         };
-        let payload_hash8 = {
-            let d = Sha256::digest(&packet.payload);
-            hex::encode(&d[..8])
-        };
-        let transfer_key = format!(
-            "{}-{}-{}",
-            hex::encode(packet.sender_id),
-            packet.timestamp,
-            payload_hash8
-        );
-        if self.seen_files.len() > SEEN_CAP {
-            self.seen_files.clear();
-        }
-        if !self.seen_files.insert(transfer_key.clone()) {
-            return;
-        }
-        let Some(file) = mesh::file_packet::FilePacket::decode(&packet.payload) else {
-            return;
-        };
-        if file.content.is_empty() || file.content.len() > MAX_FILE_TRANSFER_BYTES {
-            return;
-        }
-        out.events.push(AppEvent::FileReceived {
-            fingerprint: fp,
-            transfer_key,
-            message_id: file.message_id,
-            file_name: file.file_name,
-            mime_type: file.mime_type,
-            content: file.content,
-            timestamp_ms: packet.timestamp,
-        });
+        self.emit_file(fp, packet.sender_id, packet.timestamp, &packet.payload, out);
     }
 
     fn handle_sonar(
@@ -2098,6 +2273,10 @@ impl Engine {
         if !self.fp_allowed(&fp) {
             return;
         }
+        if self.sonar_fps.len() >= IDENTITY_MAP_CAP {
+            self.sonar_fps.clear();
+        }
+        self.sonar_fps.insert(fp.to_lowercase());
         out.events.push(AppEvent::SonarPayload {
             fingerprint: fp,
             payload: packet.payload.clone(),
@@ -2198,6 +2377,21 @@ mod tests {
 
     fn fp_of(e: &Engine) -> String {
         Engine::fingerprint_of(&e.noise_public_hex)
+    }
+
+    /// Let A learn that B is a Sonar peer: B's signed 0x53 arrives on the
+    /// established link (the shape of the payload is irrelevant here, the
+    /// Ed25519 signature against B's announce key is what verifies).
+    fn mark_sonar(a: &mut Engine, b: &mut Engine, link: &LinkId, now: u64) {
+        b.set_sonar_payload(Some(vec![0x01, 1, 1, 0x02, 32]), now);
+        let sonar = b.sonar_bytes(now).expect("sonar announce");
+        let out = a.on_client_rx(&link.conn, link.instance, &sonar, now);
+        assert!(
+            out.events.iter().any(|e| matches!(e, AppEvent::SonarPayload { .. })),
+            "verified 0x53 must surface, got {:?}",
+            out.events
+        );
+        assert!(a.peer_is_sonar(&fp_of(b)));
     }
 
     /// #416 at the REAL call site (Regression Invariant Rule: pin the call
@@ -2452,7 +2646,11 @@ mod tests {
     fn send_text_with_reply_round_trips_parent_id() {
         let mut a = engine(1, "pixel");
         let mut b = engine(9, "vincent-osx");
-        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        // The reply parent is a Sonar TLV extension (0x04) that stock bitchat
+        // rejects outright, so it only goes to a peer that proved it is Sonar
+        // with a verified 0x53.
+        mark_sonar(&mut a, &mut b, &link, 1_000);
 
         let out = a
             .send_text_with_reply(&fp_of(&b), "child-1", "ok", Some("parent-mid"), 2_000)
@@ -2488,8 +2686,13 @@ mod tests {
         // The derived chunk size is only correct while the measured per-write
         // overhead is. Assert it directly so a header change fails here rather
         // than silently pushing fragments into the 512-byte bucket in the field.
+        // High-entropy fixture: a Noise ciphertext never compresses, and a
+        // compressible probe would measure a shorter frame than the field sees.
+        let noise_like: Vec<u8> = (0..FRAGMENT_CHUNK_SIZE as u32 * 3)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         let frags = mesh::file_packet::fragment(
-            &vec![0u8; FRAGMENT_CHUNK_SIZE * 3],
+            &noise_like,
             [9u8; 8],
             msg_type::NOISE_ENCRYPTED,
             FRAGMENT_CHUNK_SIZE,
@@ -2498,7 +2701,7 @@ mod tests {
         let mut probe = mesh::Packet::new(msg_type::FRAGMENT, DEFAULT_TTL, 1_000, [1u8; 8]);
         probe.recipient_id = Some([2u8; 8]);
         probe.payload = frags[0].encode_payload();
-        let encoded = probe.encode().expect("encode").len();
+        let encoded = probe.encode_wire().expect("encode").len();
         assert_eq!(
             encoded - FRAGMENT_CHUNK_SIZE,
             FRAGMENT_PACKET_OVERHEAD_BYTES,
@@ -2564,6 +2767,9 @@ mod tests {
         let mut a = engine(1, "pixel");
         let mut b = engine(9, "iphone");
         let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        // The media receipt rides on the 0x05 message-id TLV, a Sonar
+        // extension that only goes to a verified Sonar peer.
+        mark_sonar(&mut a, &mut b, &link, 1_000);
 
         let text_ack = b
             .send_delivery_ack(&fp_of(&a), "text-mid", 2_000)
@@ -2628,8 +2834,8 @@ mod tests {
     #[test]
     fn two_instances_on_one_connection_are_distinct_peers() {
         let mut a = engine(1, "pixel");
-        let mut sonar_mac = engine(5, "Vincenzo-Mac");
-        let mut bitchat_mac = engine(9, "vincent-osx");
+        let sonar_mac = engine(5, "Vincenzo-Mac");
+        let bitchat_mac = engine(9, "vincent-osx");
         let now = 1_000;
         a.on_dial_request("84:2F", now);
         a.on_client_connected("84:2F", now);
@@ -2837,7 +3043,7 @@ mod tests {
         let bytes = {
             let mut p = mesh::Packet::new(msg_type::MESSAGE, DEFAULT_TTL, now, sender.my_peer_id);
             p.payload = b"hello mesh".to_vec();
-            assert!(mesh::sign_packet(&mut p, &sender.signer));
+            mesh::sign_packet(&mut p, &sender.signer).unwrap();
             p.encode().unwrap()
         };
         let out = a.on_client_rx("84:2F", 25, &bytes, now);
@@ -3042,22 +3248,17 @@ mod tests {
         let sender_hex = mesh::peer_id_from_noise_key(noise_pub);
         let mut sender_id = [0u8; 8];
         hex::decode_to_slice(&sender_hex, &mut sender_id).expect("peer id hex");
-        let announce = mesh::Announce {
-            nickname: nick.to_string(),
-            noise_public_key: noise_pub.to_vec(),
-            signing_public_key: signer.public_key().to_vec(),
-            direct_neighbors: None,
-        };
+        let announce = mesh::Announce::new(nick.to_string(), noise_pub.to_vec(), signer.public_key().to_vec());
         let mut p = mesh::Packet::new(msg_type::ANNOUNCE, ttl, now, sender_id);
         p.payload = announce.encode().expect("announce encode");
-        assert!(mesh::sign_packet(&mut p, signer), "sign announce");
+        mesh::sign_packet(&mut p, signer).expect("sign announce");
         p.encode().expect("packet encode")
     }
 
     fn broadcast_from(sender_id: [u8; 8], text: &str, ts: u64, signer: &mesh::MeshSigner) -> Vec<u8> {
         let mut p = mesh::Packet::new(msg_type::MESSAGE, DEFAULT_TTL, ts, sender_id);
         p.payload = text.as_bytes().to_vec();
-        assert!(mesh::sign_packet(&mut p, signer), "sign broadcast");
+        mesh::sign_packet(&mut p, signer).expect("sign broadcast");
         p.encode().expect("packet encode")
     }
 
@@ -3204,5 +3405,233 @@ mod tests {
             Some(&attacker_signing),
             "attacker signing key must never own the victim's fingerprint"
         );
+    }
+
+    /// Deliver every write A emitted to B's server leg and return B's events.
+    fn deliver_to_b(b: &mut Engine, out: &Output, now: u64) -> Vec<AppEvent> {
+        let mut got = Vec::new();
+        for c in &out.commands {
+            if let Command::WriteLink { bytes, .. } = c {
+                got.extend(b.on_server_rx("droid", bytes, now).events);
+            }
+        }
+        got
+    }
+
+    /// Both reference clients compress a payload of 100+ low-entropy bytes and
+    /// sign the COMPRESSED frame. The old Rust decoder returned `None` on the
+    /// compressed flag, so every such packet from a Sonar iPhone (or stock
+    /// bitchat) vanished on Android — the first half of the Sonar iOS ↔
+    /// Android incompatibility. A 120-byte repetitive nickname makes the
+    /// announce compressible; it must be decoded, verified against the signing
+    /// key carried inside it, and surfaced.
+    #[test]
+    fn compressed_announce_from_a_reference_encoder_is_accepted() {
+        let mut a = engine(1, "pixel");
+        let b = engine(9, &"iphone-".repeat(18));
+        let ann = b.announce_bytes(1_000).expect("announce");
+        assert_ne!(ann[11] & mesh::flags::IS_COMPRESSED, 0, "fixture must be a compressed frame");
+        a.on_dial_request("84:2F", 1_000);
+        a.on_client_connected("84:2F", 1_000);
+        a.on_instances_discovered("84:2F", &[34], 1_000);
+        a.on_subscribe_result("84:2F", 34, true, 1_000);
+        let out = a.on_client_rx("84:2F", 34, &ann, 1_000);
+        assert!(
+            out.events.iter().any(|e| matches!(e, AppEvent::PeerAnnounced { .. })),
+            "compressed, signed announce must verify and surface, got {:?}",
+            out.events
+        );
+    }
+
+    /// Our own frames follow the reference padding policy: Noise frames are
+    /// padded to a PKCS#7 bucket, everything else travels at natural length.
+    #[test]
+    fn only_noise_frames_are_padded_on_the_wire() {
+        let a = engine(1, "pixel");
+        let ann = a.announce_bytes(1_000).unwrap();
+        assert!(ann.len() < 256, "announce must not be padded to a bucket: {}", ann.len());
+        let hs = mesh::handshake_packet([1; 8], [2; 8], DEFAULT_TTL, 1, vec![0u8; 48]);
+        assert_eq!(hs.encode_wire().unwrap().len(), 256);
+    }
+
+    /// After the handshake both sides prove their capabilities inside the
+    /// session (Noise 0x21). With PRIVATE_MEDIA proven, media rides encrypted
+    /// as Noise 0x20 instead of a plaintext signed 0x22, and the receiver
+    /// surfaces it through the same FileReceived event. The 0x05 message-id
+    /// TLV stays off for a peer that never sent a Sonar 0x53.
+    #[test]
+    fn media_goes_encrypted_once_the_peer_proved_private_media() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        assert!(a.proven_capabilities(&fp_of(&b)).contains(PeerCapabilities::PRIVATE_MEDIA));
+        assert!(b.proven_capabilities(&fp_of(&a)).contains(PeerCapabilities::PRIVATE_MEDIA));
+
+        let media = vec![0x42; FRAGMENT_CHUNK_SIZE * 3];
+        let send = a
+            .send_file(&fp_of(&b), "mid", &media, "photo.jpg", "image/jpeg", 3_000)
+            .expect("media route");
+        // Every frame on the wire is a Noise 0x11 (or a fragment of one); the
+        // file TLV never appears in plaintext.
+        for c in &send.commands {
+            if let Command::WriteLink { bytes, .. } = c {
+                let p = mesh::Packet::decode(bytes).unwrap();
+                match p.type_ {
+                    // `discovery_to_route` refreshes our announce first.
+                    msg_type::ANNOUNCE | msg_type::SONAR_ANNOUNCE => continue,
+                    msg_type::NOISE_ENCRYPTED => {}
+                    msg_type::FRAGMENT => {
+                        let f = mesh::fragment::Fragment::decode_payload(&p.payload).unwrap();
+                        assert_eq!(f.original_type, msg_type::NOISE_ENCRYPTED);
+                    }
+                    other => panic!("plaintext frame type {other:#x} on an encrypted media send"),
+                }
+                assert!(
+                    !bytes.windows(9).any(|w| w == b"photo.jpg"),
+                    "file name leaked in plaintext"
+                );
+            }
+        }
+        let got = deliver_to_b(&mut b, &send, 3_000);
+        let file = got
+            .iter()
+            .find_map(|e| match e {
+                AppEvent::FileReceived { content, message_id, file_name, .. } => Some((content.clone(), message_id.clone(), file_name.clone())),
+                _ => None,
+            })
+            .expect("encrypted media surfaces as FileReceived");
+        assert_eq!(file.0, media);
+        assert_eq!(file.1, None, "message-id TLV is a Sonar extension; b never sent a 0x53");
+        assert_eq!(file.2.as_deref(), Some("photo.jpg"));
+    }
+
+    /// A peer that proved nothing (no 0x21 — a stock bitchat build that
+    /// predates it) still gets the legacy signed plaintext 0x22.
+    #[test]
+    fn media_falls_back_to_signed_plaintext_without_a_proof() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        a.proven_caps.clear(); // as if b were an older client
+        let send = a
+            .send_file(&fp_of(&b), "mid", &[7u8; 64], "n.bin", "application/octet-stream", 3_000)
+            .unwrap();
+        let p = send
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::WriteLink { bytes, .. } => mesh::Packet::decode(bytes).ok(),
+                _ => None,
+            })
+            .find(|p| !matches!(p.type_, msg_type::ANNOUNCE | msg_type::SONAR_ANNOUNCE))
+            .expect("a media frame after the discovery refresh");
+        assert_eq!(p.type_, msg_type::FILE_TRANSFER);
+        assert!(p.signature.is_some(), "legacy raw files must be signed");
+        assert!(mesh::verify_packet(&p, &a.signer.public_key()));
+        let got = deliver_to_b(&mut b, &send, 3_000);
+        assert!(got.iter().any(|e| matches!(e, AppEvent::FileReceived { .. })));
+    }
+
+    /// Stock bitchat rejects a private message carrying a TLV it does not
+    /// know and cannot carry a field over 255 bytes. To a peer that never sent
+    /// a Sonar 0x53, a 600-byte text is delivered as three legacy-sized
+    /// messages (`id`, `id#2`, `id#3`) and the reply parent is not sent.
+    #[test]
+    fn long_text_and_replies_to_a_stock_peer_use_only_legacy_tlvs() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        let text: String = (0..600).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let out = a
+            .send_text_with_reply(&fp_of(&b), "m1", &text, Some("parent"), 3_000)
+            .expect("route");
+        let got = deliver_to_b(&mut b, &out, 3_000);
+        let msgs: Vec<(String, String, Option<String>)> = got
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::TextReceived { message_id, content, reply_to, .. } => {
+                    Some((message_id.clone(), content.clone(), reply_to.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert_eq!(msgs[0].0, "m1");
+        assert_eq!(msgs[1].0, "m1#2");
+        assert_eq!(msgs[2].0, "m1#3");
+        assert!(msgs.iter().all(|m| m.1.len() <= mesh::LEGACY_MAX_FIELD_BYTES));
+        assert!(msgs.iter().all(|m| m.2.is_none()), "reply parent must not reach a stock peer");
+        assert_eq!(msgs.iter().map(|m| m.1.as_str()).collect::<String>(), text);
+        // Nothing but Noise frames (or fragments of them, since a padded
+        // 512-byte Noise bucket exceeds one GATT write) went on the air.
+        for c in &out.commands {
+            if let Command::WriteLink { bytes, .. } = c {
+                let p = mesh::Packet::decode(bytes).unwrap();
+                match p.type_ {
+                    msg_type::NOISE_ENCRYPTED => {}
+                    msg_type::FRAGMENT => {
+                        let f = mesh::fragment::Fragment::decode_payload(&p.payload).unwrap();
+                        assert_eq!(f.original_type, msg_type::NOISE_ENCRYPTED);
+                    }
+                    other => panic!("unexpected frame type {other:#x}"),
+                }
+            }
+        }
+    }
+
+    /// The same text and reply to a peer that sent a verified Sonar 0x53 go
+    /// out as ONE message with the extended TLVs.
+    #[test]
+    fn sonar_peer_receives_extended_tlvs_in_one_message() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        b.set_sonar_payload(Some(vec![0x01, 1, 1, 0x02, 32]), 1_000); // shape irrelevant: signature is what counts
+        let sonar = b.sonar_bytes(1_000).unwrap();
+        let out = a.on_client_rx(&link.conn, link.instance, &sonar, 1_000);
+        assert!(out.events.iter().any(|e| matches!(e, AppEvent::SonarPayload { .. })));
+        assert!(a.peer_is_sonar(&fp_of(&b)));
+
+        let text = "x".repeat(600);
+        let out = a
+            .send_text_with_reply(&fp_of(&b), "m1", &text, Some("parent"), 3_000)
+            .unwrap();
+        let got = deliver_to_b(&mut b, &out, 3_000);
+        let msgs: Vec<&AppEvent> = got
+            .iter()
+            .filter(|e| matches!(e, AppEvent::TextReceived { .. }))
+            .collect();
+        assert_eq!(msgs.len(), 1);
+        match msgs[0] {
+            AppEvent::TextReceived { message_id, content, reply_to, .. } => {
+                assert_eq!(message_id, "m1");
+                assert_eq!(content, &text);
+                assert_eq!(reply_to.as_deref(), Some("parent"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// A lost BLE frame must not kill the session: the receiver accepts the
+    /// next nonce (gap) and the late one inside the window, like the reference
+    /// clients' sliding window. The old strict counter rejected everything
+    /// after one loss until a new handshake.
+    #[test]
+    fn a_lost_frame_does_not_kill_the_noise_session() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        let first = a.send_text(&fp_of(&b), "m1", "one", 3_000).unwrap();
+        let second = a.send_text(&fp_of(&b), "m2", "two", 3_001).unwrap();
+        let third = a.send_text(&fp_of(&b), "m3", "three", 3_002).unwrap();
+        // "two" is lost on the air; "three" arrives, then "one" late.
+        let got3 = deliver_to_b(&mut b, &third, 3_002);
+        assert!(got3.iter().any(|e| matches!(e, AppEvent::TextReceived { content, .. } if content == "three")));
+        let got1 = deliver_to_b(&mut b, &first, 3_003);
+        assert!(got1.iter().any(|e| matches!(e, AppEvent::TextReceived { content, .. } if content == "one")));
+        // A replay of the late frame is rejected.
+        let again = deliver_to_b(&mut b, &first, 3_004);
+        assert!(!again.iter().any(|e| matches!(e, AppEvent::TextReceived { .. })));
+        drop(second);
     }
 }
