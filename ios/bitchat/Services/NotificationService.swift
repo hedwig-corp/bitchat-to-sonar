@@ -146,7 +146,17 @@ final class NotificationService {
         }
         content.interruptionLevel = interruptionLevel
 
-        if let userInfo = userInfo {
+        if var userInfo = userInfo {
+            // Every conversation banner names the account that produced it: a
+            // tap after a switch must open it in THAT account, never in
+            // whichever one is active by then (it could reply as the wrong
+            // identity). The extension stamps its own; this covers the app.
+            if SonarNotificationHandoff.conversationId(from: userInfo) != nil,
+               userInfo[SonarNotificationKeys.accountPubkey] == nil,
+               let active = SonarAccountRegistry.snapshot().active?.pubkeyHex,
+               active.count == 64 {
+                userInfo[SonarNotificationKeys.accountPubkey] = active
+            }
             content.userInfo = userInfo
         }
 

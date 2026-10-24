@@ -2352,6 +2352,9 @@ final class SonarAppStore: ObservableObject {
         defaults.removeObject(forKey: Keys.legacyDemoState)
         callLogs = Self.loadCallLogs(from: defaults)
         syncNotificationPrefsToAppGroup()
+        // Replay a per-account record a crash mid-switch left behind, before
+        // anything paints the values it holds.
+        recoverParkedAccountStateIfNeeded()
 
         // Internet fallback for private mesh media sends: when the BLE route
         // drops between route selection and send, ChatViewModel hands the
@@ -3457,21 +3460,26 @@ final class SonarAppStore: ObservableObject {
     /// target's store opens local-first. On failure the previous account is
     /// already reopened by the chat model and its wallets restart here.
     func switchAccount(to pubkeyHex: String) async throws {
-        guard SonarAccountRegistry.snapshot().active?.pubkeyHex != pubkeyHex else { return }
+        let leaving = SonarAccountRegistry.snapshot().active?.pubkeyHex
+        guard leaving != pubkeyHex else { return }
         try beginAccountChange()
         defer { endAccountChange() }
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
         defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
         try await releaseWalletsForAccountChange()
-        clearAccountBoundLocalStateForRestore()
+        if let leaving { parkAccountLocalState(leaving) }
+        clearAccountBoundLocalStateForRestore(preservingDeviceState: true)
         do {
             try await marmot.switchAccount(toPubkeyHex: pubkeyHex)
         } catch {
+            // Still the previous account: its values come back.
+            if let leaving { unparkAccountLocalState(leaving) }
             wallet.start()
             legacyWallets.refresh()
             refreshAccounts()
             throw SonarAccountRestoreError.accountSwitchFailed(error.localizedDescription)
         }
+        unparkAccountLocalState(pubkeyHex)
         finishAccountChange()
     }
 
@@ -3494,19 +3502,27 @@ final class SonarAppStore: ObservableObject {
         if let key { _ = try SonarIdentity.import(nsec: key) }
         try beginAccountChange()
         defer { endAccountChange() }
+        let leaving = SonarAccountRegistry.snapshot().active?.pubkeyHex
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
         defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
         try await releaseWalletsForAccountChange()
-        clearAccountBoundLocalStateForRestore()
+        if let leaving { parkAccountLocalState(leaving) }
+        clearAccountBoundLocalStateForRestore(preservingDeviceState: true)
         let outcome: AccountBackupRestoreOutcome
         do {
             outcome = try await marmot.addAccount(nsec: key, label: label).backup
         } catch {
+            if let leaving { unparkAccountLocalState(leaving) }
             wallet.start()
             legacyWallets.refresh()
             refreshAccounts()
             if let registryError = error as? SonarAccountRegistry.RegistryError { throw registryError }
             throw SonarAccountRestoreError.accountSwitchFailed(error.localizedDescription)
+        }
+        // A new account has no record (its values stay reset); the key of an
+        // account already on this phone (R-023) gets its own back.
+        if let added = SonarAccountRegistry.snapshot().active?.pubkeyHex {
+            unparkAccountLocalState(added)
         }
         finishAccountChange()
         switch outcome {
@@ -3538,7 +3554,16 @@ final class SonarAppStore: ObservableObject {
         }
         try beginAccountChange()
         defer { endAccountChange() }
-        _ = try SonarAccountRegistry.remove(pubkey: pubkeyHex, keychain: keychain)
+        do {
+            _ = try SonarAccountRegistry.remove(pubkey: pubkeyHex, keychain: keychain)
+        } catch SonarAccountRegistry.RegistryError.secretCleanupPending {
+            // The account IS gone (its row and store); only a keychain delete
+            // is pending a retry. Its parked values go with it.
+            SonarAccountLocalState.clearRecord(for: pubkeyHex, defaults: defaults)
+            refreshAccounts()
+            throw SonarAccountRegistry.RegistryError.secretCleanupPending
+        }
+        SonarAccountLocalState.clearRecord(for: pubkeyHex, defaults: defaults)
         refreshAccounts()
     }
 
@@ -3564,6 +3589,54 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Shared suffix of restore / switch / add once the new store is open.
+    /// Live UserDefaults keys that hold ONE account's values (see
+    /// `SonarAccountLocalState`). Mirror of Compose `parkedLocalValues`.
+    private var parkedDefaultsKeys: [String] {
+        [
+            Keys.bip353,
+            MarmotAccountBackupFlow.cellularOptInKey,
+            SonarPaymentActivityLedger.defaultsKey,
+            Keys.callLogs,
+        ]
+    }
+    /// The nickname lives in `ChatViewModel`'s defaults; parked as a field.
+    private static let parkedNicknameField = "nickname"
+
+    /// Set `pubkeyHex`'s per-account values aside, BEFORE the clear resets them.
+    private func parkAccountLocalState(_ pubkeyHex: String) {
+        var record = SonarAccountLocalState.capture(keys: parkedDefaultsKeys, from: defaults)
+        record[Self.parkedNicknameField] = chatViewModel.persistedNickname
+        SonarAccountLocalState.park(record, for: pubkeyHex, defaults: defaults)
+    }
+
+    /// Bring `pubkeyHex`'s values back (if it has a record) and reload the
+    /// in-memory copies either way: the clear reset them.
+    private func unparkAccountLocalState(_ pubkeyHex: String) {
+        if let record = SonarAccountLocalState.record(for: pubkeyHex, defaults: defaults) {
+            SonarAccountLocalState.apply(record, keys: parkedDefaultsKeys, to: defaults)
+            chatViewModel.restoreNicknameAfterAccountSwitch(record[Self.parkedNicknameField] as? String ?? "")
+            SonarAccountLocalState.clearRecord(for: pubkeyHex, defaults: defaults)
+        }
+        reloadParkedLocalState()
+    }
+
+    private func reloadParkedLocalState() {
+        bip353 = defaults.string(forKey: Keys.bip353) ?? ""
+        paymentActivityLedger.reload()
+        callLogs = Self.loadCallLogs(from: defaults)
+        objectWillChange.send()
+    }
+
+    /// A switch that died between parking and restoring left the active
+    /// account's values in its record: replay it. No record (the normal case)
+    /// costs one defaults read.
+    func recoverParkedAccountStateIfNeeded() {
+        guard let active = SonarAccountRegistry.snapshot().active?.pubkeyHex,
+              SonarAccountLocalState.record(for: active, defaults: defaults) != nil
+        else { return }
+        unparkAccountLocalState(active)
+    }
+
     private func finishAccountChange() {
         legacyWallets.armRestoreCheck()
         wallet.start()
@@ -3796,7 +3869,15 @@ final class SonarAppStore: ObservableObject {
         showToast(String(localized: "Chat backup is on — encrypted backups upload automatically. Manage in Settings."))
     }
 
-    private func clearAccountBoundLocalStateForRestore() {
+    /// `preservingDeviceState` is true for a switch or an add: the account
+    /// being left keeps everything on disk. Device-level state (mesh
+    /// transcripts, verification marks, BLE chat keys, peer profiles, mutes,
+    /// the payment-bubble ledger, the media cache) is shared by every account
+    /// on the phone — the BLE/Noise identity is — so it is neither cleared nor
+    /// rewritten; its per-account values were parked beforehand
+    /// (`parkAccountLocalState`). A restore REPLACES the account and passes
+    /// false: everything goes, as before.
+    private func clearAccountBoundLocalStateForRestore(preservingDeviceState: Bool = false) {
         // "Back up over cellular" is consent from ONE account to spend the
         // user's data plan. Restoring account B must not inherit account A's
         // answer — B never gave it. Panic wipe clears this too; both paths
@@ -3806,7 +3887,7 @@ final class SonarAppStore: ObservableObject {
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
-        chatViewModel.clearAllConversations()
+        if !preservingDeviceState { chatViewModel.clearAllConversations() }
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
         refreshingDMTasks.values.forEach { $0.cancel() }
@@ -3827,15 +3908,17 @@ final class SonarAppStore: ObservableObject {
         marmot.groups = []
         marmot.messagesByGroup = [:]
 
-        marmotVerified = [:]
-        defaults.removeObject(forKey: Keys.marmotVerified)
-        defaults.removeObject(forKey: Keys.bleKnownChatKeys)
-        sonarProfiles = [:]
-        sonarProfilesByFingerprint = [:]
+        if !preservingDeviceState {
+            marmotVerified = [:]
+            defaults.removeObject(forKey: Keys.marmotVerified)
+            defaults.removeObject(forKey: Keys.bleKnownChatKeys)
+            sonarProfiles = [:]
+            sonarProfilesByFingerprint = [:]
+            defaults.removeObject(forKey: Keys.sonarProfiles)
+        }
         invalidatePeerKeysIndex()
         meshPeerFirstSeenAt = [:]
         pendingCapabilityRefreshKeys = []
-        defaults.removeObject(forKey: Keys.sonarProfiles)
         applyBLEDiscoveryPolicy()
 
         unify.stop()
@@ -3860,16 +3943,20 @@ final class SonarAppStore: ObservableObject {
         scannedTrillMessageIDs = []
         trillCooldownUntilByChat = [:]
         SonarTrillThrottle.shared.reset()
-        SonarChatMuteStore.shared.wipe()
+        if !preservingDeviceState {
+            SonarChatMuteStore.shared.wipe()
+            payLedger.wipe()
+        }
         pendingPayPeer = nil
-        payLedger.wipe()
+        // Wallet activity is per account: parked before a switch.
         paymentActivityLedger.wipe()
         clearPaymentStatusState()
         cancelAllMediaDownloads()
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
-        clearMediaDiskCache()
+        if !preservingDeviceState { clearMediaDiskCache() }
         SNDecodedMediaCache.shared.clear()
+        // Per account: parked before a switch.
         clearCallLogs()
         resetCallState()
         bip353 = ""
@@ -12128,6 +12215,8 @@ final class SonarAppStore: ObservableObject {
             return
         }
         defer { endAccountChange() }
+        // Every account's parked values go with the accounts.
+        SonarAccountLocalState.discardAll(defaults: defaults)
         // Every account's keychain names, captured BEFORE the Marmot wipe
         // removes the registry they are read from.
         let accountNsecKeys = SonarAccountRegistry.allKeychainKeysForWipe()

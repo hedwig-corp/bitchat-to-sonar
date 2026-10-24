@@ -26,6 +26,7 @@ actual object Notifier {
     @Volatile private var trayIcon: TrayIcon? = null
     private val lastConversationId = AtomicReference<String?>(null)
     private val lastMessageId = AtomicReference<String?>(null)
+    private val lastAccountPubkeyHex = AtomicReference<String?>(null)
     private val soundGeneration = AtomicLong()
     private val soundExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "sonar-notification-sound").apply { isDaemon = true }
@@ -55,6 +56,7 @@ actual object Notifier {
                             SonarLifecycle.submitOpenConversation(
                                 conversationId = chatId,
                                 jumpMessageId = lastMessageId.get(),
+                                accountPubkeyHex = lastAccountPubkeyHex.get(),
                             )
                         }
                     },
@@ -89,6 +91,9 @@ actual object Notifier {
         if (!conversationId.isNullOrBlank()) {
             lastConversationId.set(conversationId)
             lastMessageId.set(SonarNotificationHandoff.normalizeJumpMessageId(messageId))
+            // The account that produced it, so a click after a switch opens
+            // it in THAT account rather than whichever one is active then.
+            lastAccountPubkeyHex.set(accountPubkeyHex ?: activeAccountPubkeyHexForNotification())
         }
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
@@ -106,6 +111,7 @@ actual object Notifier {
         if (last != null && last in cleared) {
             if (lastConversationId.compareAndSet(last, null)) {
                 lastMessageId.set(null)
+                lastAccountPubkeyHex.set(null)
             }
         }
     }

@@ -1350,6 +1350,37 @@ Noise shape). Core registry `sonar_core::accounts` (`<data dir>/accounts.json`,
   per-tag items are manual.
 - **Origin:** PR multi-account switcher (2026-10-15).
 
+### QA-175 — Switching away and back keeps the first account's local data
+- **Platforms:** iOS, Android, desktop.
+- **Steps:** on account A, set a nickname and a handle, turn on "Back up over
+  cellular", mark a chat verified, mute a chat, receive a mesh DM over BLE,
+  make one wallet payment, place one call. Switch to account B (new or
+  existing), then switch back to A. Also kill the app between the two
+  switches once.
+- **Expect:** back on A, the nickname, handle, cellular consent, wallet
+  activity and call log are A's again, and the verified mark, the mute and
+  the mesh transcript are still there. On B none of A's own values show:
+  B's nickname, handle, consent, wallet activity and call log are B's (empty
+  for a new account). Mesh transcripts, verification marks and mutes are
+  device-level (the BLE identity is shared) and show on both. Before the fix
+  a switch ran the restore teardown and deleted all of it.
+- **Guard:** `AccountLocalStateParkingTest.switchAwayAndBackRestoresTheLeavingAccountsValues`,
+  `SonarAccountLocalStateTests.testSwitchAwayAndBackRestoresTheLeavingAccountsValues`
+- **Origin:** codex (gpt-6-astra) review of the multi-account switcher PR (2026-10-24).
+
+### QA-176 — An old banner opens in the account that produced it
+- **Platforms:** iOS, Android, desktop.
+- **Steps:** on account A, receive a message in a group that B is also a
+  member of, and leave the banner in the notification shade. Switch to B,
+  then tap A's banner. Repeat with the app in the foreground (in-app banner)
+  and backgrounded (push banner).
+- **Expect:** the app switches to A and opens the chat there; replying sends
+  as A. Before the fix active-account banners carried no account, so the tap
+  opened the chat in B and a reply went out as B.
+- **Guard:** none automated (the stamp is on the notification post paths);
+  manual on each platform.
+- **Origin:** codex (gpt-6-astra) review of the multi-account switcher PR (2026-10-24).
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs

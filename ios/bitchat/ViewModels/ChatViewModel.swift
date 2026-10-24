@@ -799,6 +799,22 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     /// keeping the previous account's nick would publish over it.
     /// Persist an empty string (do not remove the key) so relaunch does not
     /// treat this as a first install and mint a random anon nick.
+    /// The stored nickname, for parking it with the account on a switch.
+    var persistedNickname: String {
+        userDefaults.string(forKey: nicknameKey) ?? ""
+    }
+
+    /// Put back the nickname an account had when it was switched away from.
+    /// Empty stays empty (kind-0 hydrate fills it), never a minted anon name.
+    func restoreNicknameAfterAccountSwitch(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        nickname = trimmed
+        userDefaults.set(trimmed, forKey: nicknameKey)
+        if !meshService.myPeerID.isEmpty {
+            meshService.setNickname(trimmed)
+        }
+    }
+
     func clearNicknameForAccountRestore() {
         nickname = ""
         userDefaults.set("", forKey: nicknameKey)

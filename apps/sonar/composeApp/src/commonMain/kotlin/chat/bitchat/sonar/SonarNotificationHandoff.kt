@@ -80,3 +80,9 @@ object SonarNotificationHandoff {
     fun normalizeJumpMessageId(messageId: String?): String? =
         messageId?.trim()?.takeIf { it.isNotEmpty() }
 }
+
+/** The active account at post time, for a banner whose caller did not name
+ *  one. Null on a single-account install without a registry (the tap then
+ *  opens in the only account) or when the registry cannot be read. */
+internal fun activeAccountPubkeyHexForNotification(): String? =
+    runCatching { SonarCore.accounts().active?.pubkeyHex }.getOrNull()?.takeIf { it.length == 64 }

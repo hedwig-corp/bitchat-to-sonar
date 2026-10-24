@@ -73,6 +73,20 @@ the registry through the FFI and tries the active account first, then the
 others with a short budget, keeping the single App Group store lock for the
 whole pass. Cap: `MAX_ACCOUNTS = 5`.
 
+Host state outside the Marmot store splits in two on a switch. Device-level
+state stays where it is and is shared by every account, because the BLE/Noise
+identity is: mesh transcripts and media, links and mesh names, verification
+marks, mutes, the payment-bubble ledger, peer profile and descriptor caches,
+the media cache. The few values that belong to one account (nickname, handle,
+cellular-backup consent, wallet activity, and on iOS the call log) are copied
+into a per-account record before the switch resets them and copied back when
+that account is active again: `AccountLocalStateParking` (Compose, blob
+`accounts.parked.<hex>`) and `SonarAccountLocalState` (iOS, UserDefaults
+`sonar.accounts.parked.<hex>`). Every launch replays a record left for the
+active account by a crash mid-switch; removing an account drops its record;
+the panic wipe drops them all. A restore replaces the account and still clears
+everything.
+
 ## Build flags (baked into `core/build-ios.sh`)
 
 The script unsets the OpenSSL discovery env vars before building so the Apple

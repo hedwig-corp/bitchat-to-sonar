@@ -1073,93 +1073,107 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "Another account change is still finishing. Try again in a moment."
                 return@launch
             }
-            endTranscriptSession()
-            relayConnectJob?.cancel(); relayConnectJob = null
-            resetStartupFlags()
-            refreshRelayOnline()
-            val marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
+            // HOLD the gate for the whole wipe, not just the check: the wipe
+            // suspends (delivery cancel, wallet cleanup) before it resets the
+            // app, and a switch or add acquiring the free gate in that window
+            // would open an account the wipe then deletes underneath it.
+            beginAccountChange()
             try {
-            cancelPendingMarmotSetups()
-            cancelPendingMarmotGroupSetups()
-            val (walletShutdownFailure, walletWipeFailure) = wipeWalletStorage()
-            UnifyRadio.stopScanning()
-            UnifyRadio.stopAdvertising()
-            unifyOffer = null; unifyPeers = emptyList()
-            nearbyPeerRefreshJob?.cancel(); nearbyPeerRefreshJob = null
-            // Gate push invalidation before MeshRadio.stop() — stop notifies the
-            // peer listener, which must not re-persist wiped mesh names/links.
-            onboarded = false; started = false
-            chat.bitchat.sonar.backup.setLiveUiSessionForAutoBackup(false)
-            chat.bitchat.sonar.backup.cancelPlatformAutoBackupWork()
-            // Panic wipe must not leave disclosure armed for the next account.
-            SonarCore.saveBlob("pref.$AUTO_BACKUP_DISCLOSED_PREF", "0")
-            // Same rule for the cellular opt-in: it is a per-account consent to
-            // spend the user's data plan, and the next account never gave it.
-            SonarCore.saveBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF, "0")
-            backupOverCellular = false
-            MeshRadio.stop()
-            MeshRadio.setMeshNickname("")
-            MeshRadio.discardPendingDeliverySignals()
-            MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
-            meshPeers = emptyList()
-            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-            meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
-            foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
-            persistLinks(); persistLinkCaps(); persistGroupFolds()
-            updateBleDiscoveryPolicy()
-            // Bump BEFORE the suspending write: persistSonarDescriptorCacheNow()
-            // suspends, and an in-flight fetch resuming in that window would
-            // otherwise still pass performDescriptorFetch's generation guard and
-            // repopulate the map we just cleared.
-            sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
-            sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
-            publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
-            needsSonarDescriptorPublish = false
-            rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
-            profilesByNpub = emptyMap(); profileFetches.clear()
-            socialState = SonarSocialState(); persistSocialState()
-            pendingMarmotChatNpubs = emptyMap()
-            pendingMarmotGroups = emptyMap()
-            pendingDirectMarmotSends.clear()
-            pendingMarmotGroupSends.clear()
-            outbox.clear()
-            MessageStore.wipe()
-            // Redact all visible/account-bound host state before the fallible
-            // durable wipe. A filesystem error must never leave old chats or
-            // sticker bytes painted after credentials have been cleared.
-            stack = listOf(Screen.Home)
-            chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear()
-            timezoneShareByChat = emptyMap(); lastSharedSystemTimezone = null; peerTimezonesByGroup = emptyMap()
-            clearChatSnapshot()
-            cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
-            mediaCache.clear(); clearStickerCaches()
-            val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
-            nick = ""; npub = ""
-            localCoreReady = false; homeMessagesHydrated = false
-            walletState = WalletState.NotConfigured
-            walletOnline = false; walletBalanceDetails = null; cashuOffer = null
-            lastIncomingWalletPayment = null
-            legacyWallet = LegacyWalletSnapshot(); legacyDeleteGate = null
-            resetHandleAddressState()
-            // Money prefs died with SonarCore.wipe(); mirror the defaults.
-            showFiat = false; currency = FiatCurrency.USD; rate = null
-            presenceByGeohash = emptyMap()
-            payLedger = SonarPayLedger(); payVersion++
-            PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
-            clearPaymentStatusState()
-            mutedUntilByChat = emptyMap() // blob dies with SonarCore.wipe()
-            bip353 = ""
-            callLogs.clear(); callVersion++
-            resetCallState()
-            pollJob?.cancel(); pollJob = null
-            housekeepingJob?.cancel(); housekeepingJob = null
-            stopMarmotWakeLoop()
-            if (coreWipeFailure != null || walletShutdownFailure != null || walletWipeFailure != null) {
-                toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
-            }
+                wipeHoldingAccountGate()
             } finally {
-                resumePendingMarmotPeerDelivery(marmotDeliveryGeneration)
+                endAccountChange(acquired = true)
             }
+        }
+    }
+
+    /** Caller holds the account-change gate. */
+    private suspend fun wipeHoldingAccountGate() {
+        endTranscriptSession()
+        relayConnectJob?.cancel(); relayConnectJob = null
+        resetStartupFlags()
+        refreshRelayOnline()
+        val marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
+        try {
+        cancelPendingMarmotSetups()
+        cancelPendingMarmotGroupSetups()
+        val (walletShutdownFailure, walletWipeFailure) = wipeWalletStorage()
+        UnifyRadio.stopScanning()
+        UnifyRadio.stopAdvertising()
+        unifyOffer = null; unifyPeers = emptyList()
+        nearbyPeerRefreshJob?.cancel(); nearbyPeerRefreshJob = null
+        // Gate push invalidation before MeshRadio.stop() — stop notifies the
+        // peer listener, which must not re-persist wiped mesh names/links.
+        onboarded = false; started = false
+        chat.bitchat.sonar.backup.setLiveUiSessionForAutoBackup(false)
+        chat.bitchat.sonar.backup.cancelPlatformAutoBackupWork()
+        // Panic wipe must not leave disclosure armed for the next account.
+        SonarCore.saveBlob("pref.$AUTO_BACKUP_DISCLOSED_PREF", "0")
+        // Same rule for the cellular opt-in: it is a per-account consent to
+        // spend the user's data plan, and the next account never gave it.
+        SonarCore.saveBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF, "0")
+        backupOverCellular = false
+        MeshRadio.stop()
+        MeshRadio.setMeshNickname("")
+        MeshRadio.discardPendingDeliverySignals()
+        MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
+        meshPeers = emptyList()
+        linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+        meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
+        foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
+        persistLinks(); persistLinkCaps(); persistGroupFolds()
+        updateBleDiscoveryPolicy()
+        // Bump BEFORE the suspending write: persistSonarDescriptorCacheNow()
+        // suspends, and an in-flight fetch resuming in that window would
+        // otherwise still pass performDescriptorFetch's generation guard and
+        // repopulate the map we just cleared.
+        sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
+        sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
+        publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
+        needsSonarDescriptorPublish = false
+        rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
+        profilesByNpub = emptyMap(); profileFetches.clear()
+        socialState = SonarSocialState(); persistSocialState()
+        pendingMarmotChatNpubs = emptyMap()
+        pendingMarmotGroups = emptyMap()
+        pendingDirectMarmotSends.clear()
+        pendingMarmotGroupSends.clear()
+        outbox.clear()
+        MessageStore.wipe()
+        // Redact all visible/account-bound host state before the fallible
+        // durable wipe. A filesystem error must never leave old chats or
+        // sticker bytes painted after credentials have been cleared.
+        stack = listOf(Screen.Home)
+        chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear()
+        timezoneShareByChat = emptyMap(); lastSharedSystemTimezone = null; peerTimezonesByGroup = emptyMap()
+        clearChatSnapshot()
+        cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
+        mediaCache.clear(); clearStickerCaches()
+        val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
+        nick = ""; npub = ""
+        localCoreReady = false; homeMessagesHydrated = false
+        walletState = WalletState.NotConfigured
+        walletOnline = false; walletBalanceDetails = null; cashuOffer = null
+        lastIncomingWalletPayment = null
+        legacyWallet = LegacyWalletSnapshot(); legacyDeleteGate = null
+        resetHandleAddressState()
+        // Money prefs died with SonarCore.wipe(); mirror the defaults.
+        showFiat = false; currency = FiatCurrency.USD; rate = null
+        presenceByGeohash = emptyMap()
+        payLedger = SonarPayLedger(); payVersion++
+        PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
+        clearPaymentStatusState()
+        mutedUntilByChat = emptyMap() // blob dies with SonarCore.wipe()
+        bip353 = ""
+        callLogs.clear(); callVersion++
+        resetCallState()
+        pollJob?.cancel(); pollJob = null
+        housekeepingJob?.cancel(); housekeepingJob = null
+        stopMarmotWakeLoop()
+        if (coreWipeFailure != null || walletShutdownFailure != null || walletWipeFailure != null) {
+            toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
+        }
+        } finally {
+            resumePendingMarmotPeerDelivery(marmotDeliveryGeneration)
         }
     }
 
@@ -4958,6 +4972,53 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (acquired) accountChangeInFlight = false
     }
 
+    /** The per-account values a switch sets aside (see
+     *  [AccountLocalStateParking]); everything else on disk is device-level
+     *  and stays put. Mirror of iOS `SonarAccountLocalState.parkedKeys`. */
+    private fun parkedLocalValues(): List<ParkedValue> = listOf(
+        ParkedValue("nickname", { SonarCore.nickname() }, { SonarCore.setNickname(it) }),
+        ParkedValue("bip353", { SonarCore.loadBlob("bip353") }, { SonarCore.saveBlob("bip353", it) }),
+        ParkedValue(
+            AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF,
+            { SonarCore.loadBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF) },
+            { SonarCore.saveBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF, it) },
+        ),
+        ParkedValue(
+            PaymentActivityStore.BLOB_KEY,
+            { SonarCore.loadBlob(PaymentActivityStore.BLOB_KEY) },
+            { SonarCore.saveBlob(PaymentActivityStore.BLOB_KEY, it) },
+        ),
+    )
+
+    /** Set [pubkeyHex]'s per-account values aside, BEFORE the teardown resets them. */
+    private fun parkAccountLocalState(pubkeyHex: String) {
+        AccountLocalStateParking.park(pubkeyHex, parkedLocalValues()) { k, v -> SonarCore.saveBlob(k, v) }
+    }
+
+    /** Bring [pubkeyHex]'s values back (if it has a record) and reload the
+     *  in-memory copies either way: the teardown reset them. */
+    private fun unparkAccountLocalState(pubkeyHex: String) {
+        AccountLocalStateParking.unpark(
+            pubkeyHex,
+            parkedLocalValues(),
+            load = { SonarCore.loadBlob(it) },
+            save = { k, v -> SonarCore.saveBlob(k, v) },
+        )
+        reloadParkedLocalValues()
+    }
+
+    private fun reloadParkedLocalValues() {
+        nick = SonarCore.nickname()
+        bip353 = SonarCore.loadBlob("bip353")
+        backupOverCellular = SonarCore.loadBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF) == "1"
+        PaymentActivityStore.reload()
+    }
+
+    /** Set by a switch or add: the next boot re-seeds verification marks once
+     *  the incoming account's chats are loaded (the first seed runs before
+     *  them, against an empty list). */
+    private var reseedVerifiedAfterChatsLoad = false
+
     /** Re-read the registry. Cheap: the core actual caches until a write. */
     fun refreshAccounts() {
         val snap = SonarCore.accounts()
@@ -4980,16 +5041,24 @@ class SonarAppState(private val scope: CoroutineScope) {
             var marmotDeliveryGeneration: Long? = null
             var acquired = false
             val result = runCatching {
-                if (SonarCore.accounts().active?.pubkeyHex == pubkeyHex) return@runCatching
+                val leaving = SonarCore.accounts().active?.pubkeyHex
+                if (leaving == pubkeyHex) return@runCatching
                 beginAccountChange()
                 acquired = true
                 Notifier.prepareForAccountReplacement()
                 setAsideWalletsForAccountChange()
-                marmotDeliveryGeneration = tearDownAccountBoundState()
+                leaving?.let(::parkAccountLocalState)
+                marmotDeliveryGeneration = try {
+                    tearDownAccountBoundState(preserveDeviceState = true)
+                } catch (error: Throwable) {
+                    leaving?.let(::unparkAccountLocalState)
+                    throw error
+                }
                 val newNpub = try {
                     SonarCore.switchAccount(pubkeyHex)
                 } catch (error: Throwable) {
                     // The core has already reopened the previous account.
+                    leaving?.let(::unparkAccountLocalState)
                     boot()
                     refreshAccounts()
                     throw SonarAccountRestoreException(
@@ -4997,6 +5066,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                         error,
                     )
                 }
+                unparkAccountLocalState(pubkeyHex)
+                reseedVerifiedAfterChatsLoad = true
                 finishAccountChange(newNpub)
             }
             endAccountChange(acquired)
@@ -5036,12 +5107,20 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 beginAccountChange()
                 acquired = true
+                val leaving = SonarCore.accounts().active?.pubkeyHex
                 Notifier.prepareForAccountReplacement()
                 setAsideWalletsForAccountChange()
-                marmotDeliveryGeneration = tearDownAccountBoundState()
+                leaving?.let(::parkAccountLocalState)
+                marmotDeliveryGeneration = try {
+                    tearDownAccountBoundState(preserveDeviceState = true)
+                } catch (error: Throwable) {
+                    leaving?.let(::unparkAccountLocalState)
+                    throw error
+                }
                 val newNpub = try {
                     SonarCore.addAccount(key, label?.trim()?.takeIf { it.isNotEmpty() })
                 } catch (error: Throwable) {
+                    leaving?.let(::unparkAccountLocalState)
                     boot()
                     refreshAccounts()
                     throw SonarAccountRestoreException(
@@ -5049,6 +5128,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                         error,
                     )
                 }
+                // A new account has no record (its values stay reset); the key
+                // of an account already on this phone (R-023) gets its own back.
+                SonarCore.accounts().active?.pubkeyHex?.let(::unparkAccountLocalState)
+                reseedVerifiedAfterChatsLoad = true
                 finishAccountChange(newNpub)
                 when (SonarCore.lastImportBackupOutcome()) {
                     AccountBackupRestoreOutcome.Restored ->
@@ -5088,6 +5171,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 beginAccountChange()
                 try {
                     SonarCore.removeAccount(pubkeyHex)
+                    AccountLocalStateParking.discard(pubkeyHex) { k, v -> SonarCore.saveBlob(k, v) }
                 } finally {
                     accountChangeInFlight = false
                 }
@@ -5119,10 +5203,20 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Every account-bound host cache, cleared before the identity changes.
      *  Returns the Marmot delivery generation to resume afterwards. Shared by
      *  [restoreAccount], [switchAccount] and [addAccount]. */
-    private suspend fun tearDownAccountBoundState(): Long? {
+    /**
+     * [preserveDeviceState] is true for a switch or an add: the account being
+     * left keeps everything on disk. Device-level state (mesh transcripts and
+     * media, links, mesh names, verification marks, the payment-bubble ledger,
+     * peer caches, the media cache, favorites/blocks) is shared by every
+     * account on the phone — the BLE/Noise identity is — so it is neither
+     * cleared nor rewritten; its per-account values were parked beforehand
+     * ([parkAccountLocalState]). A restore REPLACES the account and passes
+     * false: everything goes, as before.
+     */
+    private suspend fun tearDownAccountBoundState(preserveDeviceState: Boolean = false): Long? {
         var generation: Long? = null
         try {
-            return tearDownAccountBoundStateInner { generation = it }
+            return tearDownAccountBoundStateInner(preserveDeviceState) { generation = it }
         } catch (t: Throwable) {
             // A failure after the delivery pause must not strand the still-
             // active account with delivery paused: resume before rethrowing.
@@ -5131,7 +5225,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private suspend fun tearDownAccountBoundStateInner(onGeneration: (Long) -> Unit): Long? {
+    private suspend fun tearDownAccountBoundStateInner(
+        preserveDeviceState: Boolean,
+        onGeneration: (Long) -> Unit,
+    ): Long? {
         endTranscriptSession()
         UnifyRadio.stopScanning()
         UnifyRadio.stopAdvertising()
@@ -5155,28 +5252,44 @@ class SonarAppState(private val scope: CoroutineScope) {
         cancelPendingMarmotSetups()
         cancelPendingMarmotGroupSetups()
 
-        MessageStore.wipe()
+        if (!preserveDeviceState) MessageStore.wipe()
         MeshRadio.discardPendingDeliverySignals()
-        meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
-        persistMeshNames()
+        meshEchoIds.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+        // A switch keeps the mesh state in memory too: a peer event between
+        // here and the next boot re-persists from memory, and an emptied map
+        // would overwrite the transcripts' names and links on disk.
+        if (!preserveDeviceState) {
+            meshChats.clear(); meshChatNames.clear()
+            persistMeshNames()
+        }
         pendingMarmotChatNpubs = emptyMap()
         pendingMarmotGroups = emptyMap()
         pendingInviteTokens.clear()
-        linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-        persistLinks(); persistLinkCaps(); persistGroupFolds()
+        if (!preserveDeviceState) {
+            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+            persistLinks(); persistLinkCaps(); persistGroupFolds()
+        }
         updateBleDiscoveryPolicy()
         foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
         sonarPeerProfiles = emptyMap()
-        // Generation first — see wipe(): the write below suspends.
-        sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
+        if (!preserveDeviceState) {
+            // Generation first — see wipe(): the write below suspends.
+            sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
+        } else {
+            // Peer descriptors stay; in-flight fetches are retired.
+            descriptorCacheGeneration++
+        }
         sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
         publishedSonarDescriptor = false
         publishedSonarDescriptorBolt12Offer = null
         publishingSonarDescriptor = false
         needsSonarDescriptorPublish = false
         rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
-        profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCacheNow()
-        socialState = SonarSocialState(); persistSocialState()
+        profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear()
+        if (!preserveDeviceState) {
+            profilesByNpub = emptyMap(); persistProfileCacheNow()
+            socialState = SonarSocialState(); persistSocialState()
+        }
         bip353 = ""; SonarCore.saveBlob("bip353", "")
         // "Back up over cellular" is consent from ONE account to spend
         // the user's data plan. The restored account never gave it, so
@@ -5195,15 +5308,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.setNickname("")
         nick = ""
         meshBroadcast = emptyList(); meshDmRows = emptyList()
-        verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
+        // Verification marks are keyed by chat id and stay on disk across a
+        // switch; boot re-seeds them once the incoming account's chats load.
+        if (!preserveDeviceState) verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
         verifiedChatIds.clear(); verifiedVersion++
         chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear(); channelMsgs = emptyList()
         clearChatSnapshot()
         lastWnGroups = -1; lastWnMsgs = -1
-        payLedger = SonarPayLedger(); persistPay(); payVersion++
+        // The payment-bubble ledger is keyed by message id: device-level.
+        if (!preserveDeviceState) { payLedger = SonarPayLedger(); persistPay(); payVersion++ }
+        // Wallet activity is per account: parked before a switch.
         PaymentActivityStore.wipe()
         clearPaymentStatusState()
-        cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
+        cancelAllMediaDownloads()
+        if (!preserveDeviceState) MediaCache.wipe()
+        clearOpenChatTransientState()
         mediaCache.clear(); clearStickerCaches()
         callLogs.clear(); callVersion++
         notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
@@ -7069,6 +7188,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         localCoreReady = false
         Notifier.ensureChannel()
         scope.launch {
+            // A switch that died between parking and restoring left the active
+            // account's values in its record: replay it before anything reads
+            // them. No record (the normal case) costs one prefs read.
+            runCatching { SonarCore.accounts().active?.pubkeyHex }.getOrNull()?.let { active ->
+                if (AccountLocalStateParking.unpark(
+                        active,
+                        parkedLocalValues(),
+                        load = { SonarCore.loadBlob(it) },
+                        save = { k, v -> SonarCore.saveBlob(k, v) },
+                    )
+                ) {
+                    reloadParkedLocalValues()
+                }
+            }
             // ── LOCAL-FIRST PAINT (Signal/iOS parity): hydrate disk state and
             // open the encrypted database without any relay dependency.
             meshChats.putAll(MessageStore.loadAllMeshDms())
@@ -7085,6 +7218,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                 localCoreReady = true
                 refreshChats()
+                if (reseedVerifiedAfterChatsLoad) {
+                    reseedVerifiedAfterChatsLoad = false
+                    seedVerifiedChatIds()
+                }
                 recomputeConversations()
                 homeMessagesHydrated = true
 

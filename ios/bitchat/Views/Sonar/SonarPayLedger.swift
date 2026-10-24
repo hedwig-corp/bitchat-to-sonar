@@ -414,6 +414,18 @@ final class SonarPaymentActivityLedger: ObservableObject {
         defaults.removeObject(forKey: key)
     }
 
+    /// Re-read the stored ledger: an account switch has just put the incoming
+    /// account's activity there.
+    func reload() {
+        if let data = defaults.data(forKey: key),
+           let stored = try? JSONDecoder().decode([String: SonarPaymentActivity].self, from: data) {
+            entries = stored
+        } else {
+            entries = [:]
+        }
+        sortedCache = nil
+    }
+
     private func persist() {
         if let data = try? JSONEncoder().encode(entries) {
             defaults.set(data, forKey: key)
