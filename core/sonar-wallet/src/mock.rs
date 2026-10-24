@@ -188,6 +188,7 @@ impl WalletBackend for MockWallet {
             destination: destination.clone(),
             amount_sats: amount,
             fees_sats: Some(MOCK_FEE_SATS),
+            expires_at_secs: None,
             token: PreparedSendToken::None,
         })
     }

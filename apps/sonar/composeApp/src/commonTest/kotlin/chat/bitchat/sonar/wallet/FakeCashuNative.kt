@@ -26,6 +26,10 @@ class FakeCashuNative(
     var prepareError: (() -> CashuWalletException)? = null
     /** Thrown by [receiveInvoice] when set. */
     var invoiceError: (() -> CashuWalletException)? = null
+    /** Thrown by successive [send] calls, one per call, before anything is spent. */
+    val sendErrors = ArrayDeque<() -> CashuWalletException>()
+    /** Fee of successive quotes; [feeReserveSats] once empty. */
+    val nextFees = ArrayDeque<Long>()
     /** The status `send` answers with. */
     var sendStatus: CashuPaymentStatus = CashuPaymentStatus.Complete
     var sendPreimage: String? = "preimage-1"
@@ -144,16 +148,21 @@ class FakeCashuNative(
             destination = destination,
             kind = CashuDestinationKind.Bolt12Offer,
             amountSats = amountSats ?: 0L,
-            feesSats = feeReserveSats,
+            feesSats = nextFees.removeFirstOrNull() ?: feeReserveSats,
+            expiresAtSecs = 1_700_000_000L + 120L * quoteSeq,
         )
     }
 
     /** Amounts `send` was actually called with (what really left). */
     val sentAmounts = mutableListOf<Long>()
+    /** Every prepared send handed to `send`, refused or not. */
+    val sentPrepared = mutableListOf<CashuPreparedSend>()
 
     override fun send(prepared: CashuPreparedSend, note: String): CashuPayment {
         record("send")
         if (!connected) throw CashuWalletException.NotConnected()
+        sentPrepared += prepared
+        sendErrors.removeFirstOrNull()?.let { throw it() }
         sentAmounts += prepared.amountSats
         val p = CashuPayment(
             id = prepared.quoteId,
