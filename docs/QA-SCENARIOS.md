@@ -844,6 +844,97 @@ share a zone with the app and report the zone the app shared with it.
   ANRs and 23–26 % idle CPU on Home, the same on a `main` build. With one
   advertiser, main-thread time went 68 → 32 ticks/60 s after the fix.
 
+### QA-164 — Cold launch on cellular while a push wake is in flight
+- **Platforms:** both, both scripted. The real iOS extension only runs on a
+  device (`simctl push` never starts it), so a device pass stays the final
+  check for the extension's own observer wiring.
+- **How (iOS):** `scripts/qa/ios-launch-store-yield.sh` against a signed
+  Debug build from `ios-setup.sh` and a throwaway `SONAR_BENCH_NSEC`. A
+  stand-in process takes the SAME App Group store `flock` the extension takes
+  and either yields on the app's signal (the fixed extension) or holds it 13 s
+  (the old one); the real app is cold-launched each time and
+  `t0_launch → t1_local_paint` is read from its bench markers. PASS needs the
+  no-holder and yielding launches within 3000 ms AND the 13 s holder to delay
+  paint past 10 s, which proves the lock sits on the paint path; otherwise it
+  FAILs as inconclusive. Reboot the simulator after `ios-setup.sh`: its own
+  launch leaves a notification-permission alert that keeps the app inactive.
+- **How (Android):** `android-smoke.sh` QA-164 (emulator only). It turns the
+  emulator's Wi-Fi off and sets the console link to GSM bandwidth, then
+  cold-starts the app three times and reads `am start -W` TotalTime (launch
+  to first frame, which `MainActivity` defers until `boot()`'s
+  `SonarCore.start()` returns). A launch counts only when push
+  registration's relay attach began before the first frame and took 4 s or
+  more on the shaped link; if none does, the step FAILs as inconclusive
+  rather than passing. Budget 4000 ms (`QA164_BUDGET_MS`). The console's
+  latency setting is a no-op on current images and shaping never applies
+  to the emulated Wi-Fi, which is why the step uses bandwidth on mobile data.
+- **Steps:** account with a few active chats. Put the phone on cellular
+  (Wi-Fi off), kill the app, have a `sonar-cli` peer send 3–5 messages so
+  the push wakes fire, then tap the app icon while the banners are still
+  arriving. Repeat on Wi-Fi as the control.
+- **Expect:** the chat list paints within the normal cold-start budget on
+  both networks (`docs/PERFORMANCE.md`, `t0→t1_local_paint`). It must not sit
+  on the launch surface (iOS black "sonar" screen, Android starting window)
+  for the length of the wake's relay timeouts.
+  - iOS log: the NSE diagnostics stamp `yield:hostWantsStore` followed by
+    `yield:abandonedHydrate`, and the app's `marmot workQueue op=connectLocal`
+    line shows `ran_ms` well under 1000 — the open no longer waits for the
+    NSE's 5 s relay quorum + 8 s drain. The banner that wake was decorating
+    stays generic and silent; the app paints the message itself.
+  - Android logcat: no `Core: start: waited N ms for the core lock` line
+    with N in the thousands. `boot()`'s `SonarCore.start()` answers from the
+    node push registration already opened instead of queueing behind its
+    `connectRelays()` attach.
+- **Guarding tests:**
+  - `latched_collect_after_wake_refuses_instead_of_syncing` (`core/sonar-ffi`):
+    a latched node refuses the wake drain at once.
+  - `dropping_a_node_does_not_wait_for_blocking_tasks` and
+    `aborted_connect_returns_without_waiting_for_blocking_tasks`
+    (`core/sonar-ffi`): releasing a node, or a connect the host aborted,
+    waits at most 2 s for tokio's blocking pool instead of indefinitely. The
+    relay dial resolves hostnames there, so on a stalled cellular resolver
+    the NSE's yield used to release the store lock only after the resolver
+    timed out. The first test fails in 20 s with tokio's own drop (measured).
+  - `MarmotStoreLockTests.acquireExclusiveAsksHolderToYield` (iOS): the app's
+    blocking acquire posts the yield notification before it parks, and a
+    holder that releases on it lets the acquire through.
+  - Not unit-pinned: the NSE's observer wiring and the Android `start()` fast
+    path. The two scripted steps above check them end to end; the real
+    extension process still needs a device pass.
+- **Last run (2026-10-13, Sonar_QA_API_36 emulator, shaped link):**
+
+  | Build | TotalTime per launch | Core lock wait logged |
+  |---|---|---|
+  | Fix (#665) | 2128, 2095, 2064 ms: PASS | none |
+  | Fast path removed | 6812, 6936, 6862 ms: FAIL | 4722, 4641, 4622 ms |
+
+  Rerun on the final code (2026-10-24, same emulator): 2189, 2009, 2064 ms,
+  PASS.
+
+- **Last iOS run (2026-10-24, iPhone 17 Pro simulator, iOS 26.5):** built
+  with #669's Breez 0.12.4 package from a local copy of its binary (the
+  release asset it pins did not exist yet). CI's exact build command: BUILD
+  SUCCEEDED, the notification extension included. `bitchatTests_iOS`, serial
+  as in CI: 1016 tests in 133 suites passed, the new yield test among them.
+  `ios-launch-store-yield.sh`:
+
+  | Store lock holder | t0 → t1 local paint |
+  |---|---|
+  | none | 263 ms |
+  | yields on the signal (fixed extension) | 375 ms |
+  | holds 13 s, ignores it (old extension) | 10066 ms |
+
+  Earlier, before the package was restored, the yield test's logic ran as a
+  plain process on the simulator: with `signalHostWantsStore()` removed the
+  acquire stayed parked until its 3 s limit.
+- **Origin:** 2026-10-13 tester report "quando non sono in Wi-Fi non si
+  apre". Both hosts gate first paint on the local store open, and both let a
+  push-driven relay attach hold the store lock across its network timeouts:
+  Android's `SonarPushRegistration` holds the `SonarCore` mutex across
+  `connectRelays()`, iOS's NSE holds the App Group `flock` across
+  `SonarNode.connect` + `collectNotificationsAfterWake`. On Wi-Fi the attach
+  finishes in about a second, so only cellular users saw it.
+
 ## Wallet (Cashu)
 
 Money scenarios never need real sats: point a DEBUG iOS build at a local

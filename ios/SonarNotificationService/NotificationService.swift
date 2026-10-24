@@ -14,6 +14,7 @@
 
 import BreezSDKLiquid
 import Darwin
+import notify
 import Foundation
 import Security
 import SonarCore
@@ -66,6 +67,15 @@ class NotificationService: SDKNotificationService {
     /// Held for the lifetime of `marmotWakeNode` so we never unlock before the
     /// SQLCipher handle is dropped (goose M1).
     private var marmotWakeStoreLock: MarmotStoreLock?
+    /// Yield-to-host latch. Passed to `SonarNode.connect` and interrupted when
+    /// the main app posts `MarmotStoreLock.hostWantsStoreNotification`, i.e.
+    /// the moment its local open blocks on the store `flock` we hold. The
+    /// relay quorum wait and the wake drain then abort instead of running to
+    /// their timeouts, `releaseMarmotWakeNode` drops the lock, and the app
+    /// paints. Once interrupted it stays interrupted (one-way), so a later
+    /// retry attempt cannot re-take the store from under the host.
+    private let hostYieldLatch = SonarSuspendLatch()
+    private var hostYieldToken: Int32 = NOTIFY_TOKEN_INVALID
 
     override func didReceive(
         _ request: UNNotificationRequest,
@@ -87,6 +97,7 @@ class NotificationService: SDKNotificationService {
                 return
             }
             Self.configureTransponderNotification(content)
+            registerHostYieldObserver()
             hydrateTask = Task { [weak self] in
                 await self?.hydrateMarmotAndDecorate()
             }
@@ -139,6 +150,48 @@ class NotificationService: SDKNotificationService {
 
     // MARK: - Marmot hydrate (Transponder)
 
+    /// Listen for the host app asking for the store. Registered before the
+    /// hydrate task starts so a signal that lands while we are still in the
+    /// store-busy retry loop is not missed either.
+    private func registerHostYieldObserver() {
+        var token: Int32 = NOTIFY_TOKEN_INVALID
+        let status = notify_register_dispatch(
+            MarmotStoreLock.hostWantsStoreNotification,
+            &token,
+            DispatchQueue.global(qos: .userInitiated)
+        ) { [weak self] _ in
+            guard let self else { return }
+            os_log("NSE: host app wants the store — yielding the wake",
+                   log: Self.log, type: .info)
+            Self.recordDiagnostic("yield:hostWantsStore")
+            self.hostYieldLatch.interrupt()
+        }
+        // `NOTIFY_STATUS_OK` is 0; a failed registration only means we keep
+        // today's behaviour (hold the store until the wake finishes).
+        if status == 0 {
+            hostYieldToken = token
+        } else {
+            Self.recordDiagnostic("yield:registerFailed status=\(status)")
+        }
+    }
+
+    private func cancelHostYieldObserver() {
+        guard hostYieldToken != NOTIFY_TOKEN_INVALID else { return }
+        notify_cancel(hostYieldToken)
+        hostYieldToken = NOTIFY_TOKEN_INVALID
+    }
+
+    /// The host asked for the store: keep the silent generic banner (the app
+    /// is about to paint the message itself) and finish without touching the
+    /// store again.
+    private func finishYieldingToHost(_ content: UNMutableNotificationContent, attempt: Int) {
+        Self.applyUndecoratedPlaceholderSilence(content)
+        os_log("NSE: yielded the store to the host app — keeping silent generic banner",
+               log: Self.log, type: .info)
+        Self.recordDiagnostic("yield:abandonedHydrate attempt=\(attempt)")
+        finish(with: content)
+    }
+
     private func hydrateMarmotAndDecorate() async {
         guard let content = bestAttemptContent else {
             finish(with: UNMutableNotificationContent())
@@ -156,6 +209,10 @@ class NotificationService: SDKNotificationService {
         for attempt in 1...maxAttempts {
             guard !Task.isCancelled else {
                 finish(with: content)
+                return
+            }
+            if hostYieldLatch.isInterrupted() {
+                finishYieldingToHost(content, attempt: attempt)
                 return
             }
             do {
@@ -259,6 +316,12 @@ class NotificationService: SDKNotificationService {
                 finish(with: content)
                 return
             } catch {
+                if hostYieldLatch.isInterrupted() {
+                    // The connect or the drain aborted on our own latch; the
+                    // node and the store lock are already released.
+                    finishYieldingToHost(content, attempt: attempt)
+                    return
+                }
                 let storeBusy: Bool = {
                     if let nse = error as? NSEMarmotError, case .storeBusy = nse { return true }
                     return false
@@ -319,10 +382,13 @@ class NotificationService: SDKNotificationService {
                 relayUrls: Self.defaultRelayUrls,
                 dbPath: dbURL.path,
                 dbKeyHex: dbKeyHex,
-                // No suspend latch: the NSE is not the app process, has no
-                // scene-phase suspend hook to fire one, and is torn down by its
-                // own `serviceExtensionTimeWillExpire` deadline instead.
-                suspendLatch: nil
+                // Not a suspend latch in the app's sense (the NSE has no
+                // scene-phase hook and is torn down by its own
+                // `serviceExtensionTimeWillExpire` deadline); it is the
+                // yield-to-host latch, fired when the main app wants the
+                // store. `biased` select: an already-fired latch never even
+                // opens SQLCipher.
+                suspendLatch: hostYieldLatch
             )
         } catch {
             storeLock.release()
@@ -563,6 +629,7 @@ class NotificationService: SDKNotificationService {
     }
 
     private func finish(with content: UNNotificationContent) {
+        cancelHostYieldObserver()
         let handler = contentHandler
         contentHandler = nil
         bestAttemptContent = nil
