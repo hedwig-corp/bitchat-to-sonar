@@ -55,6 +55,10 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # ubuntu-latest ships the Android SDK with licenses accepted and exports
+      # ANDROID_HOME / ANDROID_SDK_ROOT; android-actions/setup-android re-ran
+      # `sdkmanager --licenses` interactively and failed the job.
       - name: Regenerate from permissionlesstech/bitchat-android HEAD
-        run: scripts/bitchat-vectors/regenerate.sh --only android
+        run: |
+          test -n "$ANDROID_HOME" || export ANDROID_HOME=/usr/local/lib/android/sdk
+          scripts/bitchat-vectors/regenerate.sh --only android
