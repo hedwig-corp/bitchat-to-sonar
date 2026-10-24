@@ -1303,11 +1303,23 @@ real mint and need the maintainer's approval of the amounts.
   `proofs_held_by_a_send_in_flight_are_not_spendable`, `a_fee_preview_holds_nothing`,
   `a_melt_costing_more_than_the_agreed_fee_is_refused_before_confirm`;
   app side `CashuWalletEngineTest.theWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`,
-  `CashuWalletServiceTests.testTheWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`
+  `CashuWalletServiceTests.testTheWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`.
+  Max: `CashuWalletEngineTest.maxStillPaysWhenTheReducedAmountQuotesAHigherFee`,
+  `CashuWalletServiceTests.testMaxStillPaysWhenTheReducedAmountQuotesAHigherFee`;
+  the price it can reach: `an_amount_a_direct_melt_of_every_proof_covers_is_affordable`.
 - **Origin:** 2026-10-13 incident — a 12,027-sat BOLT11 send (reserve 240)
   from a balance ~20 sats above 12,267 left two UNPAID quotes and no melt
   request. The fee preview was the reserve alone; CDK then could not pay
-  for the proofs' input fees and failed before the melt.
+  for the proofs' input fees and failed before the melt. #666 QA on
+  7742487dd (active 1000 ppk keyset, 1,530 sats in 61 proofs, amountless
+  BOLT12 offer): Max as both apps size it was refused. The full balance
+  quoted 95; 1,530 - 95 = 1,435 quoted 97, 2 sats over. The fee is not
+  monotonic in the amount: the mint also charges per output proof, so
+  1,434 quoted 89 and paid once. On the retired-keyset and 600 ppk shapes
+  the same one-step Max paid. Fixed in #666: both apps step Max down by
+  the overshoot (at most 3 quotes), and the core prices an amount CDK
+  cannot fund as a direct melt of every proof, the cheapest way to spend
+  them all, instead of refusing it.
 
 ### QA-166 — A quote that expires before it is sent is re-quoted, never orphaned
 - **Platforms:** both (one Rust core; iOS on the fake mint through

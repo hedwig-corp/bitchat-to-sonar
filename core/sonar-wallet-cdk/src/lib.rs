@@ -1551,8 +1551,10 @@ struct Reconciler {
     /// — with each other and with balance reads, so a dry run's short-lived
     /// reservation is never seen as money leaving.
     prepare: tokio::sync::Mutex<()>,
-    /// When a melt last read keysets from the mint (see [`warm_keysets`]).
-    keysets_read: Mutex<Option<Instant>>,
+    /// When a melt last checked keysets with the mint (see [`warm_keysets`]).
+    /// Async and held across the check, so melts that arrive together share
+    /// one request.
+    keysets_read: tokio::sync::Mutex<Option<Instant>>,
     /// The connector the current wallet talks through, for the one mint call
     /// CDK's wallet does not offer: proof states by Y, for proofs the local
     /// store no longer holds. Set on every build.
@@ -1570,7 +1572,7 @@ impl Default for Reconciler {
             sending: Mutex::new(std::collections::HashSet::new()),
             confirmed: Mutex::new(std::collections::VecDeque::new()),
             prepare: tokio::sync::Mutex::new(()),
-            keysets_read: Mutex::new(None),
+            keysets_read: tokio::sync::Mutex::new(None),
             mint: Mutex::new(None),
         }
     }
@@ -1959,39 +1961,64 @@ impl MeltPrice {
     }
 }
 
-/// Keysets as the mint has them now, read under a mint-call deadline before
-/// a melt is priced or sent.
+/// Keysets as the mint has them now, checked under a mint-call deadline
+/// before a melt is priced or sent.
 ///
 /// CDK keeps keysets for an hour and counts the ones it loads from its own
 /// database as fresh, so after the mint rotates its keyset a melt would
 /// still build its swap and change outputs on the retired one. Against
 /// cdk-mintd 0.18.1 (#666 QA) the swap was refused, retried and paid, then
 /// the melt was refused InactiveKeyset: the send failed after paying the
-/// swap fee, and the swap's saga stayed open. Reading the keysets first
-/// prevents that and keeps CDK's own preparation local, so a hung mint
-/// fails here, under the deadline, instead of stalling a payment.
+/// swap fee, and the swap's saga stayed open. Checking first prevents that
+/// and keeps CDK's own preparation local, so a hung mint fails here, under
+/// the deadline, instead of stalling a payment.
 ///
-/// `fetch_mint_info` reads the mint (info and keysets) and reports a
-/// failure, where `KeysetLoadPolicy::Refresh` would quietly fall back to the
-/// cache. One read serves `keyset_refresh` (60 s), so a fee preview and the
-/// send after it cost one round trip, not two. Melts that arrive together
-/// share one read too: CDK's `load_from_mint` is single-flight (its
-/// `fetch_lock` plus a version check), so no lock is needed here.
+/// The check is ONE request, the keyset list (`GET /v1/keysets`), compared
+/// with CDK's cached copy; only a difference (a rotation, a fee change)
+/// pays for CDK's full refresh (`fetch_mint_info`: info, keysets, new keys),
+/// which reports a failure where `KeysetLoadPolicy::Refresh` would quietly
+/// fall back to the cache. Every mint request draws on CDK's per-mint budget
+/// (20 a minute, shared with receives and the watcher), so one check serves
+/// `keyset_refresh` (60 s): a fee preview and its send cost one request
+/// more than before this check existed, not two or four.
 async fn warm_keysets(wallet: &Wallet, reconciler: &Reconciler, budgets: Budgets) -> Result<()> {
-    let fresh = reconciler
-        .keysets_read
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some_and(|at| at.elapsed() < budgets.keyset_refresh);
-    if fresh {
+    // Single-flight: the check goes out on CDK's connector directly, past
+    // its metadata cache's own fetch lock.
+    let mut checked = reconciler.keysets_read.lock().await;
+    if checked.is_some_and(|at| at.elapsed() < budgets.keyset_refresh) {
         return Ok(());
     }
-    bounded(budgets.mint_call, wallet.fetch_mint_info()).await?;
-    *reconciler
-        .keysets_read
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    let unchanged = match reconciler.mint() {
+        Some(mint) => {
+            let listed = bounded(budgets.mint_call, mint.get_mint_keysets()).await?;
+            keysets_match(wallet, &listed.keysets).await
+        }
+        None => false,
+    };
+    if !unchanged {
+        bounded(budgets.mint_call, wallet.fetch_mint_info()).await?;
+    }
+    *checked = Some(Instant::now());
     Ok(())
+}
+
+/// Whether the mint's keyset list (for this wallet's unit) is exactly what
+/// CDK has cached: the same ids, each as active and as costly. Anything else
+/// — including a cache that cannot be read — needs the full refresh.
+async fn keysets_match(wallet: &Wallet, listed: &[cdk::nuts::KeySetInfo]) -> bool {
+    let Ok(cached) = wallet
+        .keysets(cdk::wallet::types::KeysetLoadPolicy::CacheOnly)
+        .await
+    else {
+        return false;
+    };
+    let listed: Vec<_> = listed.iter().filter(|k| k.unit == wallet.unit).collect();
+    listed.len() == cached.len()
+        && listed.iter().all(|k| {
+            cached.iter().any(|c| {
+                c.id == k.id && c.active == Some(k.active) && c.input_fee_ppk == k.input_fee_ppk
+            })
+        })
 }
 
 /// Whether a cancelled melt preparation let go of what it held: the quote's
@@ -2125,43 +2152,62 @@ async fn prepare_funded_melt<'a>(
     metadata: HashMap<String, String>,
 ) -> std::result::Result<cdk::wallet::PreparedMelt<'a>, cdk::Error> {
     use cdk::nuts::nut00::ProofsMethods;
-    let melt = wallet.prepare_melt(quote_id, metadata.clone()).await?;
-    let funded = match melt_is_funded(wallet, &melt).await {
-        Ok(funded) => funded,
-        Err(e) => {
-            // The melt holds the quote and its proofs: let go before failing.
-            let _ = melt.cancel().await;
-            return Err(e);
+    let mut picked: cdk::nuts::Proofs = match wallet.prepare_melt(quote_id, metadata.clone()).await
+    {
+        Ok(melt) => {
+            let funded = match melt_is_funded(wallet, &melt).await {
+                Ok(funded) => funded,
+                Err(e) => {
+                    // The melt holds the quote and its proofs: let go first.
+                    let _ = melt.cancel().await;
+                    return Err(e);
+                }
+            };
+            if funded {
+                return Ok(melt);
+            }
+            let picked: cdk::nuts::Proofs = melt
+                .proofs()
+                .iter()
+                .chain(melt.proofs_to_swap())
+                .cloned()
+                .collect();
+            tracing::warn!(
+                "melt {}: CDK selected {} proofs that do not cover their own input fee \
+                 (swap fee {}); topping the selection up and melting it directly",
+                quote_tag(quote_id),
+                picked.len(),
+                melt.swap_fee()
+            );
+            let operation = melt.operation_id();
+            melt.cancel().await?;
+            if !melt_released(wallet, quote_id, operation).await {
+                return Err(cdk::Error::Custom(
+                    "the underfunded selection could not be released".into(),
+                ));
+            }
+            picked
         }
+        // CDK found no set that pays for a swap AND the melt's output fees.
+        // A direct melt pays neither, so it can still fit (#666 QA: 1,436 to
+        // 1,441 sats of a 1,530-sat, 61-proof wallet on a 1000 ppk keyset).
+        // CDK leaked the quote's reservation on this early return; the caller
+        // holds the `prepare` lock, so releasing it here is safe.
+        Err(cdk::Error::InsufficientFunds) => {
+            release_orphaned_quote_reservation(wallet, quote_id).await;
+            cdk::nuts::Proofs::new()
+        }
+        Err(e) => return Err(e),
     };
-    if funded {
-        return Ok(melt);
-    }
-    let owed = melt
-        .quote()
+    let quote = wallet
+        .localstore
+        .get_melt_quote(quote_id)
+        .await?
+        .ok_or(cdk::Error::UnknownQuote)?;
+    let owed = quote
         .amount
-        .checked_add(melt.quote().fee_reserve)
+        .checked_add(quote.fee_reserve)
         .ok_or(cdk::Error::AmountOverflow)?;
-    let mut picked: cdk::nuts::Proofs = melt
-        .proofs()
-        .iter()
-        .chain(melt.proofs_to_swap())
-        .cloned()
-        .collect();
-    tracing::warn!(
-        "melt {}: CDK selected {} proofs that do not cover their own input fee (swap fee {}); \
-         topping the selection up and melting it directly",
-        quote_tag(quote_id),
-        picked.len(),
-        melt.swap_fee()
-    );
-    let operation = melt.operation_id();
-    melt.cancel().await?;
-    if !melt_released(wallet, quote_id, operation).await {
-        return Err(cdk::Error::Custom(
-            "the underfunded selection could not be released".into(),
-        ));
-    }
     let mut rest: cdk::nuts::Proofs = wallet
         .get_unspent_proofs()
         .await?
@@ -2185,28 +2231,22 @@ async fn prepare_funded_melt<'a>(
     wallet.prepare_melt_proofs(quote_id, picked, metadata).await
 }
 
-/// The price of a melt CDK cannot fund from the unreserved proofs: as if it
-/// spent all of them, through a swap. That is what a caller's balance check
-/// needs to refuse it with real figures, and what a "send max" subtracts.
+/// The price of a melt the unreserved proofs cannot fund even when melted
+/// directly: as a direct melt of all of them, the cheapest way to spend
+/// everything (no swap, no output fees). That is what a caller's balance
+/// check needs to refuse it with real figures, and what a "send max"
+/// subtracts: the balance less this fee is always payable, as a direct melt.
 async fn unfunded_melt_price(
     wallet: &Wallet,
     quote: &cdk::wallet::MeltQuote,
 ) -> std::result::Result<MeltPrice, cdk::Error> {
-    let needed = quote
-        .amount
-        .checked_add(quote.fee_reserve)
-        .ok_or(cdk::Error::AmountOverflow)?;
     let unspent = wallet.get_unspent_proofs().await?;
-    let swap_fee = u64::from(wallet.get_proofs_fee(&unspent).await?.total);
-    let active = wallet.active_keyset().await?;
-    let amounts = wallet.get_keyset_fees_and_amounts_by_id(active.id).await?;
-    let outputs = u64::try_from(needed.split(&amounts)?.len()).unwrap_or(u64::MAX);
-    let input_fee = u64::from(wallet.get_keyset_count_fee(&active.id, outputs).await?);
+    let input_fee = u64::from(wallet.get_proofs_fee(&unspent).await?.total);
     Ok(MeltPrice {
         fee_reserve: u64::from(quote.fee_reserve),
         input_fee,
-        swap_fee,
-        swap: true,
+        swap_fee: 0,
+        swap: false,
         inputs: unspent.len(),
         affordable: false,
     })
@@ -5442,6 +5482,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A melt of every proof, directly, costs the amount, the reserve and one
+    /// sat per proof, with the rest back as change. When CDK cannot find an
+    /// exact set it swaps first, which also pays the melt's output fees, and
+    /// when that swap does not fit, the price falls back to "swap
+    /// everything". The direct melt is never tried, so the wallet refuses an
+    /// amount it can pay. #666 QA against cdk-mintd 0.18.1 (1000 ppk, 61
+    /// proofs, 1,530 sats): 1,436 to 1,441 were priced unaffordable, though
+    /// 1,441 + 28 + 61 is exactly the balance. 1,434 got the direct melt and
+    /// paid, with its change back.
+    #[test]
+    fn an_amount_a_direct_melt_of_every_proof_covers_is_affordable() {
+        let dir = scratch("direct-melt-every-proof");
+        let mint = Arc::new(test_mint::FakeMint::with_input_fee(1_000));
+        let mut cfg = config();
+        cfg.working_dir = dir.clone();
+        let w = CdkWallet::with_connector(cfg, "https://mint.example.com", mint.clone()).unwrap();
+        w.connect().unwrap();
+        for _ in 0..5 {
+            receive_paid_bolt11(&w, &mint, 255);
+        }
+        let balance = w.balance().unwrap().confirmed_sats;
+        let proofs = u64::try_from(unspent_proofs(&w)).unwrap();
+        // Reserve 2, a sat per proof, and 3 sats of change: no exact set.
+        let amount = balance - 2 - proofs - 3;
+        let prepared = prepare(&w, &test_invoice(Some(amount * 1_000)), None).unwrap();
+        let fee = prepared.fees_sats.unwrap();
+        assert!(
+            prepared.amount_sats + fee <= balance,
+            "{amount} sats + fee {fee} priced over {balance}, but melting all {proofs} proofs costs {}",
+            amount + 2 + proofs
+        );
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete);
+        assert_eq!(mint.calls("post_melt"), 1, "exactly one payment");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The same send from a wallet that has not yet seen the rotation: CDK's
     /// own metadata cache, not the zero TTL `wallet_with_retired_fee_proofs`
     /// sets. CDK keeps keysets for an hour, and keysets loaded from its
@@ -5815,8 +5893,9 @@ mod tests {
         assert_ne!(quote_tag("melt1"), quote_tag("melt2"));
     }
 
-    /// A fee preview and the send after it read the mint's keysets once:
-    /// the read before a melt is shared for `keyset_refresh`.
+    /// A fee preview and the send after it read the mint's keysets once —
+    /// the keyset list alone, no mint info, when nothing changed: every
+    /// request draws on CDK's per-mint budget.
     #[test]
     fn a_preview_and_its_send_read_the_keysets_once() {
         let dir = scratch("keysets-read-once");
@@ -5824,12 +5903,18 @@ mod tests {
         w.connect().unwrap();
         receive_paid_bolt11(&w, &mint, 1_000);
         let before = mint.calls("get_mint_keysets");
+        let info_before = mint.calls("get_mint_info");
         let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
         assert_eq!(
             w.send(&prepared, "").unwrap().status,
             PaymentStatus::Complete
         );
         assert_eq!(mint.calls("get_mint_keysets") - before, 1);
+        assert_eq!(
+            mint.calls("get_mint_info") - info_before,
+            0,
+            "no full refresh"
+        );
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5889,8 +5974,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Previews that arrive together share one keyset read (CDK's metadata
-    /// cache is single-flight; this pins that the wallet relies on it).
+    /// Previews that arrive together share one keyset check.
     #[test]
     fn concurrent_previews_read_the_keysets_once() {
         let dir = scratch("keysets-single-flight");

@@ -301,6 +301,28 @@ class CashuWalletEngineTest {
         e.onBackground()
     }
 
+    /**
+     * Max on ecash that pays input fees is not one subtraction away. The
+     * figures are from #666 QA against cdk-mintd 0.18.1 (1000 ppk, 61
+     * proofs, BOLT12 offer). 1,530 sats quoted 95. 1,530 - 95 = 1,435 then
+     * quoted 97, two sats over the balance: the mint charges per output
+     * proof too, and 1,435 splits into more of them. 1,434 quoted 89 and
+     * paid. Max must pay an amount the fees allow, not refuse with
+     * "Amount plus fee exceeds your balance".
+     */
+    @Test
+    fun maxStillPaysWhenTheReducedAmountQuotesAHigherFee() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 1_530)
+        native.nextFees.addAll(listOf(95L, 97L, 89L))
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val r = e.send("lno1peer", 1_530, "note", feeFromAmount = true, maxFeeSats = 95)
+        assertTrue(r.ok, "Max must pay what the balance allows, got ${r.errorKind}: ${r.error}")
+        assertEquals(1, native.count("send"), "exactly one payment")
+        e.onBackground()
+    }
+
     // ── The fee the user consented to (maintainer review, #614) ──
 
     /**

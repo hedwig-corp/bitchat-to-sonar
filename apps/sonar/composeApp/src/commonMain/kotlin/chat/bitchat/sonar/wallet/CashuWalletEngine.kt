@@ -341,14 +341,25 @@ class CashuWalletEngine(
             // that the wallet then could not pay.
             var fee = prepared.feesSats ?: 0L
             if (prepared.amountSats + fee > balance) {
-                val reduced = amountSats - fee
-                if (!feeFromAmount || amountSats <= 0 || reduced <= 0) {
+                if (!feeFromAmount || amountSats <= 0) {
                     return insufficient(prepared.amountSats, fee, balance)
                 }
-                prepared = n.prepareSend(dest, reduced)
-                fee = prepared.feesSats ?: 0L
-                if (prepared.amountSats + fee > balance) {
-                    return insufficient(prepared.amountSats, fee, balance)
+                // Max. On ecash that pays input fees the fee depends on the
+                // amount (the proofs it spends, the outputs it splits into),
+                // so one subtraction can land a sat or two over the balance
+                // (#666 QA: 1,530 quoted 95; 1,435 then quoted 97). Step down
+                // by the overshoot, a few quotes at most.
+                var target = amountSats - fee
+                var steps = 0
+                while (true) {
+                    if (target <= 0) return insufficient(prepared.amountSats, fee, balance)
+                    prepared = n.prepareSend(dest, target)
+                    fee = prepared.feesSats ?: 0L
+                    val over = prepared.amountSats + fee - balance
+                    if (over <= 0) break
+                    steps += 1
+                    if (steps >= MAX_SIZING_QUOTES) return insufficient(prepared.amountSats, fee, balance)
+                    target -= over
                 }
             }
             // The fee the user saw is a promise: a higher fee on the quote
@@ -709,6 +720,9 @@ class CashuWalletEngine(
 
         /** Fresh quotes a send may take after its quote expired unsent. */
         const val MAX_REQUOTES = 2
+
+        /** Quotes a Max send may take to find an amount its fee fits. */
+        const val MAX_SIZING_QUOTES = 3
 
         fun balanceKey(accountId: String) = "wallet.cashu.balance.$accountId"
         fun offerKey(accountId: String) = "wallet.cashu.offer.$accountId"
