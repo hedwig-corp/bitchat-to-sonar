@@ -129,7 +129,7 @@ fn signed_v2_file_transfer_packet_encodes_and_verifies() {
     .expect("file payload");
     assert!(payload.len() > u16::MAX as usize);
 
-    let signer = MeshSigner::generate();
+    let signer = MeshSigner::generate().expect("signer");
     let sender = [0x10; 8];
     let recipient = [0x20; 8];
     let route = vec![[0x31; 8], [0x32; 8]];
@@ -137,7 +137,7 @@ fn signed_v2_file_transfer_packet_encodes_and_verifies() {
     packet.recipient_id = Some(recipient);
     packet.route = Some(route.clone());
     packet.payload = payload.clone();
-    assert!(sonar_core::mesh::sign_packet(&mut packet, &signer));
+    sonar_core::mesh::sign_packet(&mut packet, &signer).expect("sign");
 
     let wire = packet.encode().expect("encode signed v2");
     let decoded = Packet::decode(&wire).expect("decode signed v2");

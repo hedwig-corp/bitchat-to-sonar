@@ -463,12 +463,12 @@ receiving decoder returned `nil` for the whole `FilePacket` over an unusable
 optional hint. On the sending side an unusable id failed `encode()`, which
 surfaces as "not connected" and no media sent.
 
-**Call sites:** `mesh.rs::file_packet::FilePacket::encode` / `decode` (the
+**Call sites:** `bitchat-protocol/src/file_packet.rs::FilePacket::encode` / `decode` (the
 `T_MESSAGE_ID` arm) and `BitchatFilePacket.encode()` / `decode()` (the
 `.messageID` case). Both directions on both platforms — a one-sided fix leaves
 the pair asymmetric, which is worse than either behaviour alone.
 
-**Guarded by:** `mesh.rs::malformed_optional_message_id_degrades_instead_of_dropping_the_file`, `BitchatFilePacketTests.testUnusableMessageIDCostsTheReceiptNotTheTransfer`, `BitchatFilePacketTests.testMalformedMessageIDTLVStillDecodesTheFile`
+**Guarded by:** `mesh_legacy.rs::malformed_optional_message_id_degrades_instead_of_dropping_the_file`, `BitchatFilePacketTests.testUnusableMessageIDCostsTheReceiptNotTheTransfer`, `BitchatFilePacketTests.testMalformedMessageIDTLVStillDecodesTheFile`
 
 **Not guarded:** cross-implementation behaviour against stock bitchat, which does
 not know tag `0x05` at all — that path relies on unknown tags being skipped, and
@@ -3231,6 +3231,96 @@ today; a new pass over every chat through them would bring this back.
 - *Invalidate a cached index from the `$groups` sink.* `@Published` emits in
   willSet, so a lookup in that sink would rebuild the index from the old
   groups and keep it. The cache is dropped in `didSet` and rebuilt lazily.
+
+## R-058 — Mesh frames decode and verify as the sender put them on the air
+
+**Invariant:** The bitchat wire codec lives in one place, `core/bitchat-protocol`
+(spec: `core/bitchat-protocol/SPEC.md`), and decodes every frame shape the two
+reference clients emit: a payload of 100+ low-entropy bytes arrives
+**DEFLATE-compressed** (`IS_COMPRESSED`, raw DEFLATE, original size prefixed)
+and must be inflated, not dropped. A packet signature is verified over the
+payload bytes **as received** (`Packet::wire_payload`), never over a
+re-compression of the decoded payload — DEFLATE output differs per encoder
+(Apple libcompression, `java.util.zip`, miniz), and an uncompressed-but-
+compressible payload would be compressed on re-encode. Sonar's own private-
+message TLV extensions (two-byte lengths, reply parent) and the file `0x05`
+message-id TLV go only to a peer that sent a verified Sonar `0x53`; a stock
+peer gets the legacy TLVs, with long text split into ≤255-byte messages.
+
+**Breaks as:** Sonar iOS ↔ Sonar Android looked "incompatible": any frame
+with a compressible payload over 100 bytes — a long signed public message, a
+`0x53` announce carrying a BIP-353 address or an offer, a text file — was
+silently dropped by Android (`decode_core` returned `None` on the compressed
+flag) and, in the other direction, any such frame Android signed failed iOS's
+signature check (iOS rebuilt the preimage with its own compressor), so the
+Sonar announce was logged "unverified" and the npub never exchanged. Replies
+and long DMs sent to stock bitchat users vanished without an error (their
+decoders reject an unknown TLV).
+
+**Call sites:** core `bitchat-protocol/src/packet.rs::decode_core` /
+`encode_core` (wire-payload reuse), `signing.rs::signing_preimage`,
+`mesh_engine.rs::try_send_text` (the Sonar gate), `mesh_engine.rs::send_file`
+(the `0x05` gate). iOS `BinaryProtocol.swift` / `BitchatPacket.toBinaryDataForSigning`
+and the private-message send in `BLEService.swift` — the Swift copy of the
+codec, fixed in the same change; it stays a hand-mirrored copy until iOS moves
+onto the crate through UniFFI (tracked gap, see `SPEC.md` §12).
+
+**Guarded by:** `vectors.rs::bitchat_ios_vectors`, `vectors.rs::bitchat_android_vectors`, `mesh_engine.rs::compressed_announce_from_a_reference_encoder_is_accepted`, `signing.rs::compressed_payload_verifies_from_wire_bytes_not_a_recompression`, `mesh_engine.rs::long_text_and_replies_to_a_stock_peer_use_only_legacy_tlvs`, `mesh_engine.rs::sonar_peer_receives_extended_tlvs_in_one_message`, `BinaryProtocolWirePayloadTests.testReencodeReproducesAForeignDeflateStream`, `BinaryProtocolWirePayloadTests.testSignatureOverUncompressedCompressiblePayloadVerifies`, `PrivateMessagePacketLegacyTests.testStockPeerGetsSplitLegacyFramesWithDerivedIDs`, `PrivateMessagePacketLegacyTests.testSonarPeerGetsOneExtendedFrame`
+
+**Not guarded:** bitchat iOS 1.8.0 itself still re-compresses for verification
+(`SPEC.md` §12 ★), so a Sonar frame with a compressible signed payload can
+fail there regardless of what Sonar does; only an upstream change fixes that.
+iOS unit tests for the Swift copy run in CI but no test exercises a real
+stock-client decoder end to end; the upstream drop-in replay tests in
+`core/bitchat-protocol/upstream/` do, once they land there.
+
+**History:** #291 ported the codec to Rust "for uncompressed packets" and the
+compressed branch was never finished; the iOS "0x53 unverified" symptom was
+noted during the Android↔iOS DM work (2026-06) and misattributed to signing-
+byte layout. Both root causes found together 2026-10-24 by diffing the three
+codecs against upstream HEAD.
+
+**Rejected:** *Making the Rust encoder reproduce Apple's DEFLATE bytes so
+stock iOS verifies.* Not achievable in general (different encoder, levels,
+heuristics), and it would still break the moment either side upgrades zlib.
+*Never compressing on send.* Does not help: a receiver that re-compresses for
+verification compresses our uncompressed payload too. The only sound rule is
+the one upstream Android adopted — verify over received bytes — so that is the
+invariant.
+
+## R-059 — One lost BLE frame must not end a Noise session
+
+**Invariant:** The Noise transport receiver decrypts with the **extracted**
+4-byte nonce and keeps the reference clients' 1024-entry sliding replay
+window: a newer nonce is always accepted (gaps), a nonce inside the window is
+accepted once, an older one is rejected, and state advances only after a
+successful decryption.
+
+**Breaks as:** after a single dropped or reordered BLE frame, every later
+message from that peer is rejected ("replay/out-of-order nonce") until a new
+handshake — DMs stop arriving mid-conversation while the link looks healthy.
+The pre-crate `noise.rs` required the wire nonce to equal snow's own counter.
+
+**Call sites:** core `bitchat-protocol/src/noise.rs::CipherState::decrypt`
+(the only transport decrypt; `sonar-core::noise` re-exports it). iOS
+`NoiseProtocol.swift::NoiseCipherState.decrypt` (upstream-identical sliding
+window; unchanged).
+
+**Guarded by:** `noise.rs::lost_and_reordered_messages_inside_the_window_are_accepted`, `noise.rs::nonces_older_than_the_window_are_rejected`, `noise.rs::window_bitmap_tracks_seen_nonces_exactly`, `mesh_engine.rs::a_lost_frame_does_not_kill_the_noise_session`
+
+**Not guarded:** behaviour against a real iOS peer over the air (the window
+semantics are copied from `NoiseCipherState`, not vector-tested — the Swift
+cipher lives in the app target and no deterministic vector exists for a
+handshake).
+
+**History:** the explicit-nonce framing landed in 2026-06 (Android↔iOS DMs)
+with a note that the sliding window was a follow-up; fixed 2026-10-24 when the
+transport moved into the protocol crate.
+
+**Rejected:** *Keeping snow's transport state and calling `set_receiving_nonce`
+with the wire value.* snow caps messages at 65 535 bytes while bitchat
+encrypts whole 1 MiB private files in one message, so the crate derives the
+split keys and owns the cipher state instead.
 
 ## Unguarded
 

@@ -11,7 +11,27 @@ import Foundation
 enum NoiseSecurityConstants {
     // Maximum message size to prevent memory exhaustion
     static let maxMessageSize = 65535 // 64KB as per Noise spec
-    
+
+    // The extracted transport nonce (4 bytes) and Poly1305 tag (16 bytes)
+    // `NoiseSession` adds around every transport plaintext.
+    static let transportCiphertextOverhead = 20
+
+    // Private files (Noise payload 0x20) are an explicit bitchat extension to
+    // the ordinary Noise message-size ceiling: current bitchat-android and
+    // Sonar Android encrypt a whole file TLV (up to 1 MiB) in ONE transport
+    // message. They stay bounded by the same framed-file cap the binary and
+    // fragment decoders enforce, less the outer 0x11 packet envelope (v2 adds
+    // two length bytes) and the cipher overhead. Only the `.privateFile`
+    // typed-payload path may use this larger budget; everything else keeps
+    // `maxMessageSize`. Mirrors upstream bitchat `NoiseSecurityConstants`.
+    private static let privateFileOuterPacketOverhead = BinaryProtocol.v1HeaderSize + 2
+        + BinaryProtocol.senderIDSize
+        + BinaryProtocol.recipientIDSize
+    static let maxPrivateFilePlaintextSize = FileTransferLimits.maxFramedFileBytes
+        - privateFileOuterPacketOverhead
+        - transportCiphertextOverhead
+    static let maxPrivateFileCiphertextSize = maxPrivateFilePlaintextSize + transportCiphertextOverhead
+
     // Maximum handshake message size
     static let maxHandshakeMessageSize = 2048 // 2KB to accommodate XX pattern
 
