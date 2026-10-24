@@ -3269,10 +3269,12 @@ onto the crate through UniFFI (tracked gap, see `SPEC.md` §12).
 
 **Not guarded:** bitchat iOS 1.8.0 itself still re-compresses for verification
 (`SPEC.md` §12 ★), so a Sonar frame with a compressible signed payload can
-fail there regardless of what Sonar does; only an upstream change fixes that.
+fail there regardless of what Sonar does; the fix is open upstream as
+permissionlesstech/bitchat#1805 and only a shipped iOS release closes it.
 iOS unit tests for the Swift copy run in CI but no test exercises a real
 stock-client decoder end to end; the upstream drop-in replay tests in
-`core/bitchat-protocol/upstream/` do, once they land there.
+`core/bitchat-protocol/upstream/` do, once they land there
+(permissionlesstech/bitchat#1805, permissionlesstech/bitchat-android#994).
 
 **History:** #291 ported the codec to Rust "for uncompressed packets" and the
 compressed branch was never finished; the iOS "0x53 unverified" symptom was

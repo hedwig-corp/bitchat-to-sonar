@@ -140,12 +140,12 @@ private struct VectorFile {
 /// Kinds replayed by this suite.
 private let bitFoundationKinds: Set<String> = [
     "padding", "optimal_block_size", "unpad", "should_compress", "compress",
-    "packet_encode", "packet_decode_reject", "packet_decode_accept", "peer_id", "capabilities",
+    "packet_encode", "packet_decode_reject", "packet_decode_accept", "peer_id", "capabilities"
 ]
 /// Kinds whose codecs live in the app target; replayed by `BitchatAppVectorReplayTests`.
 private let appTargetKinds: Set<String> = [
     "announce_tlv", "announce_decode", "peer_state_tlv", "private_message_tlv",
-    "noise_payload", "file_packet_tlv", "fragment_payload",
+    "noise_payload", "file_packet_tlv", "fragment_payload"
 ]
 
 private func makePacket(_ i: JV) throws -> BitchatPacket {
