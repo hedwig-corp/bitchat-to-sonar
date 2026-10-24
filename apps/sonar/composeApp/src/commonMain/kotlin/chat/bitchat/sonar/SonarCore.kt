@@ -848,6 +848,23 @@ expect object SonarCore {
      *  waiting for relay connectivity. Returns our npub. Safe to call repeatedly. */
     suspend fun start(): String
 
+    // ── Accounts (switcher) ─────────────────────────────────────────────
+    /** Every account registered on this install, with the active one. Cheap:
+     *  cached until a write. See [SonarAccountRegistrySnapshot]. */
+    fun accounts(): SonarAccountRegistrySnapshot
+    /** Add an account (`nsec == null` generates a key) under its own store
+     *  directory and switch to it. A pasted key tries its Blossom backup first;
+     *  [lastImportBackupOutcome] says what happened. Adding a key that is
+     *  already registered is a switch. Returns the new npub. */
+    suspend fun addAccount(nsec: String?, label: String?): String
+    /** Close the live store (never wipe it) and open [pubkeyHex]'s store
+     *  locally. Rolls back to the previous account when the target fails to
+     *  open. Returns the npub now live. */
+    suspend fun switchAccount(pubkeyHex: String): String
+    /** Remove a NON-active account: its store, sidecars and secrets go; its
+     *  wallet directory stays. */
+    suspend fun removeAccount(pubkeyHex: String)
+
     /** Replace the local-only node with a relay-backed node using the same
      *  identity and encrypted database. Existing local reads stay available
      *  while the relay connection is established. */
@@ -1319,6 +1336,12 @@ expect object SonarCore {
     /** Generic persisted key/value blobs (⚡PAY ledger, BIP-353 address, …). */
     fun loadBlob(key: String): String
     fun saveBlob(key: String, value: String)
+    /** Make every blob/pref write so far durable before returning. Android
+     *  `apply()` writes asynchronously in-process; an account switch calls
+     *  this before the core commits the new active account, so a crash can
+     *  never leave the new account active over the previous account's live
+     *  values. Desktop writes are already synchronous. */
+    fun flushBlobs()
 
     /** Wipe all on-device data (identity, chats, prefs). */
     suspend fun wipe()

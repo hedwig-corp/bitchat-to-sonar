@@ -142,13 +142,22 @@ actual object Notifier {
         sound: SonarNotificationSound,
         conversationId: String?,
         messageId: String?,
+        accountPubkeyHex: String?,
     ) {
         if (!canNotify()) return
+        // Every conversation banner names the account that produced it: a tap
+        // after a switch must open it in THAT account, never in whichever one
+        // is active by then (it could reply as the wrong identity).
+        val account = accountPubkeyHex
+            ?: conversationId?.takeIf { it.isNotBlank() }?.let { activeAccountPubkeyHexForNotification() }
         val open = Intent(ctx, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
                 Intent.FLAG_ACTIVITY_SINGLE_TOP
             if (!conversationId.isNullOrBlank()) {
                 putExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID, conversationId)
+            }
+            if (!account.isNullOrBlank()) {
+                putExtra(SonarNotificationHandoff.EXTRA_ACCOUNT_PUBKEY, account)
             }
             SonarNotificationHandoff.normalizeJumpMessageId(messageId)?.let {
                 putExtra(SonarNotificationHandoff.EXTRA_MESSAGE_ID, it)

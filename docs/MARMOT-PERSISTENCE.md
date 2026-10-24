@@ -49,6 +49,44 @@ use `new_with_key(path, EncryptionConfig::new(key: [u8; 32]))`:
   on every launch so the existing database reopens.
 - A wrong key fails to open the database (verified by a test).
 
+## Several accounts per install (2026-10-15)
+
+```text
+<data dir>/accounts.json                      registry: entries + active pubkey (core-owned, atomic write)
+<data dir>/marmot.sqlite                      the pre-registry store, registered in place as the "legacy" account
+<data dir>/accounts/<pubkey_hex>/marmot.sqlite every account added later
+```
+
+`sonar_core::accounts` owns the file and the layout; every sidecar in this
+document hangs off the `marmot.sqlite` path, so a per-account directory
+isolates the index, outbox, push-token cache, backup policy and restore
+staging with no further change. Secrets stay host-side and are named per
+account through `account_secret_key_name(base, tag)`: the legacy account keeps
+the bare `marmot-nsec` / `marmot-db-key` (`nsec` / `dbKeyHex` on Compose), so
+registering it never moves a secret; later accounts use `<base>.<hex>`.
+
+Exactly one store is open per process. A switch is close → set active → open
+(local-first), never a wipe. `wipeDatabase(scope: .activeAccount)` (iOS) /
+`wipeActiveStore()` (Compose) serve erase-chats and nsec restore; the panic
+wipe removes the whole data dir and every account's keys. The iOS NSE reads
+the registry through the FFI and tries the active account first, then the
+others with a short budget, keeping the single App Group store lock for the
+whole pass. Cap: `MAX_ACCOUNTS = 5`.
+
+Host state outside the Marmot store splits in two on a switch. Device-level
+state stays where it is and is shared by every account, because the BLE/Noise
+identity is: mesh transcripts and media, links and mesh names, verification
+marks, mutes, the payment-bubble ledger, peer profile and descriptor caches,
+the media cache. The few values that belong to one account (nickname, handle,
+cellular-backup consent, wallet activity, and on iOS the call log) are copied
+into a per-account record before the switch resets them and copied back when
+that account is active again: `AccountLocalStateParking` (Compose, blob
+`accounts.parked.<hex>`) and `SonarAccountLocalState` (iOS, UserDefaults
+`sonar.accounts.parked.<hex>`). Every launch replays a record left for the
+active account by a crash mid-switch; removing an account drops its record;
+the panic wipe drops them all. A restore replaces the account and still clears
+everything.
+
 ## Build flags (baked into `core/build-ios.sh`)
 
 The script unsets the OpenSSL discovery env vars before building so the Apple

@@ -331,7 +331,8 @@ fun SNNavHeader(title: String, hairline: Boolean = true, onBack: () -> Unit) {
 }
 
 enum class SNTone { Default, Cyan, Gold, Red }
-enum class SNTrail { Chevron, None }
+/** Row trailing glyph. `Check` marks the selected item in a picker (design: `trail="check"`). */
+enum class SNTrail { Chevron, Check, None }
 
 /** st-card — a rounded grouped card wrapping settings rows. */
 @Composable
@@ -388,6 +389,7 @@ fun SNSettingsRow(
             when {
                 toggle != null -> SNSwitch(toggle)
                 trail == SNTrail.Chevron -> SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
+                trail == SNTrail.Check -> SNIcon(SNIconName.Check, 16.dp, s.accentDeep, weight = 2.4f)
                 else -> {}
             }
         }

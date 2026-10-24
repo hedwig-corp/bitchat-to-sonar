@@ -341,7 +341,8 @@ fun mergeWalletActivity(
  * the app's main scope (same threading contract as SonarAppState's payLedger).
  */
 object PaymentActivityStore {
-    private const val BLOB_KEY = "payment.activity"
+    /** Per-account: parked on an account switch (see AccountLocalStateParking). */
+    internal const val BLOB_KEY = "payment.activity"
 
     private var ledger: SonarPaymentActivityLedger? = null
 
@@ -494,6 +495,13 @@ object PaymentActivityStore {
             ledger = SonarPaymentActivityLedger()
             SonarCore.saveBlob(BLOB_KEY, "")
         }
+        version++
+    }
+
+    /** Drop the in-memory ledger so the next read loads the blob again: an
+     *  account switch has just put the incoming account's activity there. */
+    fun reload() {
+        lock.withLock { ledger = null }
         version++
     }
 

@@ -609,14 +609,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleNotificationIntent(intent: Intent?) {
-        val chatId = intent?.getStringExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID)
+        if (intent == null) return
+        val chatId = intent.getStringExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID)
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
-            ?: return
+        val accountPubkeyHex = intent.getStringExtra(SonarNotificationHandoff.EXTRA_ACCOUNT_PUBKEY)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+        if (chatId == null && accountPubkeyHex == null) return
         val jumpMessageId = intent.getStringExtra(SonarNotificationHandoff.EXTRA_MESSAGE_ID)
         intent.removeExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID)
         intent.removeExtra(SonarNotificationHandoff.EXTRA_MESSAGE_ID)
-        SonarLifecycle.submitOpenConversation(chatId, jumpMessageId = jumpMessageId)
+        intent.removeExtra(SonarNotificationHandoff.EXTRA_ACCOUNT_PUBKEY)
+        SonarLifecycle.submitOpenConversation(
+            chatId.orEmpty(),
+            jumpMessageId = jumpMessageId,
+            accountPubkeyHex = accountPubkeyHex,
+        )
     }
 
     /**

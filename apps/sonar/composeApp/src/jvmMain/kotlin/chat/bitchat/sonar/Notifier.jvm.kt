@@ -24,8 +24,11 @@ import javax.sound.sampled.AudioSystem
  */
 actual object Notifier {
     @Volatile private var trayIcon: TrayIcon? = null
-    private val lastConversationId = AtomicReference<String?>(null)
-    private val lastMessageId = AtomicReference<String?>(null)
+    /** What a tray click opens: conversation, jump target and the account
+     *  that produced it, published and read as ONE value so a click racing a
+     *  new banner never pairs one banner's chat with another's account. */
+    private data class TapTarget(val conversationId: String, val messageId: String?, val accountPubkeyHex: String?)
+    private val lastTarget = AtomicReference<TapTarget?>(null)
     private val soundGeneration = AtomicLong()
     private val soundExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "sonar-notification-sound").apply { isDaemon = true }
@@ -51,10 +54,11 @@ actual object Notifier {
                 isImageAutoSize = true
                 addActionListener(
                     ActionListener {
-                        lastConversationId.get()?.let { chatId ->
+                        lastTarget.get()?.let { target ->
                             SonarLifecycle.submitOpenConversation(
-                                conversationId = chatId,
-                                jumpMessageId = lastMessageId.get(),
+                                conversationId = target.conversationId,
+                                jumpMessageId = target.messageId,
+                                accountPubkeyHex = target.accountPubkeyHex,
                             )
                         }
                     },
@@ -84,10 +88,18 @@ actual object Notifier {
         sound: SonarNotificationSound,
         conversationId: String?,
         messageId: String?,
+        accountPubkeyHex: String?,
     ) {
         if (!conversationId.isNullOrBlank()) {
-            lastConversationId.set(conversationId)
-            lastMessageId.set(SonarNotificationHandoff.normalizeJumpMessageId(messageId))
+            // The account that produced it, so a click after a switch opens
+            // it in THAT account rather than whichever one is active then.
+            lastTarget.set(
+                TapTarget(
+                    conversationId = conversationId,
+                    messageId = SonarNotificationHandoff.normalizeJumpMessageId(messageId),
+                    accountPubkeyHex = accountPubkeyHex ?: activeAccountPubkeyHexForNotification(),
+                ),
+            )
         }
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
@@ -101,11 +113,9 @@ actual object Notifier {
         // click cannot reopen a just-read conversation by accident.
         val cleared = conversationIds.filter { it.isNotBlank() }.toSet()
         if (cleared.isEmpty()) return
-        val last = lastConversationId.get()
-        if (last != null && last in cleared) {
-            if (lastConversationId.compareAndSet(last, null)) {
-                lastMessageId.set(null)
-            }
+        val last = lastTarget.get()
+        if (last != null && last.conversationId in cleared) {
+            lastTarget.compareAndSet(last, null)
         }
     }
 

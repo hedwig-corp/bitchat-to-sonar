@@ -37306,7 +37306,7 @@
     },
     "Your nickname is what people see. Your key stays on this device unless you explicitly export it." : {
 
-    }    ,
+    },
     "chat.copy" : {
       "comment" : "Context-menu action to copy the full message text, Signal-style",
       "extractionState" : "manual",
@@ -37462,8 +37462,79 @@
     },
     "Payments to this address go to your wallet at mint.hedwig.sh." : {
 
-    }
+    },
+    "Accounts" : {
 
+    },
+    "Add account" : {
+
+    },
+    "Remove account" : {
+
+    },
+    "Remove from this phone" : {
+
+    },
+    "Switch account" : {
+
+    },
+    "Create a new key or sign in with an nsec" : {
+
+    },
+    "Only the selected account is online. Others still get notifications; tap one to switch." : {
+
+    },
+    "Your current account stays on this phone with all its chats. Only one account is online at a time; the others still receive notifications." : {
+
+    },
+    "Label (optional, e.g. Work)" : {
+
+    },
+    "Create new account" : {
+
+    },
+    "Adding..." : {
+
+    },
+    "or sign in with an existing key" : {
+
+    },
+    "Sign in with this key" : {
+
+    },
+    "Removing..." : {
+
+    },
+    "This removes %@ from this phone: its chats and keys here are deleted. The account still exists wherever you keep its nsec, and its wallet files stay on this phone." : {
+
+    },
+    "Account added — chats recovered from backup" : {
+
+    },
+    "Account added — chats start empty on this phone" : {
+
+    },
+    "Couldn't open that account: %@" : {
+
+    },
+    "That account is not on this phone." : {
+
+    },
+    "This is your only account. Use Emergency wipe to remove it." : {
+
+    },
+    "Account list unreadable: %@" : {
+
+    },
+    "New messages for %@" : {
+
+    },
+    "Tap to switch to this account" : {
+
+    },
+    "You can keep up to %@ accounts on this phone." : {
+
+    }
   },
   "version" : "1.1"
 }

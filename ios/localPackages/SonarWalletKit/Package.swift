@@ -19,17 +19,17 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // Breez SDK Liquid official Swift bindings — pinned to the SAME version as
-        // the Android/desktop KMP package (0.12.4) so the wallet behaves
-        // identically across platforms. SPM downloads the prebuilt xcframework.
-        .package(url: "https://github.com/breez/breez-sdk-liquid-swift", exact: "0.12.4"),
+        // Breez SDK Liquid Swift bindings, vendored: upstream deleted the package
+        // and its binaries (see ../BreezSDKLiquid/MIRROR.md). 0.11.13 is the last
+        // mirrored release; the Android/desktop KMP package stays on 0.12.4.
+        .package(path: "../BreezSDKLiquid"),
     ],
     targets: [
         // Thin Swift layer: Keychain-backed seed + async/await façade over Breez.
         .target(
             name: "WalletKit",
             dependencies: [
-                .product(name: "BreezSDKLiquid", package: "breez-sdk-liquid-swift"),
+                .product(name: "BreezSDKLiquid", package: "BreezSDKLiquid"),
             ],
             path: "Sources"
         ),

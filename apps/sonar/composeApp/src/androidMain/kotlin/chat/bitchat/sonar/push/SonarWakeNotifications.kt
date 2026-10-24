@@ -1,5 +1,6 @@
 package chat.bitchat.sonar.push
 
+import chat.bitchat.sonar.activeAccountPubkeyHexForNotification
 import chat.bitchat.sonar.MUTE_BLOB_KEY
 import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
@@ -15,6 +16,10 @@ import chat.bitchat.sonar.decodeMuteMap
 import chat.bitchat.sonar.decodeProfileCache
 import chat.bitchat.sonar.isMutedAt
 import chat.bitchat.sonar.resolvePushSenderName
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.new_messages_for
+import chat.bitchat.sonar.resources.tap_to_switch_to_this_account
+import org.jetbrains.compose.resources.getString
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeoutOrNull
@@ -30,6 +35,36 @@ import kotlinx.coroutines.withTimeoutOrNull
 internal object SonarWakeNotifications {
 
     private const val PROFILE_FETCH_BUDGET_MS = 5_000L
+    /** Per-account drain window for background accounts (iOS NSE uses 3 s). */
+    private const val INACTIVE_ACCOUNT_PEEK_MS = 3_000L
+
+    /**
+     * Background accounts (push-only): after the active account's drain, peek
+     * the other registered accounts and post ONE banner per account that
+     * received something. The banner names the account, never a sender or a
+     * preview — that store is not the live one — and its tap switches to it.
+     * Returns how many accounts were notified.
+     */
+    suspend fun notifyInactiveAccounts(prefs: SonarNotificationPrefs): Int {
+        if (!prefs.enabled) return 0
+        // One account online at a time: with the UI visible the active node
+        // is live, so no second relay-connected store. The user is right
+        // there and can switch by hand.
+        if (chat.bitchat.sonar.SonarLifecycle.appVisible) return 0
+        val hit = SonarCore.peekInactiveAccountsForWake(INACTIVE_ACCOUNT_PEEK_MS)
+        for (account in hit) {
+            val name = account.label?.takeIf { it.isNotBlank() } ?: account.shortNpub
+            Notifier.notify(
+                id = ("account:" + account.pubkeyHex).hashCode(),
+                title = getString(Res.string.new_messages_for, name),
+                body = getString(Res.string.tap_to_switch_to_this_account),
+                sound = SonarNotificationSound.Default,
+                conversationId = null,
+                accountPubkeyHex = account.pubkeyHex,
+            )
+        }
+        return hit.size
+    }
 
     /** Render titled notifications for every unread conversation from local
      *  storage. Returns how many conversations were notified.
@@ -45,7 +80,13 @@ internal object SonarWakeNotifications {
         profileFetchBudgetMs: Long = PROFILE_FETCH_BUDGET_MS,
         tryClaimPost: () -> Boolean = { true },
     ): Int {
+        // These banners belong to the account whose store is drained here.
+        // Name it explicitly (the Notifier fallback would read the active
+        // account at POST time), and drop the batch if a switch lands while
+        // the drain runs: the summaries could then be the other account's.
+        val account = activeAccountPubkeyHexForNotification()
         val summaries = SonarCore.conversationSummaries()
+        if (activeAccountPubkeyHexForNotification() != account) return 0
         val unread = summaries.filter { it.unreadCount > 0 }
         if (unread.isEmpty()) return 0
 
@@ -99,6 +140,7 @@ internal object SonarWakeNotifications {
             // The inline fallback can stop awaiting us while a blocking UniFFI
             // call is still running. Its gate is the final authority: never
             // post a titled banner after that caller has degraded to generic.
+            if (activeAccountPubkeyHexForNotification() != account) return notified
             if (notif != null && tryClaimPost()) {
                 Notifier.notify(
                     id = notif.id,
@@ -111,6 +153,7 @@ internal object SonarWakeNotifications {
                         SonarNotificationSound.Default
                     },
                     conversationId = summary.groupIdHex,
+                    accountPubkeyHex = account,
                 )
                 notified++
             }
