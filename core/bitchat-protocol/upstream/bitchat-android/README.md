@@ -54,6 +54,10 @@ SONAR_VECTOR_FILE=/path/to/bitchat-to-sonar/core/bitchat-protocol/vectors/bitcha
 ./gradlew :app:testDebugUnitTest --tests 'com.bitchat.android.protocol.BitchatVectorReplayTest'
 ```
 
+Gradle does not treat `SONAR_VECTOR_FILE` as a task input, so a second run
+against a different file is reported UP-TO-DATE with the previous result:
+pass `--rerun` (or `--rerun-tasks`) whenever you change the variable.
+
 Drop `SONAR_VECTOR_FILE` once the JSON is under `app/src/test/resources/`. The
 test prints `replayed N cases` with a per-kind count to the test stdout
 (`app/build/test-results/testDebugUnitTest/TEST-…BitchatVectorReplayTest.xml`).

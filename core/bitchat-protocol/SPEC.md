@@ -335,7 +335,9 @@ frame whose compressible (≥100 B, low‑entropy) payload was produced by any
 other DEFLATE encoder — or sent uncompressed — fails verification there.
 Nothing a sender can do fixes this except keeping such payloads under 100 B or
 high‑entropy; it needs the §5 rule upstream (as bitchat-android already has).
-The proposed fix is `upstream/bitchat-ios-verify-over-wire-payload.patch`.
+The fix is proposed upstream as permissionlesstech/bitchat#1805
+(`upstream/bitchat-ios-verify-over-wire-payload.patch`); until it ships, stock
+iOS builds keep the defect.
 In practice: Noise frames are high‑entropy (unaffected); announces with
 nicknames under ~30 bytes stay under 100 B (unaffected); long signed public
 messages and `0x53` announces with a BIP‑353 address are affected.

@@ -166,10 +166,10 @@ index db286ae3..4db1b9e3 100644
      
 diff --git a/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift b/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift
 new file mode 100644
-index 00000000..07240e00
+index 00000000..9466a5c8
 --- /dev/null
 +++ b/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,242 @@
 +//
 +// BinaryProtocolWirePayloadTests.swift
 +// BitFoundationTests
@@ -403,7 +403,8 @@ index 00000000..07240e00
 +        let frame = try #require(fresh(type: 0x02, ttl: 7, payload: compressiblePayload).toBinaryData(padding: false))
 +        let decoded = try #require(BinaryProtocol.decode(frame))
 +        let json = try JSONEncoder().encode(decoded)
-+        #expect(!String(decoding: json, as: UTF8.self).contains("wirePayload"))
++        let text = try #require(String(bytes: json, encoding: .utf8))
++        #expect(!text.contains("wirePayload"))
 +        let restored = try JSONDecoder().decode(BitchatPacket.self, from: json)
 +        #expect(restored.wirePayload == nil)
 +        #expect(restored.payload == decoded.payload)

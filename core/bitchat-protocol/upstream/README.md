@@ -4,6 +4,16 @@ Material Sonar prepares for the reference clients, kept here until it lands
 upstream so the compatibility matrix in `../SPEC.md` has concrete artifacts to
 point at.
 
+**Status (2026-10-24):** both opened from `vincenzopalazzo`'s forks.
+
+| Upstream PR | Contents | Verified before opening |
+|---|---|---|
+| [permissionlesstech/bitchat#1805](https://github.com/permissionlesstech/bitchat/pull/1805) | the wire-payload patch + `bitchat-ios/` replay tests + `vectors/bitchat-ios.json` (two copies) | `swift test` 205/205 in BitFoundation, `xcodebuild test` 7 tests / 80 cases in the app target, SwiftLint `--strict` clean (upstream's lint job is blocking) |
+| [permissionlesstech/bitchat-android#994](https://github.com/permissionlesstech/bitchat-android/pull/994) | `bitchat-android/BitchatVectorReplayTest.kt` + `vectors/bitchat-android.json` as a test resource | 90/90 on upstream `d1da9716`; mutation check fails per corrupted field |
+
+When either lands, drop the corresponding copy here and have
+`scripts/check-bitchat-upstream-drift.sh` cover the upstream test file instead.
+
 ## Vector replay tests (`bitchat-ios/`, `bitchat-android/`)
 
 Drop-in tests for each upstream repository that replay `../vectors/*.json`
