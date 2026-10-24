@@ -1,127 +1,8 @@
-diff --git a/ios/bitchat/Models/BitchatPacket.swift b/ios/bitchat/Models/BitchatPacket.swift
-index a647d3760..81c4df95c 100644
---- a/ios/bitchat/Models/BitchatPacket.swift
-+++ b/ios/bitchat/Models/BitchatPacket.swift
-@@ -8,6 +8,42 @@
- 
- import Foundation
- 
-+/// The payload bytes exactly as they arrived on the wire, kept beside the
-+/// decoded payload so a re-encode (relay TTL decrement, signature
-+/// verification) reproduces the originator's bytes instead of running our own
-+/// DEFLATE encoder over the payload.
-+///
-+/// DEFLATE output is encoder-specific: Apple's `Compression` framework, Rust
-+/// miniz (Sonar Android) and `java.util.zip` (bitchat-android) all emit
-+/// different streams for the same input, and a sender may also have chosen
-+/// NOT to compress a payload we would compress. Either way, rebuilding the
-+/// signature preimage with our encoder rejects every valid signed packet whose
-+/// payload is compressible (≥ `TransportConfig.compressionThresholdBytes`).
-+/// Mirrors `WirePayload` in `core/bitchat-protocol/src/packet.rs` and upstream
-+/// bitchat-android #863 ("preserve wire payload").
-+///
-+/// `payloadSHA256` ties the bytes to the payload they decode to: change the
-+/// payload and the encoder compresses afresh.
-+struct WirePayload {
-+    /// Compressed stream when `compressed`, else the raw payload.
-+    let bytes: Data
-+    /// Whether `bytes` is a DEFLATE stream.
-+    let compressed: Bool
-+    /// SHA-256 of the decoded payload these bytes belong to.
-+    let payloadSHA256: Data
-+
-+    init(bytes: Data, compressed: Bool, forPayload payload: Data) {
-+        self.bytes = bytes
-+        self.compressed = compressed
-+        self.payloadSHA256 = payload.sha256Hash()
-+    }
-+
-+    /// Do these wire bytes still describe `payload`?
-+    func matches(_ payload: Data) -> Bool {
-+        payloadSHA256 == payload.sha256Hash()
-+    }
-+}
-+
- /// The core packet structure for all BitChat protocol messages.
- /// Encapsulates all data needed for routing through the mesh network,
- /// including TTL for hop limiting and optional encryption.
-@@ -23,7 +59,15 @@ struct BitchatPacket: Codable {
-     var ttl: UInt8
-     var route: [Data]?
-     var isRSR: Bool
--    
-+    /// Payload bytes as received; `nil` for a locally built packet. Not part of
-+    /// the coded form and not an identity property: two packets with the same
-+    /// fields are the same packet whether or not one remembers its wire bytes.
-+    var wirePayload: WirePayload? = nil
-+
-+    private enum CodingKeys: String, CodingKey {
-+        case version, type, senderID, recipientID, timestamp, payload, signature, ttl, route, isRSR
-+    }
-+
-     init(type: UInt8, senderID: Data, recipientID: Data?, timestamp: UInt64, payload: Data, signature: Data?, ttl: UInt8, version: UInt8 = 1, route: [Data]? = nil, isRSR: Bool = false) {
-         self.version = version
-         self.type = type
-@@ -36,7 +80,7 @@ struct BitchatPacket: Codable {
-         self.route = route
-         self.isRSR = isRSR
-     }
--    
-+
-     // Convenience initializer for new binary format
-     init(type: UInt8, ttl: UInt8, senderID: PeerID, payload: Data, isRSR: Bool = false) {
-         self.version = 1
-@@ -60,11 +104,11 @@ struct BitchatPacket: Codable {
-         self.route = nil
-         self.isRSR = isRSR
-     }
--    
-+
-     var data: Data? {
-         BinaryProtocol.encode(self)
-     }
--    
-+
-     func toBinaryData(padding: Bool = true) -> Data? {
-         BinaryProtocol.encode(self, padding: padding)
-     }
-@@ -73,13 +117,13 @@ struct BitchatPacket: Codable {
-     func toBinaryData() -> Data? {
-         toBinaryData(padding: true)
-     }
--    
-+
-     /// Create binary representation for signing (without signature and TTL fields)
-     /// TTL is excluded because it changes during packet relay operations
-     func toBinaryDataForSigning() -> Data? {
-         // Create a copy without signature and with fixed TTL for signing
-         // TTL must be excluded because it changes during relay
--        let unsignedPacket = BitchatPacket(
-+        var unsignedPacket = BitchatPacket(
-             type: type,
-             senderID: senderID,
-             recipientID: recipientID,
-@@ -91,9 +135,14 @@ struct BitchatPacket: Codable {
-             route: route,
-             isRSR: false // RSR flag is mutable and not part of the signature
-         )
-+        // A verifier must rebuild the preimage from the bytes the ORIGINATOR
-+        // put on the wire, never from a re-compression of the payload (see
-+        // `WirePayload`). For a locally built packet this is nil and the
-+        // encoder decides compression exactly as before.
-+        unsignedPacket.wirePayload = wirePayload
-         return BinaryProtocol.encode(unsignedPacket)
-     }
--    
-+
-     static func from(_ data: Data) -> BitchatPacket? {
-         BinaryProtocol.decode(data)
-     }
-diff --git a/ios/bitchat/Protocols/BinaryProtocol.swift b/ios/bitchat/Protocols/BinaryProtocol.swift
-index 568daf2a5..13ade0ed2 100644
---- a/ios/bitchat/Protocols/BinaryProtocol.swift
-+++ b/ios/bitchat/Protocols/BinaryProtocol.swift
-@@ -146,13 +146,29 @@ struct BinaryProtocol {
+diff --git a/localPackages/BitFoundation/Sources/BitFoundation/BinaryProtocol.swift b/localPackages/BitFoundation/Sources/BitFoundation/BinaryProtocol.swift
+index 8590db7d..f59813e7 100644
+--- a/localPackages/BitFoundation/Sources/BitFoundation/BinaryProtocol.swift
++++ b/localPackages/BitFoundation/Sources/BitFoundation/BinaryProtocol.swift
+@@ -134,13 +134,29 @@ public struct BinaryProtocol {
          let version = packet.version
          guard version == 1 || version == 2 else { return nil }
  
@@ -136,7 +17,7 @@ index 568daf2a5..13ade0ed2 100644
 -            // Only compress when we can represent the original length in the outbound frame
 -            let maxRepresentable = version == 2 ? Int(UInt32.max) : Int(UInt16.max)
 +        if let wire = packet.wirePayload, wire.matches(packet.payload) {
-+            // Reuse the originator's bytes verbatim — compressed or not — so a
++            // Reuse the originator's bytes verbatim, compressed or not, so a
 +            // relay re-encode and the signature preimage reproduce the frame
 +            // that was signed. Running `shouldCompress`/`compress` here instead
 +            // substitutes Apple's DEFLATE stream (or compresses a payload the
@@ -155,27 +36,31 @@ index 568daf2a5..13ade0ed2 100644
              if payload.count <= maxRepresentable,
                 let compressedPayload = CompressionUtil.compress(payload) {
                  originalPayloadSize = payload.count
-@@ -369,6 +385,7 @@ struct BinaryProtocol {
- 
-             // Payload: payloadLength is exactly the payload size (+ compression preamble if compressed)
+@@ -361,6 +377,7 @@ public struct BinaryProtocol {
+             // one frame-wide cap is not enough.
+             let maxPayloadSize = PacketPayloadLimits.maxPayloadBytes(forType: type)
              let payload: Data
 +            let wirePayload: WirePayload
              if isCompressed {
                  guard payloadLength >= lengthFieldBytes else { return nil }
                  let originalSize: Int
-@@ -392,9 +409,11 @@ struct BinaryProtocol {
+@@ -386,6 +403,7 @@ public struct BinaryProtocol {
                  guard let decompressed = CompressionUtil.decompress(compressed, originalSize: originalSize),
                        decompressed.count == originalSize else { return nil }
                  payload = decompressed
 +                wirePayload = WirePayload(bytes: compressed, compressed: true, forPayload: payload)
              } else {
+                 // Uncompressed payloads get the same ceiling, or a large frame
+                 // could arrive as small compressed fragments and be reassembled.
+@@ -395,6 +413,7 @@ public struct BinaryProtocol {
+                 }
                  guard let rawPayload = readData(payloadLength) else { return nil }
                  payload = rawPayload
 +                wirePayload = WirePayload(bytes: rawPayload, compressed: false, forPayload: payload)
              }
  
              var signature: Data? = nil
-@@ -405,7 +424,7 @@ struct BinaryProtocol {
+@@ -405,7 +424,7 @@ public struct BinaryProtocol {
  
              guard offset <= buf.count else { return nil }
  
@@ -184,7 +69,7 @@ index 568daf2a5..13ade0ed2 100644
                  type: type,
                  senderID: senderID,
                  recipientID: recipientID,
-@@ -417,6 +436,10 @@ struct BinaryProtocol {
+@@ -417,6 +436,10 @@ public struct BinaryProtocol {
                  route: route,
                  isRSR: isRSR
              )
@@ -195,3 +80,334 @@ index 568daf2a5..13ade0ed2 100644
          }
      }
  }
+diff --git a/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift b/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift
+index db286ae3..4db1b9e3 100644
+--- a/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift
++++ b/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift
+@@ -8,6 +8,41 @@
+ 
+ import struct Foundation.Data
+ 
++/// The payload bytes exactly as they arrived on the wire, kept beside the
++/// decoded payload so a re-encode (relay TTL decrement, signature
++/// verification) reproduces the originator's bytes instead of running our own
++/// DEFLATE encoder over the payload.
++///
++/// DEFLATE output is encoder-specific: Apple's `Compression` framework,
++/// `java.util.zip` (bitchat-android) and Rust miniz (Sonar) all emit different
++/// streams for the same input, and a sender may also have chosen NOT to
++/// compress a payload we would compress. Either way, rebuilding the signature
++/// preimage with our encoder rejects every valid signed packet whose payload is
++/// compressible (>= `Constants.compressionThresholdBytes`). Mirrors
++/// bitchat-android #863 ("preserve wire payload").
++///
++/// `payloadSHA256` ties the bytes to the payload they decode to: change the
++/// payload and the encoder compresses afresh.
++public struct WirePayload: Equatable, Sendable {
++    /// Compressed stream when `compressed`, else the raw payload.
++    public let bytes: Data
++    /// Whether `bytes` is a DEFLATE stream.
++    public let compressed: Bool
++    /// SHA-256 of the decoded payload these bytes belong to.
++    public let payloadSHA256: Data
++
++    public init(bytes: Data, compressed: Bool, forPayload payload: Data) {
++        self.bytes = bytes
++        self.compressed = compressed
++        self.payloadSHA256 = payload.sha256Hash()
++    }
++
++    /// Do these wire bytes still describe `payload`?
++    public func matches(_ payload: Data) -> Bool {
++        payloadSHA256 == payload.sha256Hash()
++    }
++}
++
+ /// The core packet structure for all BitChat protocol messages.
+ /// Encapsulates all data needed for routing through the mesh network,
+ /// including TTL for hop limiting and optional encryption.
+@@ -23,7 +58,15 @@ public struct BitchatPacket: Codable {
+     public var ttl: UInt8
+     public var route: [Data]?
+     public var isRSR: Bool
+-    
++    /// Payload bytes as received; `nil` for a locally built packet. Not part of
++    /// the coded form: two packets with the same fields are the same packet
++    /// whether or not one remembers its wire bytes.
++    public var wirePayload: WirePayload? = nil
++
++    private enum CodingKeys: String, CodingKey {
++        case version, type, senderID, recipientID, timestamp, payload, signature, ttl, route, isRSR
++    }
++
+     public init(type: UInt8, senderID: Data, recipientID: Data?, timestamp: UInt64, payload: Data, signature: Data?, ttl: UInt8, version: UInt8 = 1, route: [Data]? = nil, isRSR: Bool = false) {
+         self.version = version
+         self.type = type
+@@ -51,7 +94,7 @@ public struct BitchatPacket: Codable {
+     public func toBinaryDataForSigning() -> Data? {
+         // Create a copy without signature and with fixed TTL for signing
+         // TTL must be excluded because it changes during relay
+-        let unsignedPacket = BitchatPacket(
++        var unsignedPacket = BitchatPacket(
+             type: type,
+             senderID: senderID,
+             recipientID: recipientID,
+@@ -63,6 +106,11 @@ public struct BitchatPacket: Codable {
+             route: route,
+             isRSR: false // RSR flag is mutable and not part of the signature
+         )
++        // A verifier must rebuild the preimage from the bytes the ORIGINATOR
++        // put on the wire, never from a re-compression of the payload (see
++        // `WirePayload`). For a locally built packet this is nil and the
++        // encoder decides compression exactly as before.
++        unsignedPacket.wirePayload = wirePayload
+         return BinaryProtocol.encode(unsignedPacket)
+     }
+     
+diff --git a/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift b/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift
+new file mode 100644
+index 00000000..07240e00
+--- /dev/null
++++ b/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift
+@@ -0,0 +1,241 @@
++//
++// BinaryProtocolWirePayloadTests.swift
++// BitFoundationTests
++//
++// This is free and unencumbered software released into the public domain.
++// For more information, see <https://unlicense.org>
++//
++
++import CryptoKit
++import Foundation
++import Testing
++@testable import BitFoundation
++
++/// Signature preimages must be rebuilt from the bytes the ORIGINATOR put on
++/// the wire, never from a re-compression of the decoded payload. DEFLATE
++/// output is encoder-specific (Apple `Compression` vs `java.util.zip` on
++/// bitchat-android vs Rust miniz), and a sender may have left a compressible
++/// payload plain; either way a re-encode changes the preimage and every such
++/// signed packet fails verification. `WirePayload` on `BitchatPacket` keeps
++/// the received bytes so `BinaryProtocol.encode` and `toBinaryDataForSigning`
++/// reproduce the frame that was signed.
++struct BinaryProtocolWirePayloadTests {
++
++    private let sender = Data([0, 1, 2, 3, 4, 5, 6, 7])
++    private let timestamp: UInt64 = 0x0102_0304_0506_0708
++    /// 360 bytes: far over the compression threshold (100) and well under 90%
++    /// unique bytes, so `shouldCompress` says yes.
++    private var compressiblePayload: Data {
++        Data(String(repeating: "compress-me ", count: 30).utf8)
++    }
++
++    /// Hand-assembled v1 frame: header(14) + sender(8) + body. No recipient,
++    /// no signature, no padding.
++    private func v1Frame(type: UInt8, ttl: UInt8, flags: UInt8, body: Data) -> Data {
++        var frame = Data([1, type, ttl])
++        for shift in stride(from: 56, through: 0, by: -8) {
++            frame.append(UInt8((timestamp >> UInt64(shift)) & 0xFF))
++        }
++        frame.append(flags)
++        let length = UInt16(body.count)
++        frame.append(UInt8(length >> 8))
++        frame.append(UInt8(length & 0xFF))
++        frame.append(sender)
++        frame.append(body)
++        return frame
++    }
++
++    /// A valid raw DEFLATE stream Apple's encoder never emits for this input:
++    /// a single stored (uncompressed) block, RFC 1951 section 3.2.4.
++    private func storedDeflate(_ payload: Data) -> Data {
++        var out = Data([0x01]) // BFINAL=1, BTYPE=00, byte-aligned
++        let len = UInt16(payload.count)
++        out.append(UInt8(len & 0xFF))
++        out.append(UInt8(len >> 8))
++        let nlen = ~len
++        out.append(UInt8(nlen & 0xFF))
++        out.append(UInt8(nlen >> 8))
++        out.append(payload)
++        return out
++    }
++
++    private func fresh(type: UInt8, ttl: UInt8, payload: Data) -> BitchatPacket {
++        BitchatPacket(
++            type: type,
++            senderID: sender,
++            recipientID: nil,
++            timestamp: timestamp,
++            payload: payload,
++            signature: nil,
++            ttl: ttl
++        )
++    }
++
++    private func padded(_ frame: Data) -> Data {
++        MessagePadding.pad(frame, toSize: MessagePadding.optimalBlockSize(for: frame.count))
++    }
++
++    /// The canonical signing form of a raw frame: ttl 0, signature bit and RSR
++    /// bit cleared, then padded exactly like `BinaryProtocol.encode`.
++    private func signingForm(of frame: Data) -> Data {
++        var canonical = frame
++        canonical[2] = 0
++        canonical[BinaryProtocol.Offsets.flags] &= ~(BinaryProtocol.Flags.hasSignature | BinaryProtocol.Flags.isRSR)
++        return padded(canonical)
++    }
++
++    // MARK: - 1. A foreign compressed stream is reproduced byte for byte
++
++    @Test func reencodeReproducesAForeignDeflateStream() throws {
++        let payload = compressiblePayload
++        let stream = storedDeflate(payload)
++        var body = Data()
++        body.append(UInt8(payload.count >> 8))
++        body.append(UInt8(payload.count & 0xFF))
++        body.append(stream)
++        let frame = v1Frame(type: 0x02, ttl: 7, flags: BinaryProtocol.Flags.isCompressed | BinaryProtocol.Flags.isRSR, body: body)
++
++        let decoded = try #require(BinaryProtocol.decode(frame), "stored-block deflate must decode")
++        #expect(decoded.payload == payload)
++        #expect(decoded.wirePayload?.compressed == true)
++        #expect(decoded.wirePayload?.bytes == stream)
++        #expect(decoded.wirePayload?.matches(payload) == true)
++
++        // Our encoder would have produced a different (smaller) stream...
++        let ours = try #require(fresh(type: 0x02, ttl: 7, payload: payload).toBinaryData(padding: false))
++        #expect(ours != frame, "precondition: Apple's DEFLATE differs from the hand-built stream")
++        #expect(ours.count < frame.count)
++
++        // ...but a decoded packet re-encodes to exactly what arrived.
++        #expect(decoded.toBinaryData(padding: false) == frame)
++        let paddedFrame = try #require(decoded.toBinaryData(padding: true))
++        #expect(paddedFrame == padded(frame))
++        #expect(BinaryProtocol.decode(paddedFrame)?.payload == payload)
++
++        // The signing preimage is the padded ORIGINAL frame with ttl 0 and the
++        // RSR bit cleared: the originator's stream, not a re-compression.
++        let preimage = try #require(decoded.toBinaryDataForSigning())
++        #expect(preimage == signingForm(of: frame))
++        #expect(preimage != fresh(type: 0x02, ttl: 7, payload: payload).toBinaryDataForSigning())
++    }
++
++    @Test func reencodeReproducesOurOwnCompressedFrame() throws {
++        let frame = try #require(fresh(type: 0x02, ttl: 7, payload: compressiblePayload).toBinaryData(padding: false))
++        #expect(frame[BinaryProtocol.Offsets.flags] & BinaryProtocol.Flags.isCompressed != 0)
++        let decoded = try #require(BinaryProtocol.decode(frame))
++        #expect(decoded.toBinaryData(padding: false) == frame)
++        // For our own frames the fix is invisible: preimage unchanged.
++        #expect(decoded.toBinaryDataForSigning() == fresh(type: 0x02, ttl: 7, payload: compressiblePayload).toBinaryDataForSigning())
++    }
++
++    @Test func v2ForeignStreamKeepsFourByteOriginalSize() throws {
++        let payload = compressiblePayload
++        let stream = storedDeflate(payload)
++        var body = Data()
++        for shift in stride(from: 24, through: 0, by: -8) {
++            body.append(UInt8((UInt32(payload.count) >> UInt32(shift)) & 0xFF))
++        }
++        body.append(stream)
++        var frame = Data([2, 0x02, 7])
++        for shift in stride(from: 56, through: 0, by: -8) {
++            frame.append(UInt8((timestamp >> UInt64(shift)) & 0xFF))
++        }
++        frame.append(BinaryProtocol.Flags.isCompressed)
++        for shift in stride(from: 24, through: 0, by: -8) {
++            frame.append(UInt8((UInt32(body.count) >> UInt32(shift)) & 0xFF))
++        }
++        frame.append(sender)
++        frame.append(body)
++
++        let decoded = try #require(BinaryProtocol.decode(frame))
++        #expect(decoded.version == 2)
++        #expect(decoded.payload == payload)
++        #expect(decoded.toBinaryData(padding: false) == frame)
++    }
++
++    // MARK: - 2. Signed over an UNCOMPRESSED but compressible payload
++
++    @Test func signatureOverUncompressedCompressiblePayloadVerifies() throws {
++        // 120 identical bytes: over the threshold, trivially compressible,
++        // sent plain (flags without 0x04), which is what a sender that does
++        // not compress produces.
++        let payload = Data(repeating: 0x41, count: 120)
++        #expect(CompressionUtil.shouldCompress(payload), "precondition: we WOULD compress this")
++        let frame = v1Frame(type: 0x02, ttl: 7, flags: 0, body: payload)
++
++        let decoded = try #require(BinaryProtocol.decode(frame))
++        #expect(decoded.payload == payload)
++        #expect(decoded.wirePayload?.compressed == false)
++
++        // The preimage is the canonical (ttl 0, unsigned, padded) form of the
++        // frame AS SENT: still uncompressed.
++        let preimage = try #require(decoded.toBinaryDataForSigning())
++        #expect(preimage[BinaryProtocol.Offsets.flags] & BinaryProtocol.Flags.isCompressed == 0)
++        #expect(preimage == signingForm(of: frame))
++
++        // The originator signs that preimage; a CryptoKit verifier accepts it.
++        let key = Curve25519.Signing.PrivateKey()
++        let signature = try key.signature(for: preimage)
++        #expect(key.publicKey.isValidSignature(signature, for: preimage))
++
++        // A packet built fresh from the same fields re-compresses and yields a
++        // DIFFERENT preimage: the pre-fix behaviour, and why every such packet
++        // from a non-compressing sender failed verification.
++        let freshPreimage = try #require(fresh(type: 0x02, ttl: 7, payload: payload).toBinaryDataForSigning())
++        #expect(freshPreimage[BinaryProtocol.Offsets.flags] & BinaryProtocol.Flags.isCompressed != 0)
++        #expect(freshPreimage != preimage)
++        #expect(!key.publicKey.isValidSignature(signature, for: freshPreimage))
++
++        // Relay round trip: attach the signature, change the mutable fields,
++        // encode, decode again. The receiver's preimage still verifies.
++        var signed = decoded
++        signed.signature = signature
++        signed.ttl = 3
++        signed.isRSR = true
++        let wire = try #require(signed.toBinaryData(padding: false))
++        #expect(wire[BinaryProtocol.Offsets.flags] & BinaryProtocol.Flags.isCompressed == 0, "relay must not compress the payload either")
++        let relayed = try #require(BinaryProtocol.decode(wire))
++        #expect(relayed.ttl == 3)
++        #expect(relayed.isRSR)
++        #expect(relayed.signature == signature)
++        let relayedPreimage = try #require(relayed.toBinaryDataForSigning())
++        #expect(relayedPreimage == preimage)
++        #expect(key.publicKey.isValidSignature(signature, for: relayedPreimage))
++    }
++
++    // MARK: - 3. Changing the payload drops the remembered wire bytes
++
++    @Test func changedPayloadIsCompressedAfreshNotReplayed() throws {
++        let frame = try #require(fresh(type: 0x02, ttl: 7, payload: compressiblePayload).toBinaryData(padding: false))
++        let decoded = try #require(BinaryProtocol.decode(frame))
++        #expect(decoded.wirePayload?.compressed == true)
++
++        let other = Data(String(repeating: "something else entirely, also long and repetitive ", count: 6).utf8)
++        #expect(other != decoded.payload)
++        // `payload` is immutable, so the stale wire bytes travel with a new
++        // packet value. The SHA-256 guard must notice the mismatch.
++        var changed = fresh(type: decoded.type, ttl: decoded.ttl, payload: other)
++        changed.wirePayload = decoded.wirePayload
++        #expect(changed.wirePayload?.matches(other) == false)
++
++        let bytes = try #require(changed.toBinaryData(padding: false))
++        #expect(bytes != frame)
++        let redecoded = try #require(BinaryProtocol.decode(bytes))
++        #expect(redecoded.payload == other)
++        #expect(bytes[BinaryProtocol.Offsets.flags] & BinaryProtocol.Flags.isCompressed != 0, "a compressible payload is still compressed when encoded fresh")
++        // And it is identical to encoding the new payload with no wire bytes at all.
++        #expect(bytes == fresh(type: decoded.type, ttl: decoded.ttl, payload: other).toBinaryData(padding: false))
++    }
++
++    @Test func wirePayloadIsNotPartOfTheCodedForm() throws {
++        let frame = try #require(fresh(type: 0x02, ttl: 7, payload: compressiblePayload).toBinaryData(padding: false))
++        let decoded = try #require(BinaryProtocol.decode(frame))
++        let json = try JSONEncoder().encode(decoded)
++        #expect(!String(decoding: json, as: UTF8.self).contains("wirePayload"))
++        let restored = try JSONDecoder().decode(BitchatPacket.self, from: json)
++        #expect(restored.wirePayload == nil)
++        #expect(restored.payload == decoded.payload)
++        // Without wire bytes the restored packet encodes like a fresh one.
++        #expect(restored.toBinaryData(padding: false) == frame)
++    }
++}
