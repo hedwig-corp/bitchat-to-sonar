@@ -1021,8 +1021,19 @@ share a zone with the app and report the zone the app shared with it.
   advertiser, main-thread time went 68 → 32 ticks/60 s after the fix.
 
 ### QA-164 — Cold launch on cellular while a push wake is in flight
-- **Platforms:** both. Android is scripted; iOS is manual, with the app-side
-  hand-off pinned by a unit test.
+- **Platforms:** both, both scripted. The real iOS extension only runs on a
+  device (`simctl push` never starts it), so a device pass stays the final
+  check for the extension's own observer wiring.
+- **How (iOS):** `scripts/qa/ios-launch-store-yield.sh` against a signed
+  Debug build from `ios-setup.sh` and a throwaway `SONAR_BENCH_NSEC`. A
+  stand-in process takes the SAME App Group store `flock` the extension takes
+  and either yields on the app's signal (the fixed extension) or holds it 13 s
+  (the old one); the real app is cold-launched each time and
+  `t0_launch → t1_local_paint` is read from its bench markers. PASS needs the
+  no-holder and yielding launches within 3000 ms AND the 13 s holder to delay
+  paint past 10 s, which proves the lock sits on the paint path; otherwise it
+  FAILs as inconclusive. Reboot the simulator after `ios-setup.sh`: its own
+  launch leaves a notification-permission alert that keeps the app inactive.
 - **How (Android):** `android-smoke.sh` QA-164 (emulator only). It turns the
   emulator's Wi-Fi off and sets the console link to GSM bandwidth, then
   cold-starts the app three times and reads `am start -W` TotalTime (launch
@@ -1064,8 +1075,8 @@ share a zone with the app and report the zone the app shared with it.
     blocking acquire posts the yield notification before it parks, and a
     holder that releases on it lets the acquire through.
   - Not unit-pinned: the NSE's observer wiring and the Android `start()` fast
-    path. The scripted step above is the Android check; iOS needs the manual
-    steps on a device.
+    path. The two scripted steps above check them end to end; the real
+    extension process still needs a device pass.
 - **Last run (2026-10-13, Sonar_QA_API_36 emulator, shaped link):**
 
   | Build | TotalTime per launch | Core lock wait logged |
@@ -1073,14 +1084,25 @@ share a zone with the app and report the zone the app shared with it.
   | Fix (#665) | 2128, 2095, 2064 ms: PASS | none |
   | Fast path removed | 6812, 6936, 6862 ms: FAIL | 4722, 4641, 4622 ms |
 
-  The iOS yield check, run as a plain process on an iOS 26.5 simulator
-  (the test target could not build while `breez-sdk-liquid-swift` was
-  unresolvable): with the fix the acquire got the lock at once; with
-  `signalHostWantsStore()` removed it stayed parked until the 3 s limit.
-  The notification extension target was compiled for the simulator against
-  a local compile-only stand-in for the Breez module (its seven symbols the
-  extension uses), so the observer wiring type-checks; the real build still
-  needs the package restored.
+  Rerun on the final code (2026-10-24, same emulator): 2189, 2009, 2064 ms,
+  PASS.
+
+- **Last iOS run (2026-10-24, iPhone 17 Pro simulator, iOS 26.5):** built
+  with #669's Breez 0.12.4 package from a local copy of its binary (the
+  release asset it pins did not exist yet). CI's exact build command: BUILD
+  SUCCEEDED, the notification extension included. `bitchatTests_iOS`, serial
+  as in CI: 1016 tests in 133 suites passed, the new yield test among them.
+  `ios-launch-store-yield.sh`:
+
+  | Store lock holder | t0 → t1 local paint |
+  |---|---|
+  | none | 263 ms |
+  | yields on the signal (fixed extension) | 375 ms |
+  | holds 13 s, ignores it (old extension) | 10066 ms |
+
+  Earlier, before the package was restored, the yield test's logic ran as a
+  plain process on the simulator: with `signalHostWantsStore()` removed the
+  acquire stayed parked until its 3 s limit.
 - **Origin:** 2026-10-13 tester report "quando non sono in Wi-Fi non si
   apre". Both hosts gate first paint on the local store open, and both let a
   push-driven relay attach hold the store lock across its network timeouts:

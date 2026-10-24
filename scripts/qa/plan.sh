@@ -43,7 +43,7 @@ fi
 
 # --- areas -----------------------------------------------------------------
 ios=0 android=0 core=0 corelib=0 wallet=0 breez=0 messaging=0 share=0 localtime=0
-ui=0 i18n=0 perf=0 transcript=0 code=0 harness=0 ffi=0 mirror_kt=0 mirror_swift=0 mesh=0
+ui=0 i18n=0 perf=0 transcript=0 code=0 harness=0 ffi=0 mirror_kt=0 mirror_swift=0 mesh=0 launchlock=0
 while IFS= read -r f; do
   b="${f##*/}"   # keyword areas match the file name: every Compose path contains "chat/bitchat"
   case "$f" in
@@ -78,7 +78,7 @@ while IFS= read -r f; do
   case "$f" in *Localizable.xcstrings|scripts/i18n/*|*/composeResources/*strings*) i18n=1; ui=1 ;; esac
   case "$b" in *startup*|*coldstart*|*bench*|*relay*|*sync*|*background*) perf=1 ;; esac
   # The first-paint store lock and whoever can hold it at launch (QA-164).
-  case "$b" in SonarCore.android.kt|MarmotStoreLock.swift|NotificationService.swift|SonarPushRegistration.kt|SonarApp.kt|MainActivity.kt|SonarRootView.swift) perf=1 ;; esac
+  case "$b" in SonarCore.android.kt|MarmotStoreLock.swift|NotificationService.swift|SonarPushRegistration.kt|SonarApp.kt|MainActivity.kt|SonarRootView.swift) perf=1; launchlock=1 ;; esac
 done <<< "$changed"
 
 # --- environment -----------------------------------------------------------
@@ -213,6 +213,8 @@ if (( ios && xcode && peers )); then
     (( share )) && run "T2  scripts/qa/ios-share-smoke.sh   # QA-080…092"
   fi
 fi
+(( launchlock && ios && xcode && peers )) && run "T2  scripts/qa/ios-launch-store-yield.sh   # QA-164 iOS leg: reboot the sim first, needs SONAR_BENCH_NSEC"
+(( launchlock && android )) && run "T2  scripts/qa/android-smoke.sh --only QA-164   # emulator, shapes the link"
 (( perf && ios && xcode && peers )) && run "T2  scripts/qa/idle-cpu.sh ios \"\$QA_UDID\" 60 --max 3   # QA-050 (android-smoke.sh runs it on Android)"
 
 # Tier 3 — registry sections to walk (the agent drives, the registry says how).
