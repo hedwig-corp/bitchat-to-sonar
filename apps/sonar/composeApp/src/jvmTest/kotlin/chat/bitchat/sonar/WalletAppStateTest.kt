@@ -488,7 +488,19 @@ class WalletAppStateTest {
         waitUntil("the offer reaches the announce") { s.localSonarAnnounce()?.bolt12Offer == shortOffer }
         assertTrue(sonarAnnouncePackets(s.localSonarAnnounce()!!.encode()).all { it.size <= 512 })
 
-        val mintOffer = "lno1" + "q".repeat(396)
+        // The engine now DEFLATE-compresses low-entropy payloads like the
+        // reference clients do (core/bitchat-protocol, SPEC.md §3), so a run of
+        // "q" would shrink to a few bytes and prove nothing. A real offer is
+        // bech32 over random bytes (~5 bits per character), so use a
+        // pseudo-random bech32 body long enough to overflow even after
+        // compression; `forMesh()` still decides on the UNcompressed size,
+        // which is the conservative side of the 512-byte attribute limit.
+        val bech32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+        var seed = 0x2545F491L // rng-hygiene: ok — deterministic test fixture, not a nonce
+        val mintOffer = "lno1" + CharArray(1200) {
+            seed = (seed * 6364136223846793005L + 1442695040888963407L)
+            bech32[((seed ushr 33) % 32).toInt()]
+        }.concatToString()
         val oversized = sonarAnnouncePackets(s.localSonarAnnounce()!!.copy(bolt12Offer = mintOffer).encode())
         assertTrue(oversized.isNotEmpty() && oversized.all { it.size > 512 }, "premise: this offer does not fit")
 
