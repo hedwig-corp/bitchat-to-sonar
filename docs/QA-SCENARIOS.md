@@ -1266,6 +1266,123 @@ real mint and need the maintainer's approval of the amounts.
   the amount never on screen; Compose ignored that amount and paid the typed
   one.
 
+### QA-165 — A near-exact balance is priced with the mint's input fees
+- **Platforms:** both (one Rust core; iOS on the fake mint, headless with
+  `sonar-cashu-cli`; Android manual against a mint the maintainer approves).
+- **Setup:** a `cdk-mintd` 0.18 fakewallet mint whose keyset charges an input
+  fee (`[info] input_fee_ppk = 1000`, 1 sat per proof — the fee mint.hedwig.sh's
+  retired keyset `0197ebd2…` still charges). Fund the wallet with several
+  small receives so it holds many proofs (5 × 255 sats is ~50 proofs).
+- **Steps:** `sonar-cashu-cli --mint <mint> quote <foreign invoice>` for
+  balance − reserve − 20 sats; then Send the same invoice from the app and
+  read the fee line. For **Max**, use an amountless destination (a BOLT12
+  offer or an amountless invoice from the second mint): a fixed-amount
+  invoice leaves Max nothing to size.
+- **Expect:** the quote's `fees_sats` is the reserve PLUS about one sat per
+  proof spent, and `affordable` is false; the app's fee line says the same
+  "up to N", and Send is refused up front with "Amount plus fee exceeds your
+  balance" and the real figures. Nothing is sent: the mint has the UNPAID
+  quote and no melt request, the balance is unchanged and nothing reads as
+  pending. Max pays the largest amount the fees allow. A send that fits pays
+  once, and the mint's fee check passes (it refuses a melt that underpays).
+- **Retired keyset (the incident's exact shape):** fund the wallet, stop the
+  mint, `cdk-mintd -w <dir> config apply --file <toml with input_fee_ppk = 0>`
+  and start it again. cdk-mintd 0.18.1 rotates on a fee mismatch at startup
+  ("Rotating keyset for unit sat due to fee mismatch"), and `curl
+  <mint>/v1/keysets` then shows the funded keyset inactive at 1000 ppk.
+  The wallet does not see the rotation by itself: CDK keeps keysets for an
+  hour, and ones loaded from its database count as fresh. Receive 1 sat and
+  `sync`, so the mint refuses its outputs and CDK refreshes ("Active keyset
+  changed"); for a wallet that skips this, see QA-167. Then repeat the steps
+  above. Expect the log line `CDK selected N proofs that do not cover their
+  own input fee … topping the selection up`, the same refusal at balance −
+  reserve − 20, and a send that fits melts the retired proofs directly
+  (`swap first: false`) and pays once.
+- **Guard:** `incident_near_exact_balance_with_retired_fee_proofs_is_refused_up_front`,
+  `retired_fee_proofs_are_swapped_then_paid_when_the_fee_fits`,
+  `proofs_held_by_a_send_in_flight_are_not_spendable`, `a_fee_preview_holds_nothing`,
+  `a_melt_costing_more_than_the_agreed_fee_is_refused_before_confirm`;
+  app side `CashuWalletEngineTest.theWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`,
+  `CashuWalletServiceTests.testTheWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`
+- **Origin:** 2026-10-13 incident — a 12,027-sat BOLT11 send (reserve 240)
+  from a balance ~20 sats above 12,267 left two UNPAID quotes and no melt
+  request. The fee preview was the reserve alone; CDK then could not pay
+  for the proofs' input fees and failed before the melt.
+
+### QA-166 — A quote that expires before it is sent is re-quoted, never orphaned
+- **Platforms:** both (one Rust core; iOS on the fake mint through
+  `scripts/qa/mint-proxy.py`; headless with `sonar-cashu-cli --mint <proxy>`).
+- **Steps:** fund the wallet, get a foreign invoice from the second fake mint.
+  `mint-proxy.py arm short-melt-ttl 5` (the next melt quote reads as expiring
+  in 5 s, under the 20 s a melt needs), then pay the invoice from the app.
+  Re-arm the fault and pay a FRESH foreign invoice with `sonar-cashu-cli
+  --mint <proxy> send <invoice>`: each arm fires once, and a paid invoice
+  cannot be paid again. Repeat with `short-melt-ttl 5x3` and another fresh
+  invoice (every quote of one send is short-lived). Then, with
+  the mint's own `[info.quote_ttl] melt_ttl = 120` (production's value), open
+  the send sheet, wait out the quote (over 2 minutes), and tap Send.
+- **Expect:** first run: paid once, on a second quote — the CLI prints
+  `{"requote":1,…}` before the payment; the mint shows the first quote
+  UNPAID with no melt request and the second PAID; exactly one melt request.
+  The log has `melt <8 hex>: … not starting, QuoteExpired` and
+  `re-quoting (1/2)`; no full quote id, invoice or proof in it, and the
+  expired quote's tag differs from the re-quote's (the tag is a SHA-256
+  digest of the id: cdk-mintd quote ids are UUIDv7, so their first 8 hex
+  digits are the same for every quote issued within ~65 s). `5x3`: "The
+  payment quote expired before it could be sent. Nothing was sent — try
+  again." — never "Payment failed", no melt request, balance unchanged. The
+  sheet left past 120 s pays on a fresh quote within the fee it showed (a
+  dearer fresh quote is refused with "The network fee is now up to…").
+- **Guard:** `a_quote_too_close_to_expiry_is_refused_before_any_melt` (BOLT11
+  and BOLT12), `an_expired_quote_is_refused_before_any_melt`,
+  `a_preparation_past_the_quote_deadline_is_cancelled_not_melted`,
+  `a_preparation_slower_than_the_send_budget_still_pays`,
+  `a_lookup_during_a_slow_preparation_is_pending_and_leaves_it_alone`,
+  `an_ambiguous_melt_is_never_requoted_or_sent_twice`,
+  `a_near_expiry_quote_is_refused_typed_and_a_fresh_one_pays` (sonar-ffi);
+  app side `CashuWalletEngineTest.aQuoteThatExpiresUnsentIsRequotedAndTheFreshQuotePays`,
+  `aRequoteAboveTheAgreedFeeStopsWithTheNewFee`,
+  `requotingIsBoundedAndEndsInATypedQuoteExpired`, `aPendingSendIsNeverRequoted`,
+  and the `CashuWalletServiceTests` mirrors. Log tags:
+  `a_quote_and_its_requote_get_different_log_tags`,
+  `logs_name_a_quote_by_a_short_digest`.
+- **Origin:** 2026-10-13 incident review. Melt quotes live 120 s on
+  mint.hedwig.sh; the wallet never looked at the expiry, and a preparation
+  slower than its 60 s wait was cancelled (answering "Mint offline") instead
+  of confirmed. #666 QA against cdk-mintd 0.18.1: the expired quote, its
+  re-quote, and all three quotes of a `5x3` run logged under one tag
+  (`melt 01a1406b`, `melt 01a1406c`).
+
+### QA-167 — The first send after the mint rotates its keyset pays
+- **Platforms:** both (one Rust core; headless with `sonar-cashu-cli`
+  against a local `cdk-mintd` 0.18.1 fakewallet mint).
+- **Steps:** fund the wallet on a 1000 ppk keyset. Stop the mint, `config
+  apply` a document with `input_fee_ppk = 0`, start it (it rotates; see
+  QA-165). Without any receive or sync first, pay a foreign invoice that fits
+  the balance with the fee shown. Then run any command again and read the log.
+- **Expect:** the send pays once and the mint shows the quote PAID. The log has
+  no `Mint rejected outputs with inactive keyset`, no `Melt request failed
+  with error: Inactive Keyset`, and no `saga recovery: … 1 failed` on the
+  next connect.
+- **Guard:** `a_send_right_after_a_keyset_rotation_pays_and_leaves_no_saga`;
+  `a_preview_and_its_send_read_the_keysets_once` pins the cost (one keyset
+  read per preview and send). FakeMint now refuses melt change outputs on an
+  inactive keyset, as cdk-mintd does.
+- **Origin:** #666 QA, 2026-10-15. The wallet still treated the retired
+  keyset as active: CDK keeps keysets for an hour, and keysets loaded from its
+  database count as fresh. `warm_keysets` uses CDK's default
+  `CacheThenNetwork`, so it re-reads nothing. The pre-melt swap was refused
+  InactiveKeyset. CDK refreshed and retried the swap, paying its 12-sat fee,
+  then sent the melt's change outputs on the retired keyset. The mint refused
+  the melt. The send ended Failed with nothing paid, balance 188 → 176, and
+  the quote UNPAID. The refused swap's saga stayed `swap_requested`, so every
+  later connect makes a `/v1/restore` call and logs `Failed to recover saga`.
+  A retry paid, once the refused request had refreshed the keysets. The unit
+  tests missed it because `wallet_with_retired_fee_proofs` sets a zero cache
+  TTL. Fixed in #666: `warm_keysets` reads the mint (`fetch_mint_info`, which
+  reports a failure instead of falling back to the cache) before a melt is
+  priced or sent, and one read serves 60 s.
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs

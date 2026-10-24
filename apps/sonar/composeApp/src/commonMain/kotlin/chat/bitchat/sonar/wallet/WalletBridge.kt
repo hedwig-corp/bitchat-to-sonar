@@ -35,6 +35,12 @@ enum class SendErrorKind {
      * the new fee to ask about.
      */
     FeeChanged,
+    /**
+     * The payment's quote expired before anything was sent, and so did the
+     * fresh quotes taken in its place. Nothing was sent; trying again prices
+     * the payment afresh.
+     */
+    QuoteExpired,
 }
 
 /** Result of a wallet send: success flag plus the Lightning preimage and the
@@ -185,7 +191,7 @@ object WalletBridge {
         engine.receiveInvoice(amountSats)
 
     /**
-     * The mint's fee reserve for paying [amountSats] to [destination]
+     * The fee (reserve plus the mint's input fees) for paying [amountSats] to [destination]
      * (amountSats=0 ⇒ the invoice's own amount), via FFI `prepare_send`. The
      * quote is discarded — [send] prepares again, and the fee shown from this
      * one is the ceiling that send enforces (`maxFeeSats`). Off the caller's

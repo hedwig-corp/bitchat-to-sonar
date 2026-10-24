@@ -96,6 +96,7 @@ import chat.bitchat.sonar.resources.their_payment_address_is_from_an_older
 import chat.bitchat.sonar.resources.couldn_t_reach_the_relays_for_their
 import chat.bitchat.sonar.resources.they_haven_t_published_a_payment
 import chat.bitchat.sonar.resources.that_payment_address_can_t_be_paid
+import chat.bitchat.sonar.resources.the_payment_quote_expired_before_it
 import chat.bitchat.sonar.resources.the_network_fee_is_now_up_to_nothing
 import chat.bitchat.sonar.resources.the_old_wallet_couldn_t_be_removed
 import chat.bitchat.sonar.resources.this_kind_of_payment_isn_t_supported_yet
@@ -3430,6 +3431,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         SendErrorKind.Unsupported -> getString(Res.string.this_kind_of_payment_isn_t_supported_yet)
         SendErrorKind.NotReady -> result.error ?: getString(Res.string.your_wallet_is_still_starting_try_again)
         SendErrorKind.Failed -> getString(Res.string.payment_failed_you_were_not_charged)
+        SendErrorKind.QuoteExpired ->
+            getString(Res.string.the_payment_quote_expired_before_it)
         null -> result.error
     }
 
@@ -3441,8 +3444,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     suspend fun createReceiveInvoice(sats: Long): WalletOutcome<CashuInvoice> = WalletBridge.receiveInvoice(sats)
 
     /**
-     * Send sheet fee line (Cashu wallet only): the mint's fee reserve for
-     * paying [sats] to [destination], or null when there is nothing to show —
+     * Send sheet fee line (Cashu wallet only): the fee (the mint's reserve
+     * plus its input fees on the ecash spent) for paying [sats] to [destination], or null when there is nothing to show —
      * wallet not open, mint offline, quote refused. The line then hides, and
      * a Send from that sheet consents to no fee (`consentedFeeCeiling`). A
      * BOLT11 invoice is quoted at its own amount, exactly as

@@ -16,12 +16,16 @@
 // Money rules enforced here (mirror of Compose `CashuWalletEngine`):
 //  - A `Pending` send is surfaced as pending, never as failed, and is never
 //    re-sent; its outcome arrives as an update with the same id.
-//  - Affordability is checked against the mint's REAL fee reserve from
-//    `prepareSend` before `send`; a shortfall is the typed
-//    `CashuWalletError.insufficientFunds`.
+//  - Affordability is checked against the REAL fee from `prepareSend` —
+//    the mint's fee reserve plus its input fees on the ecash spent — before
+//    `send`; a shortfall is the typed `CashuWalletError.insufficientFunds`.
 //  - The fee paid never exceeds the fee the user agreed to on the send
-//    sheet (`maxFeeSats`): a higher reserve is the typed
-//    `CashuWalletError.feeChanged`, refused before `send`.
+//    sheet (`maxFeeSats`): a higher fee is the typed
+//    `CashuWalletError.feeChanged`, refused before `send`, and the agreed
+//    fee travels into `send`, which refuses to pay more.
+//  - A quote that expires before anything was sent (`QuoteExpired`) is
+//    re-quoted — same destination and amount, same checks — at most
+//    `maxRequotes` times; never after the spending call may have sent.
 //  - Never disconnect under a send in flight; the disconnect waits.
 //  - Account replacement keeps the old account's store on disk; only a panic
 //    wipe deletes stores.
@@ -154,6 +158,9 @@ enum CashuWalletError: LocalizedError, Equatable {
     /// user agreed to on the send sheet. Nothing was sent; `feeSats` is the
     /// NEW fee to ask about.
     case feeChanged(feeSats: Int64)
+    /// The quote expired before anything was sent, and so did the fresh
+    /// quotes taken in its place. Nothing was sent.
+    case quoteExpired
 
     /// The words for a `.feeChanged` refusal, fee written like the sheet's
     /// fee line. Shared by the error and the payment status screen.
@@ -179,6 +186,8 @@ enum CashuWalletError: LocalizedError, Equatable {
         case .Unsupported(let reason): self = .unsupported(reason)
         case .InvalidInput(let reason): self = .invalidInput(reason)
         case .Backend(let reason): self = .backend(reason)
+        case .QuoteExpired: self = .quoteExpired
+        case .FeeChanged(let fee): self = .feeChanged(feeSats: Int64(clamping: fee))
         }
     }
 
@@ -206,6 +215,8 @@ enum CashuWalletError: LocalizedError, Equatable {
             return String(localized: "A payment is still in flight. Wait for it to finish and try again.")
         case .feeChanged(let fee):
             return Self.feeChangedMessage(feeSats: fee)
+        case .quoteExpired:
+            return String(localized: "The payment quote expired before it could be sent. Nothing was sent — try again.")
         }
     }
 }
@@ -778,6 +789,10 @@ final class CashuWalletService: ObservableObject {
     /// nil = no ceiling (paths that never showed a fee): the fee is then
     /// only checked against the balance.
     ///
+    /// A quote that expires before anything was sent is priced again — same
+    /// destination and amount, every check re-run — at most `maxRequotes`
+    /// times, then `.quoteExpired`.
+    ///
     /// Throws a typed `CashuWalletError`; a `.pending` result is NOT an
     /// error and must never be retried.
     func send(
@@ -813,26 +828,48 @@ final class CashuWalletService: ObservableObject {
         do {
             let paid: WalletPayment = try await run {
                 if !n.isConnected() { try n.connect() }
-                var prepared = try n.prepareSend(destination: dest, amountSats: requested)
-                let confirmed = try n.balance().confirmedSats
-                var fee = prepared.feesSats ?? 0
-                if Self.exceeds(prepared.amountSats, fee, confirmed) {
-                    guard feeFromAmount, let full = requested, full > fee else {
-                        throw Self.shortfall(prepared.amountSats, fee, confirmed)
-                    }
-                    prepared = try n.prepareSend(destination: dest, amountSats: full - fee)
-                    fee = prepared.feesSats ?? 0
+                var requotes = 0
+                while true {
+                    var prepared = try n.prepareSend(destination: dest, amountSats: requested)
+                    let confirmed = try n.balance().confirmedSats
+                    // The whole fee: the mint's reserve plus its input fees on
+                    // the ecash spent. Checking the reserve alone let a send
+                    // through that the wallet then could not pay.
+                    var fee = prepared.feesSats ?? 0
                     if Self.exceeds(prepared.amountSats, fee, confirmed) {
-                        throw Self.shortfall(prepared.amountSats, fee, confirmed)
+                        guard feeFromAmount, let full = requested, full > fee else {
+                            throw Self.shortfall(prepared.amountSats, fee, confirmed)
+                        }
+                        prepared = try n.prepareSend(destination: dest, amountSats: full - fee)
+                        fee = prepared.feesSats ?? 0
+                        if Self.exceeds(prepared.amountSats, fee, confirmed) {
+                            throw Self.shortfall(prepared.amountSats, fee, confirmed)
+                        }
+                    }
+                    // The fee the user saw is a promise: a higher fee on the
+                    // quote about to be paid is refused BEFORE the spending
+                    // call. The quote is only a price — abandoning it spends
+                    // nothing.
+                    if let ceiling, fee > ceiling {
+                        throw CashuWalletError.feeChanged(feeSats: Int64(clamping: fee))
+                    }
+                    // The agreed fee travels with the quote: the wallet refuses
+                    // (FeeChanged) rather than pay more than the user saw. No
+                    // ceiling (nil) stays no ceiling: the fee is then only
+                    // checked against the balance, as documented above.
+                    prepared.feesSats = ceiling
+                    do {
+                        return try n.send(prepared: prepared, note: noteText)
+                    } catch WalletFfiError.QuoteExpired where requotes < Self.maxRequotes {
+                        // Nothing was sent: the quote ran out before the wallet
+                        // asked the mint to pay it. Price it again.
+                        requotes += 1
+                        SecureLogger.info(
+                            "Cashu quote expired before sending; re-quoting (\(requotes)/\(Self.maxRequotes))",
+                            category: .session
+                        )
                     }
                 }
-                // The fee the user saw is a promise: a higher reserve on the
-                // quote about to be paid is refused BEFORE the spending call.
-                // The quote is only a price — abandoning it spends nothing.
-                if let ceiling, fee > ceiling {
-                    throw CashuWalletError.feeChanged(feeSats: Int64(clamping: fee))
-                }
-                return try n.send(prepared: prepared, note: noteText)
             }
             let mapped = Self.map(paid)
             // Never let the send's own (possibly Pending) result undo an
@@ -849,9 +886,10 @@ final class CashuWalletService: ObservableObject {
         }
     }
 
-    /// Price a send without paying it: the mint's fee RESERVE (`prepareSend`
-    /// `feesSats`) for `amountSats` to `destination` — the most the payment
-    /// can cost on top of the amount. For the send confirmation sheet only.
+    /// Price a send without paying it: the whole fee (`prepareSend`
+    /// `feesSats` — the mint's fee reserve plus its input fees on the ecash
+    /// spent) for `amountSats` to `destination` — the most the payment can
+    /// cost on top of the amount. For the send confirmation sheet only.
     ///
     /// The quote is DISCARDED: `send` prepares again, so a stale quote is
     /// never what gets paid — and the fee shown from this quote is the
@@ -882,6 +920,9 @@ final class CashuWalletService: ObservableObject {
         guard epoch == myEpoch, native === n else { throw CashuWalletError.notOpen }
         return Int64(clamping: fee)
     }
+
+    /// Fresh quotes a send may take after its quote expired unsent.
+    nonisolated static let maxRequotes = 2
 
     private nonisolated static func exceeds(_ amount: UInt64, _ fee: UInt64, _ balance: UInt64) -> Bool {
         let (total, overflow) = amount.addingReportingOverflow(fee)
