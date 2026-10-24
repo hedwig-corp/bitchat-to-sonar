@@ -190,6 +190,9 @@
     "That payment address can't be paid." : {
 
     },
+    "The payment quote expired before it could be sent. Nothing was sent — try again." : {
+
+    },
     "The old wallet couldn't be removed. Restart Sonar and try again." : {
 
     },

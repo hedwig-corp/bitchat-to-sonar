@@ -301,6 +301,28 @@ class CashuWalletEngineTest {
         e.onBackground()
     }
 
+    /**
+     * Max on ecash that pays input fees is not one subtraction away. The
+     * figures are from #666 QA against cdk-mintd 0.18.1 (1000 ppk, 61
+     * proofs, BOLT12 offer). 1,530 sats quoted 95. 1,530 - 95 = 1,435 then
+     * quoted 97, two sats over the balance: the mint charges per output
+     * proof too, and 1,435 splits into more of them. 1,434 quoted 89 and
+     * paid. Max must pay an amount the fees allow, not refuse with
+     * "Amount plus fee exceeds your balance".
+     */
+    @Test
+    fun maxStillPaysWhenTheReducedAmountQuotesAHigherFee() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 1_530)
+        native.nextFees.addAll(listOf(95L, 97L, 89L))
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val r = e.send("lno1peer", 1_530, "note", feeFromAmount = true, maxFeeSats = 95)
+        assertTrue(r.ok, "Max must pay what the balance allows, got ${r.errorKind}: ${r.error}")
+        assertEquals(1, native.count("send"), "exactly one payment")
+        e.onBackground()
+    }
+
     // ── The fee the user consented to (maintainer review, #614) ──
 
     /**
@@ -336,6 +358,148 @@ class CashuWalletEngineTest {
         val below = e.send("lno1peer", 500, "note", maxFeeSats = 10)
         assertTrue(below.ok, "a fee below what was shown pays")
         assertEquals(2, native.count("send"))
+        e.onBackground()
+    }
+
+    /**
+     * The incident's figures (2026-10-13): 12,027 sats with a 240-sat reserve
+     * from a 12,287-sat balance. The reserve alone fits; the mint's input fees
+     * on the ecash spent (the native's `feesSats` now carries them) do not.
+     * The send is refused up front with the real figures, before any quote id
+     * is handed out or anything is spent.
+     */
+    @Test
+    fun theWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 12_287, feeReserveSats = 240 + 53)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        var linked: String? = null
+        val r = e.send("lnbc12027", 12_027, "note", maxFeeSats = 293) { linked = it }
+        assertEquals(SendErrorKind.InsufficientFunds, r.errorKind)
+        assertEquals(SpendableBalance.insufficientMessage(12_027, 293, 12_287), r.error)
+        assertEquals(0, native.count("send"))
+        assertNull(linked)
+        e.onBackground()
+    }
+
+    /** The fee the user agreed to travels into the spending call, which pays no more. */
+    @Test
+    fun theAgreedFeeTravelsIntoTheSpendingCall() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 3)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        assertTrue(e.send("lno1peer", 500, "note", maxFeeSats = 10).ok)
+        assertTrue(e.send("lno1peer", 500, "note").ok)
+        assertEquals(listOf<Long?>(10L, null), native.sentPrepared.map { it.feesSats }, "no ceiling stays no ceiling")
+        e.onBackground()
+    }
+
+    /**
+     * The quote ran out before anything was sent: the engine prices the same
+     * destination and amount again, runs every check again, re-links the
+     * caller's record to the new quote id, and pays that quote.
+     */
+    @Test
+    fun aQuoteThatExpiresUnsentIsRequotedAndTheFreshQuotePays() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 3)
+        native.sendErrors += { CashuWalletException.QuoteExpired() }
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val linked = mutableListOf<String>()
+        val r = e.send("lno1peer", 500, "note", maxFeeSats = 3) { linked += it }
+        assertTrue(r.ok, "the fresh quote pays: $r")
+        assertEquals(listOf("quote-1", "quote-2"), linked, "the record follows the quote that paid")
+        assertEquals("quote-2", r.paymentId)
+        assertEquals(listOf<Long?>(500L, 500L), native.preparedAmounts, "same amount")
+        assertEquals(2, native.count("send"))
+        assertEquals(listOf(500L), native.sentAmounts, "paid once")
+        e.onBackground()
+    }
+
+    /** A fresh quote is held to the fee the user already agreed to. */
+    @Test
+    fun aRequoteAboveTheAgreedFeeStopsWithTheNewFee() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000)
+        native.nextFees += listOf(3L, 40L)
+        native.sendErrors += { CashuWalletException.QuoteExpired() }
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val r = e.send("lno1peer", 500, "note", maxFeeSats = 3)
+        assertEquals(SendErrorKind.FeeChanged, r.errorKind)
+        assertEquals(40L, r.quotedFeeSats)
+        assertEquals(1, native.count("send"), "the expired quote only; the dearer one is never sent")
+        assertTrue(native.sentAmounts.isEmpty(), "nothing was spent")
+        e.onBackground()
+    }
+
+    /** Re-quoting is bounded and ends in its own typed refusal, not "Payment failed". */
+    @Test
+    fun requotingIsBoundedAndEndsInATypedQuoteExpired() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 3)
+        repeat(5) { native.sendErrors += { CashuWalletException.QuoteExpired() } }
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val r = e.send("lno1peer", 500, "note", maxFeeSats = 3)
+        assertFalse(r.ok)
+        assertFalse(r.pending)
+        assertEquals(SendErrorKind.QuoteExpired, r.errorKind)
+        assertEquals(CashuWalletEngine.QUOTE_EXPIRED_MESSAGE, r.error)
+        assertEquals(1 + CashuWalletEngine.MAX_REQUOTES, native.count("send"))
+        assertTrue(native.sentAmounts.isEmpty())
+        e.onBackground()
+    }
+
+    /** The wallet's own fee refusal carries the new fee, and is never retried. */
+    @Test
+    fun aFeeChangeRaisedByTheWalletCarriesTheNewFee() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 3)
+        native.sendErrors += { CashuWalletException.FeeChanged(55L) }
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val r = e.send("lno1peer", 500, "note", maxFeeSats = 3)
+        assertEquals(SendErrorKind.FeeChanged, r.errorKind)
+        assertEquals(55L, r.quotedFeeSats)
+        assertEquals(1, native.count("send"))
+        e.onBackground()
+    }
+
+    /** A send whose caller is cancelled is not re-quoted into a fresh payment. */
+    @Test
+    fun aCancelledSendIsNotRequoted() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 3)
+        native.sendErrors += { CashuWalletException.QuoteExpired() }
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        var job: kotlinx.coroutines.Job? = null
+        native.onCall = { if (it == "send") job?.cancel() }
+        job = launch { e.send("lno1peer", 500, "note", maxFeeSats = 3) }
+        runCurrent()
+        assertTrue(job.isCancelled)
+        assertEquals(1, native.count("send"), "the expired quote only; nothing new is started")
+        assertTrue(native.sentAmounts.isEmpty())
+        e.onBackground()
+    }
+
+    /** Pending may already be paying: it is never re-quoted or sent again. */
+    @Test
+    fun aPendingSendIsNeverRequoted() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 3).apply {
+            sendStatus = CashuPaymentStatus.Pending
+        }
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val r = e.send("lno1peer", 500, "note", maxFeeSats = 3)
+        assertTrue(r.pending)
+        assertEquals(1, native.count("prepareSend"))
+        assertEquals(1, native.count("send"))
         e.onBackground()
     }
 

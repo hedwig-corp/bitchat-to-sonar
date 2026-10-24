@@ -196,6 +196,7 @@
   "The network fee is now up to %@. Nothing was sent — try again to pay it.": "the_network_fee_is_now_up_to_nothing",
   "The old wallet couldn't be removed. Restart Sonar and try again.": "the_old_wallet_couldn_t_be_removed",
   "The old wallet has a refund waiting to be claimed.": "the_old_wallet_has_a_refund_waiting_to",
+  "The payment quote expired before it could be sent. Nothing was sent — try again.": "the_payment_quote_expired_before_it",
   "Their payment address is from an older Sonar. Ask them to open the latest Sonar to pay them here.": "their_payment_address_is_from_an_older",
   "They haven't published a payment address in Sonar yet.": "they_haven_t_published_a_payment",
   "This ": "this",

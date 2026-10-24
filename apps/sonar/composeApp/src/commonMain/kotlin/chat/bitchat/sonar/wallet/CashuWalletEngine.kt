@@ -9,6 +9,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,7 +49,11 @@ interface OfferBackupRelay {
  *  - Affordability is checked against the mint's REAL fee reserve before
  *    `send`; a shortfall is the typed [SendErrorKind.InsufficientFunds].
  *  - The fee paid never exceeds the fee the user agreed to on the send sheet:
- *    a higher reserve is refused as [SendErrorKind.FeeChanged] before `send`.
+ *    a higher fee is refused as [SendErrorKind.FeeChanged] before `send`, and
+ *    the agreed fee travels into `send`, which refuses to pay more.
+ *  - A quote that expires before anything was sent is re-quoted — same
+ *    destination and amount, same balance and fee checks — at most
+ *    [MAX_REQUOTES] times; never after the spending call may have sent.
  *  - The wallet is not disconnected while a send is in flight.
  */
 class CashuWalletEngine(
@@ -226,9 +232,9 @@ class CashuWalletEngine(
         }
 
     /**
-     * The mint's fee RESERVE for paying [amountSats] to [destination] ([amountSats]
-     * 0: the invoice's own amount) — the most the payment can cost on top of
-     * the amount. Prices only: the melt quote is discarded (`send` prepares
+     * The whole fee for paying [amountSats] to [destination] ([amountSats] 0:
+     * the invoice's own amount) — the mint's fee reserve plus its input fees
+     * on the ecash spent, the most the payment can cost on top of the amount. Prices only: the melt quote is discarded (`send` prepares
      * its own, and refuses it if its fee exceeds the one shown from this
      * quote — `maxFeeSats`), nothing is spent and no proofs are reserved.
      * Never connects — an offline wallet answers [SendErrorKind.Offline] and
@@ -290,35 +296,11 @@ class CashuWalletEngine(
         counters.withLock { sendsInFlight += 1 }
         try {
             if (!n.isConnected()) connectOnce(n)
-            // Read before quoting: the balance is what the user can spend.
-            val balance = n.balance().confirmedSats
-            var prepared = n.prepareSend(dest, amountSats.takeIf { it > 0 })
-            var fee = prepared.feesSats ?: 0L
-            if (prepared.amountSats + fee > balance) {
-                val reduced = amountSats - fee
-                if (!feeFromAmount || amountSats <= 0 || reduced <= 0) {
-                    return@withContext insufficient(prepared.amountSats, fee, balance)
-                }
-                prepared = n.prepareSend(dest, reduced)
-                fee = prepared.feesSats ?: 0L
-                if (prepared.amountSats + fee > balance) {
-                    return@withContext insufficient(prepared.amountSats, fee, balance)
-                }
-            }
-            // The fee the user saw is a promise: a higher reserve on the quote
-            // about to be paid is refused here, BEFORE the spending call and
-            // before the quote id is handed out. The quote is only a price —
-            // abandoning it spends and reserves nothing.
-            if (maxFeeSats != null && fee > maxFeeSats) {
-                return@withContext feeChanged(fee)
-            }
-            // The payment's id IS the quote id. Hand it out before the one
-            // spending call so a caller can link its record first: if the
-            // process dies inside `send`, a later lookup still finds it.
-            onQuoted?.invoke(prepared.quoteId)
-            val payment = n.send(prepared, note)
-            requestBalanceRefresh()
-            sendResultOf(payment)
+            quoteAndSend(n, dest, amountSats, note, feeFromAmount, maxFeeSats, onQuoted)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: CashuWalletException.FeeChanged) {
+            feeChanged(e.feesSats)
         } catch (e: CashuWalletException) {
             if (e.isOffline && wantOnline) startConnectLoop()
             failureOf(e, n)
@@ -331,6 +313,87 @@ class CashuWalletEngine(
                 (sendsInFlight == 0 && disconnectWhenIdle).also { if (it) disconnectWhenIdle = false }
             }
             if (deferred && !wantOnline) withContext(NonCancellable) { disconnectIfIdle(n) }
+        }
+    }
+
+    /**
+     * [send]'s quote → check → pay loop, on [io]. Each pass prices the
+     * destination afresh and runs every check again; only a
+     * [CashuWalletException.QuoteExpired] — the one refusal that guarantees
+     * nothing was sent — loops, at most [MAX_REQUOTES] times.
+     */
+    private suspend fun quoteAndSend(
+        n: CashuNative,
+        dest: String,
+        amountSats: Long,
+        note: String,
+        feeFromAmount: Boolean,
+        maxFeeSats: Long?,
+        onQuoted: ((paymentId: String) -> Unit)?,
+    ): SendResult {
+        var requotes = 0
+        while (true) {
+            // Read before quoting: the balance is what the user can spend.
+            val balance = n.balance().confirmedSats
+            var prepared = n.prepareSend(dest, amountSats.takeIf { it > 0 })
+            // The whole fee: the mint's reserve plus its input fees on the
+            // ecash spent. Checking the reserve alone let a send through
+            // that the wallet then could not pay.
+            var fee = prepared.feesSats ?: 0L
+            if (prepared.amountSats + fee > balance) {
+                if (!feeFromAmount || amountSats <= 0) {
+                    return insufficient(prepared.amountSats, fee, balance)
+                }
+                // Max. On ecash that pays input fees the fee depends on the
+                // amount (the proofs it spends, the outputs it splits into),
+                // so one subtraction can land a sat or two over the balance
+                // (#666 QA: 1,530 quoted 95; 1,435 then quoted 97). Step down
+                // by the overshoot, a few quotes at most.
+                var target = amountSats - fee
+                var steps = 0
+                while (true) {
+                    if (target <= 0) return insufficient(prepared.amountSats, fee, balance)
+                    prepared = n.prepareSend(dest, target)
+                    fee = prepared.feesSats ?: 0L
+                    val over = prepared.amountSats + fee - balance
+                    if (over <= 0) break
+                    steps += 1
+                    if (steps >= MAX_SIZING_QUOTES) return insufficient(prepared.amountSats, fee, balance)
+                    target -= over
+                }
+            }
+            // The fee the user saw is a promise: a higher fee on the quote
+            // about to be paid is refused here, BEFORE the spending call and
+            // before the quote id is handed out. The quote is only a price —
+            // abandoning it spends and reserves nothing.
+            if (maxFeeSats != null && fee > maxFeeSats) {
+                return feeChanged(fee)
+            }
+            // The payment's id IS the quote id. Hand it out before the one
+            // spending call so a caller can link its record first: if the
+            // process dies inside `send`, a later lookup still finds it. A
+            // re-quote hands out the new id, re-linking the record.
+            // A caller that has gone away gets no spending call started for
+            // it — checked as late as possible, right before the spend.
+            currentCoroutineContext().ensureActive()
+            onQuoted?.invoke(prepared.quoteId)
+            // The agreed fee travels with the quote: the wallet refuses
+            // (FeeChanged) rather than pay more than the user saw. No
+            // ceiling (null) stays no ceiling: the fee is then only checked
+            // against the balance, as documented on [send].
+            val agreed = prepared.copy(feesSats = maxFeeSats)
+            try {
+                val payment = n.send(agreed, note)
+                requestBalanceRefresh()
+                return sendResultOf(payment)
+            } catch (e: CashuWalletException.QuoteExpired) {
+                // Nothing was sent: the quote ran out before the wallet
+                // asked the mint to pay it. Price the same destination and
+                // amount again, through the same checks.
+                if (requotes >= MAX_REQUOTES) throw e
+                requotes += 1
+                sonarLog(TAG, "cashu quote expired before sending; re-quoting ($requotes/$MAX_REQUOTES)")
+            }
         }
     }
 
@@ -641,6 +704,10 @@ class CashuWalletEngine(
             WalletOutcome.Failed(SendErrorKind.InvalidDestination, INVALID_DESTINATION_MESSAGE)
         is CashuWalletException.Unsupported -> WalletOutcome.Failed(SendErrorKind.Unsupported, UNSUPPORTED_MESSAGE)
         is CashuWalletException.Backend -> WalletOutcome.Failed(SendErrorKind.Failed, PAYMENT_FAILED_MESSAGE)
+        is CashuWalletException.QuoteExpired ->
+            WalletOutcome.Failed(SendErrorKind.QuoteExpired, QUOTE_EXPIRED_MESSAGE)
+        is CashuWalletException.FeeChanged ->
+            WalletOutcome.Failed(SendErrorKind.FeeChanged, feeChangedMessage(e.feesSats))
     }
 
     private fun notReady() = WalletOutcome.Failed(SendErrorKind.NotReady, WALLET_STARTING_MESSAGE)
@@ -650,6 +717,12 @@ class CashuWalletEngine(
         val DEFAULT_RETRY_DELAYS_MS = listOf(2_000L, 5_000L, 15_000L, 30_000L, 60_000L)
         private const val PANIC_SEND_GRACE_MS = 5_000L
         private const val BACKUP_RETRY_MS = 30_000L
+
+        /** Fresh quotes a send may take after its quote expired unsent. */
+        const val MAX_REQUOTES = 2
+
+        /** Quotes a Max send may take to find an amount its fee fits. */
+        const val MAX_SIZING_QUOTES = 3
 
         fun balanceKey(accountId: String) = "wallet.cashu.balance.$accountId"
         fun offerKey(accountId: String) = "wallet.cashu.offer.$accountId"
@@ -663,6 +736,8 @@ class CashuWalletEngine(
         const val UNSUPPORTED_MESSAGE = "This kind of payment isn't supported yet."
         const val PAYMENT_FAILED_MESSAGE = "Payment failed — you were not charged."
         const val INVOICE_AMOUNT_MESSAGE = "Enter an amount above zero."
+        const val QUOTE_EXPIRED_MESSAGE =
+            "The payment quote expired before it could be sent. Nothing was sent — try again."
 
         /** English fallback for [SendErrorKind.FeeChanged]; the app shows the localized resource. */
         fun feeChangedMessage(feeSats: Long): String =

@@ -325,6 +325,26 @@ final class CashuWalletServiceTests: XCTestCase {
         await service.releaseQuietly()
     }
 
+    /// Max on ecash that pays input fees is not one subtraction away. The
+    /// figures are from #666 QA against cdk-mintd 0.18.1 (1000 ppk, 61
+    /// proofs, BOLT12 offer). 1,530 sats quoted 95. 1,530 - 95 = 1,435 then
+    /// quoted 97, two sats over the balance: the mint charges per output
+    /// proof too, and 1,435 splits into more of them. 1,434 quoted 89 and
+    /// paid. Max must pay an amount the fees allow, not refuse. Mirror of
+    /// `CashuWalletEngineTest.maxStillPaysWhenTheReducedAmountQuotesAHigherFee`.
+    func testMaxStillPaysWhenTheReducedAmountQuotesAHigherFee() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 1_530
+        native.nextFees = [95, 97, 89]
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        _ = try await service.send(destination: "lno1peer", amountSats: 1_530, note: "", feeFromAmount: true, maxFeeSats: 95)
+        XCTAssertEqual(native.sentPrepared.count, 1, "exactly one payment")
+        await service.releaseQuietly()
+    }
+
     // MARK: The fee the user consented to (maintainer review, #614)
 
     private let feeChanged40 = "The network fee is now up to \(sonarFormatSats(40)). Nothing was sent — try again to pay it."
@@ -349,6 +369,109 @@ final class CashuWalletServiceTests: XCTestCase {
         }
         XCTAssertEqual(native.count("send"), 0, "nothing is spent above the consented fee")
         await service.releaseQuietly()
+    }
+
+    /// The incident's figures (2026-10-13): 12,027 sats with a 240-sat
+    /// reserve from 12,287. The reserve alone fits; the mint's input fees on
+    /// the ecash spent (now part of `feesSats`) do not. Refused up front with
+    /// the real figures, nothing spent.
+    func testTheWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 12_287
+        native.feeReserve = 240 + 53
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        do {
+            _ = try await service.send(destination: "lnbc12027", amountSats: 12_027, note: "", feeFromAmount: false, maxFeeSats: 293)
+            XCTFail("expected a shortfall")
+        } catch let error as CashuWalletError {
+            XCTAssertEqual(error, .insufficientFunds(amountSats: 12_027, feeSats: 293, balanceSats: 12_287))
+        }
+        XCTAssertEqual(native.count("send"), 0)
+        await service.releaseQuietly()
+    }
+
+    /// The fee the user agreed to travels into the spending call.
+    func testTheAgreedFeeTravelsIntoTheSpendingCall() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 3
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 10)
+        _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: nil)
+        XCTAssertEqual(native.sentPrepared.map(\.feesSats), [10, nil], "no ceiling stays no ceiling")
+        await service.releaseQuietly()
+    }
+
+    /// A quote that expired unsent is priced again, through every check, and
+    /// the fresh quote pays — once.
+    func testAQuoteThatExpiresUnsentIsRequotedAndTheFreshQuotePays() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 3
+        native.sendErrors = [WalletFfiError.QuoteExpired]
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        let paid = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 3)
+        XCTAssertEqual(paid.id, "quote-2", "the payment is the fresh quote's")
+        XCTAssertEqual(native.preparedAmounts, [500, 500], "same amount")
+        XCTAssertEqual(native.sentPrepared.map(\.quoteId), ["quote-1", "quote-2"])
+        await service.releaseQuietly()
+    }
+
+    /// A fresh quote is held to the fee the user already agreed to.
+    func testARequoteAboveTheAgreedFeeStopsWithTheNewFee() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.nextFees = [3, 40]
+        native.sendErrors = [WalletFfiError.QuoteExpired]
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        do {
+            _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 3)
+            XCTFail("expected the dearer fresh quote to be refused")
+        } catch let error as CashuWalletError {
+            XCTAssertEqual(error, .feeChanged(feeSats: 40))
+        }
+        XCTAssertEqual(native.count("send"), 1, "only the expired quote reached send")
+        await service.releaseQuietly()
+    }
+
+    /// Re-quoting is bounded and ends in its own typed refusal.
+    func testRequotingIsBoundedAndEndsInATypedQuoteExpired() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 3
+        native.sendErrors = Array(repeating: WalletFfiError.QuoteExpired, count: 5)
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        do {
+            _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 3)
+            XCTFail("expected QuoteExpired")
+        } catch let error as CashuWalletError {
+            XCTAssertEqual(error, .quoteExpired)
+            XCTAssertNotEqual(error.errorDescription, CashuWalletError.backend("x").errorDescription)
+        }
+        XCTAssertEqual(native.count("send"), 1 + CashuWalletService.maxRequotes)
+        await service.releaseQuietly()
+    }
+
+    /// The core's two "nothing was sent" refusals map to their own typed
+    /// errors, never to `.backend` ("Payment failed").
+    func testQuoteExpiredAndFeeChangedMapToTheirTypedErrors() {
+        XCTAssertEqual(CashuWalletError(WalletFfiError.FeeChanged(feesSats: 55)), .feeChanged(feeSats: 55))
+        XCTAssertEqual(CashuWalletError(WalletFfiError.QuoteExpired), .quoteExpired)
     }
 
     func testAFeeAtOrBelowTheConsentedCeilingPays() async throws {
