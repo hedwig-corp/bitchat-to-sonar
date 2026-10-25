@@ -83,6 +83,11 @@ struct AnnouncementPacket {
     var capabilities: PeerCapabilities? = nil
     /// Coarse rendezvous cell when bridging (TLV 0x06, ≤12 bytes).
     var bridgeGeohash: String? = nil
+    /// TLVs this build does not understand, kept in arrival order and
+    /// re-emitted after the known ones (as `Announce::unknown_tlvs` in the
+    /// crate and `IdentityAnnouncement.unknownTLVs` on bitchat-android do), so
+    /// re-encoding a decoded announce loses nothing a newer peer put in it.
+    var unknownTLVs: [UnknownAnnouncementTLV] = []
 
     static let maxBridgeGeohashBytes = 12
 
@@ -145,6 +150,13 @@ struct AnnouncementPacket {
             data.append(cell)
         }
 
+        for tlv in unknownTLVs {
+            guard tlv.value.count <= 255 else { return nil }
+            data.append(tlv.type)
+            data.append(UInt8(tlv.value.count))
+            data.append(tlv.value)
+        }
+
         return data
     }
 
@@ -156,6 +168,7 @@ struct AnnouncementPacket {
         var directNeighbors: [Data]?
         var capabilities: PeerCapabilities?
         var bridgeGeohash: String?
+        var unknownTLVs: [UnknownAnnouncementTLV] = []
 
         while offset + 2 <= data.count {
             let typeRaw = data[offset]
@@ -196,8 +209,9 @@ struct AnnouncementPacket {
                     }
                 }
             } else {
-                // Unknown TLV; skip (tolerant decoder for forward compatibility)
-                continue
+                // Unknown TLV: kept for re-encoding (tolerant decoder for
+                // forward compatibility).
+                unknownTLVs.append(UnknownAnnouncementTLV(type: typeRaw, value: Data(value)))
             }
         }
 
@@ -208,9 +222,16 @@ struct AnnouncementPacket {
             signingPublicKey: signingPublicKey,
             directNeighbors: directNeighbors,
             capabilities: capabilities,
-            bridgeGeohash: bridgeGeohash
+            bridgeGeohash: bridgeGeohash,
+            unknownTLVs: unknownTLVs
         )
     }
+}
+
+/// An announce TLV this build does not understand.
+struct UnknownAnnouncementTLV: Equatable {
+    let type: UInt8
+    let value: Data
 }
 
 /// Noise payload `0x21`: state that is authoritative only because it arrives
@@ -437,7 +458,9 @@ struct PrivateMessagePacket {
         var content: String?
         var replyTo: String?
 
-        while offset < data.count {
+        // A trailing lone type byte is ignored, like both reference decoders
+        // and the crate (`while offset + 2 <= count`).
+        while offset + 2 <= data.count {
             let typeRaw = data[offset]
             offset += 1
             let type = TLVType(rawValue: typeRaw)

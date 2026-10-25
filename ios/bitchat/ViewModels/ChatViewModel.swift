@@ -3259,6 +3259,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 // surfaced through `didReceiveMessage` like a directed 0x22;
                 // peer state only updates transport-level capabilities.
                 break
+            case .groupInvite, .groupKeyUpdate, .voiceFrame, .vouch:
+                // Unsupported upstream features; BLEService drops them first.
+                break
             case .verifyResponse:
                 guard let resp = VerificationService.shared.parseVerifyResponse(payload) else { return }
                 // Check pending for this peer

@@ -383,7 +383,11 @@ struct BinaryProtocol {
                 }
             }
 
-            // Payload: payloadLength is exactly the payload size (+ compression preamble if compressed)
+            // Payload: payloadLength is exactly the payload size (+ compression preamble if compressed).
+            // Per-type ceiling on the decoded payload, compressed or not, checked
+            // before allocating (PacketPayloadLimits; same verdicts as the crate
+            // and stock bitchat iOS).
+            let maxPayloadSize = PacketPayloadLimits.maxPayloadBytes(forType: type)
             let payload: Data
             let wirePayload: WirePayload
             if isCompressed {
@@ -396,13 +400,16 @@ struct BinaryProtocol {
                     guard let rawSize = read16() else { return nil }
                     originalSize = Int(rawSize)
                 }
-                guard originalSize >= 0 && originalSize <= FileTransferLimits.maxFramedFileBytes else { return nil }
+                guard originalSize > 0 && originalSize <= maxPayloadSize else {
+                    SecureLogger.debug("🚫 Compressed payload for type \(type) declares \(originalSize) bytes (cap \(maxPayloadSize))", category: .security)
+                    return nil
+                }
                 let compressedSize = payloadLength - lengthFieldBytes
                 guard compressedSize > 0, let compressed = readData(compressedSize) else { return nil }
 
-                let compressionRatio = Double(originalSize) / Double(compressedSize)
-                guard compressionRatio <= 50_000.0 else {
-                    SecureLogger.warning("🚫 Suspicious compression ratio: \(String(format: "%.0f", compressionRatio)):1", category: .security)
+                // DEFLATE cannot exceed 1032:1; a larger claim is a bomb, not a frame.
+                guard originalSize <= compressedSize * PacketPayloadLimits.maxDeflateRatio else {
+                    SecureLogger.warning("🚫 Impossible compression ratio: \(originalSize) bytes from \(compressedSize)", category: .security)
                     return nil
                 }
 
@@ -411,6 +418,12 @@ struct BinaryProtocol {
                 payload = decompressed
                 wirePayload = WirePayload(bytes: compressed, compressed: true, forPayload: payload)
             } else {
+                // Uncompressed payloads get the same ceiling, or a large frame
+                // could arrive as small fragments and be reassembled.
+                guard payloadLength <= maxPayloadSize else {
+                    SecureLogger.debug("🚫 Payload for type \(type) is \(payloadLength) bytes (cap \(maxPayloadSize))", category: .security)
+                    return nil
+                }
                 guard let rawPayload = readData(payloadLength) else { return nil }
                 payload = rawPayload
                 wirePayload = WirePayload(bytes: rawPayload, compressed: false, forPayload: payload)
