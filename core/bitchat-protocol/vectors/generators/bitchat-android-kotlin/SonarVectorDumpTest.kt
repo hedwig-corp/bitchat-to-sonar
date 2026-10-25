@@ -242,6 +242,41 @@ class SonarVectorDumpTest {
             )
         }
 
+        // The same frame carrying a DEFLATE stream no reference encoder emits for this payload:
+        // zlib level 1 (python3: zlib.compressobj(1, zlib.DEFLATED, -15)), 18 bytes like the
+        // default-level stream above but different bytes. Here a fresh compression differs from
+        // the original, so "re-encode reproduces the originator's bytes" is distinguishable from
+        // "re-encode recompresses" -- which the case above cannot show.
+        run {
+            val unpadded4 = BinaryProtocol.encode(makePacket(1, 2, 7, 1709600000000L, sender, null, null, cycle("compress-me", 300), sig22), padding = false)!!
+            val own = BinaryProtocol.decode(unpadded4)!!.wirePayload!!.bytes
+            val foreign = unhex("4bcecf2d284a2d2ed6cd4d4d1e65e20f0700")
+            check(foreign.size == own.size && !foreign.contentEquals(own)) { "foreign stream must differ from the codec's own at equal length" }
+            // v1 header (14) + sender (8) + 2-byte original size, then the stream.
+            val at = 14 + 8 + 2
+            check(unpadded4.copyOfRange(at, at + own.size).contentEquals(own)) { "unexpected frame layout" }
+            val frame = unpadded4.copyOf().also { foreign.copyInto(it, at) }
+            val padded = MessagePadding.pad(frame, MessagePadding.optimalBlockSize(frame.size))
+            val decoded = BinaryProtocol.decode(padded)!!
+            val rePadded = BinaryProtocol.encode(decoded, padding = true)
+            val reUnpadded = BinaryProtocol.encode(decoded, padding = false)
+            val freshUnpadded = BinaryProtocol.encode(decoded.copy(wirePayload = null), padding = false)
+            cases += case(
+                "case4_foreign_deflate_decode_then_reencode", "packet_reencode_preserves_wire",
+                mapOf("padded" to padded),
+                mapOf(
+                    "reencoded" to reUnpadded,
+                    "reencoded_padded" to rePadded,
+                    "equals_original_unpadded" to (reUnpadded?.contentEquals(frame)),
+                    "equals_original_padded" to (rePadded?.contentEquals(padded)),
+                    "decoded_wire_compressed" to decoded.wirePayload?.compressed,
+                    "decoded_wire_bytes" to decoded.wirePayload?.bytes,
+                    "fresh_reencode_without_wirepayload" to freshUnpadded,
+                    "fresh_equals_original_unpadded" to (freshUnpadded?.contentEquals(frame))
+                )
+            )
+        }
+
         // ---------- packet_decode_reject ----------
         run {
             val unpadded1 = BinaryProtocol.encode(makePacket(1, 2, 7, 1709600000000L, sender, null, null, ascii("Hello mesh"), null), padding = false)!!

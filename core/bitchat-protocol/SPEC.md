@@ -366,7 +366,7 @@ messages and `0x53` announces with a BIP‑353 address are affected.
 ## 13. Test vectors
 
 `vectors/bitchat-ios.json` (179 cases) and `vectors/bitchat-android.json`
-(90 cases) were produced by running the reference codecs themselves — a Swift
+(91 cases) were produced by running the reference codecs themselves — a Swift
 Testing case dropped into `localPackages/BitFoundation/Tests` plus copies of
 the app‑target TLV files, and a JUnit test run through the upstream Gradle
 unit‑test harness. The generator sources are in `vectors/generators/`. Two
@@ -376,7 +376,11 @@ multi‑hundred‑KB cases were dropped and single‑byte repeats are written
 The harness asserts byte equality for everything except DEFLATE streams,
 where it asserts that the upstream stream inflates to the payload, that the
 compression *decision* agrees, and that decoding upstream bytes and
-re‑encoding reproduces them exactly (the §5 rule). Deliberate divergences
+re‑encoding reproduces them exactly (the §5 rule). The Android
+`packet_reencode_preserves_wire` pair makes that rule falsifiable: one case
+carries the codec's own stream, the other the same payload behind a zlib
+level‑1 stream no reference encoder emits by default, so a re‑encode that
+recompressed would reproduce the first and fail the second. Deliberate divergences
 (§12: tolerant PM decode; the union `NoisePayloadType` registry) are listed in
 `DIVERGENCES` and asserted the other way round, so they can never drift into
 silent agreement or disagreement.

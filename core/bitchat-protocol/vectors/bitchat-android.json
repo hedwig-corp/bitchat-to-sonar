@@ -731,6 +731,23 @@
   },
   {
    "expected": {
+    "decoded_wire_bytes": "4bcecf2d284a2d2ed6cd4d4d1e65e20f0700",
+    "decoded_wire_compressed": true,
+    "equals_original_padded": true,
+    "equals_original_unpadded": true,
+    "fresh_equals_original_unpadded": false,
+    "fresh_reencode_without_wirepayload": "0102070000018e0c19c8000600141122334455667788012c4bcecf2d284a2d2ed6cd4d4d1e65e267020022222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+    "reencoded": "0102070000018e0c19c8000600141122334455667788012c4bcecf2d284a2d2ed6cd4d4d1e65e20f070022222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+    "reencoded_padded": "0102070000018e0c19c8000600141122334455667788012c4bcecf2d284a2d2ed6cd4d4d1e65e20f070022222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696"
+   },
+   "input": {
+    "padded": "0102070000018e0c19c8000600141122334455667788012c4bcecf2d284a2d2ed6cd4d4d1e65e20f070022222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696"
+   },
+   "kind": "packet_reencode_preserves_wire",
+   "name": "case4_foreign_deflate_decode_then_reencode"
+  },
+  {
+   "expected": {
     "decodes": false
    },
    "input": {
@@ -1245,6 +1262,6 @@
   }
  ],
  "generator": "Approach A: JUnit test SonarVectorDumpTest.kt run inside the upstream Gradle unit-test harness (JVM, android.util.Log stubbed by app/src/test/kotlin/android/util/Log.kt); every expected value is the real upstream Kotlin codec output. Compression = java.util.zip.Deflater(DEFAULT_COMPRESSION, nowrap=true), JDK 17 (JBR 17.0.12). signing_preimage = BitchatPacket.toBinaryDataForSigning() which upstream encodes WITH padding and TTL=0.",
- "note": "Trimmed for the repository: the two 70000-byte v2 file-transfer cases were dropped (the crate pins that shape in its own tests) and hex strings that are one byte repeated >= 1024 times are written as \"repeat:xx*N\". Regenerate with scripts/bitchat-vectors/regenerate.sh.",
+ "note": "Trimmed for the repository: the two 70000-byte v2 file-transfer cases were dropped (the crate pins that shape in its own tests) and hex strings that are one byte repeated >= 1024 times are written as \"repeat:xx*N\". Generated, not hand-written: scripts/bitchat-vectors/regenerate.sh in https://github.com/hedwig-corp/bitchat-to-sonar clones the reference repository, installs the dump test from core/bitchat-protocol/vectors/generators/ into its own unit-test harness, runs it and normalizes the output with scripts/bitchat-vectors/normalize.py; a copy of this file elsewhere is refreshed from the regenerated file, never edited.",
  "source": "permissionlesstech/bitchat-android@dfc67dad"
 }

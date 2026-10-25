@@ -4,7 +4,7 @@ A JUnit test for `permissionlesstech/bitchat-android` that replays the shared
 wire-format vectors in `core/bitchat-protocol/vectors/bitchat-android.json`
 against the upstream Kotlin codec, so upstream guards its own bytes with the
 same file other clients check against. Verified green on upstream `dfc67dad`
-(release 2.0.3): 90/90 cases byte-exact, JBR 17.0.12, Gradle 9.6.1, AGP 9.3.1.
+(release 2.0.3): 91/91 cases byte-exact, JBR 17.0.12, Gradle 9.6.1, AGP 9.3.1.
 
 ## Pitch for the upstream PR
 
@@ -26,7 +26,7 @@ becomes a deliberate vector update that every client picks up together.
 
 ```
 app/src/test/java/com/bitchat/android/protocol/BitchatVectorReplayTest.kt   <- this file
-app/src/test/resources/bitchat-vectors/bitchat-android.json                 <- copy of the vector file
+app/src/test/resources/contracts/bitchat-wire-protocol-v1-v2.json          <- copy of the vector file
 ```
 
 The `wear` module re-runs the app's `protocol/**` tests from a synced mirror of
@@ -45,9 +45,11 @@ Robolectric, no `returnDefaultValues`.
 1. `SONAR_VECTOR_FILE` environment variable, if set: an absolute path to the
    vector file. Use this to replay a file outside the repo (e.g. this repo's
    `core/bitchat-protocol/vectors/bitchat-android.json`) without copying it.
-2. Otherwise the classpath resource `/bitchat-vectors/bitchat-android.json`,
-   i.e. `app/src/test/resources/bitchat-vectors/bitchat-android.json`. This is
-   the form the upstream PR should ship so CI needs no environment.
+2. Otherwise the classpath resource `/contracts/bitchat-wire-protocol-v1-v2.json`,
+   i.e. `app/src/test/resources/contracts/bitchat-wire-protocol-v1-v2.json`
+   (upstream's `docs/testing-conventions.md` puts interoperability fixtures
+   under `contracts/` with protocol and version in the name). This is the form
+   the upstream PR ships so CI needs no environment.
 
 If neither exists the test fails with a message naming both locations.
 
@@ -101,7 +103,9 @@ asserted, because that is what every peer must accept regardless of encoder.
   padding and TTL=0; decoded payload, flags byte, `wirePayload` bytes and
   compressed flag, route, recipient, signature, ttl, timestamp),
   `packet_reencode_preserves_wire` (decode then re-encode must reproduce the
-  originator's bytes; also the fresh re-compression), `packet_decode_reject`,
+  originator's bytes; also the fresh re-compression — one case carries the
+  codec's own stream, one a zlib level-1 stream it never emits by default, so
+  preservation is distinguishable from recompression), `packet_decode_reject`,
   `announce_tlv` (encode shape when `input.nickname` is present; decode /
   re-encode shape with `unknown_tlvs` when `input.encoded` is present),
   `capabilities` (encode when `input.raw`, decode when `input.encoded`),
