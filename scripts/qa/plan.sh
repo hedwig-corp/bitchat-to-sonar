@@ -43,7 +43,7 @@ fi
 
 # --- areas -----------------------------------------------------------------
 ios=0 android=0 core=0 corelib=0 wallet=0 breez=0 messaging=0 share=0 localtime=0
-ui=0 i18n=0 perf=0 transcript=0 code=0 harness=0 ffi=0 mirror_kt=0 mirror_swift=0
+ui=0 i18n=0 perf=0 transcript=0 code=0 harness=0 ffi=0 mirror_kt=0 mirror_swift=0 slow=0
 while IFS= read -r f; do
   b="${f##*/}"   # keyword areas match the file name: every Compose path contains "chat/bitchat"
   case "$f" in
@@ -68,6 +68,10 @@ while IFS= read -r f; do
   case "$f" in ios/bitchatShareExtension/*) share=1 ;; esac
   case "$b" in *share*) share=1 ;; esac
   case "$b" in *localtime*|*local_time*|*timezone*) localtime=1 ;; esac
+  # A lost publish only shows up when the network breaks mid-send: QA_SLOW=1
+  # runs QA-142 (airplane mode until the outbox gives up on a share).
+  case "$b" in outbox.rs|conversation_index.rs|*timezone*|*localtime*|*local_time*) slow=1 ;; esac
+  case "$f" in core/sonar-core/src/client.rs) slow=1 ;; esac
   case "$f" in ios/bitchat/Views/*|*/screens/*|*/ui/*) ui=1 ;; esac
   case "$b" in *Screen.kt|*View.swift|*Sheet*) ui=1 ;; esac
   case "$f" in *Localizable.xcstrings|scripts/i18n/*|*/composeResources/*strings*) i18n=1; ui=1 ;; esac
@@ -187,7 +191,11 @@ if (( android && peers )); then
   else
     avd="Sonar_QA_API_36"; [[ " $avds " == *" $avd "* ]] || avd="$(awk '{print $1}' <<< "$avds")"
     run "T2  export QA_SERIAL=\"\$(scripts/qa/android-setup.sh --avd $avd$cfg)\""
-    run "T2  scripts/qa/android-smoke.sh      # every automated QA-NNN; --only QA-NNN for one"
+    if (( slow )); then
+      run "T2  QA_SLOW=1 scripts/qa/android-smoke.sh   # every automated QA-NNN, plus QA-142: a share lost offline (~12 min)"
+    else
+      run "T2  scripts/qa/android-smoke.sh      # every automated QA-NNN; --only QA-NNN for one"
+    fi
   fi
 fi
 if (( ios && xcode && peers )); then
