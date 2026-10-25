@@ -21,8 +21,13 @@ DROP = {
 NOTE = (
     "Trimmed for the repository: the two 70000-byte v2 file-transfer cases were "
     "dropped (the crate pins that shape in its own tests) and hex strings that are "
-    "one byte repeated >= 1024 times are written as \"repeat:xx*N\". Regenerate with "
-    "scripts/bitchat-vectors/regenerate.sh."
+    "one byte repeated >= 1024 times are written as \"repeat:xx*N\". Generated, not "
+    "hand-written: scripts/bitchat-vectors/regenerate.sh in "
+    "https://github.com/hedwig-corp/bitchat-to-sonar clones the reference "
+    "repository, installs the dump test from core/bitchat-protocol/vectors/generators/ "
+    "into its own unit-test harness, runs it and normalizes the output with "
+    "scripts/bitchat-vectors/normalize.py; a copy of this file elsewhere is "
+    "refreshed from the regenerated file, never edited."
 )
 
 

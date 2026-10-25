@@ -28,7 +28,9 @@ import java.io.File
  * implementations will see.
  *
  * Location: the env var SONAR_VECTOR_FILE, else the classpath resource
- * /bitchat-vectors/bitchat-android.json (app/src/test/resources/bitchat-vectors/).
+ * /contracts/bitchat-wire-protocol-v1-v2.json, i.e. the interoperability fixture
+ * app/src/test/resources/contracts/bitchat-wire-protocol-v1-v2.json (packet
+ * versions 1 and 2; see docs/testing-conventions.md for the contracts/ layout).
  *
  * Hex encoding: lowercase hex, or "repeat:xx*N" for one byte repeated N times.
  *
@@ -50,8 +52,8 @@ class BitchatVectorReplayTest {
         val text = if (!envPath.isNullOrBlank()) {
             File(envPath).readText()
         } else {
-            val stream = javaClass.getResourceAsStream("/bitchat-vectors/bitchat-android.json")
-                ?: error("vector file not found: set SONAR_VECTOR_FILE or add app/src/test/resources/bitchat-vectors/bitchat-android.json")
+            val stream = javaClass.getResourceAsStream("/contracts/bitchat-wire-protocol-v1-v2.json")
+                ?: error("vector file not found: set SONAR_VECTOR_FILE or add app/src/test/resources/contracts/bitchat-wire-protocol-v1-v2.json")
             stream.bufferedReader().use { it.readText() }
         }
         return JsonParser.parseString(text).asJsonObject

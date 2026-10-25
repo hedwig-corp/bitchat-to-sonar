@@ -1,3 +1,197 @@
+diff --git a/bitchat/Services/BLE/BLEDirectedRelaySpool.swift b/bitchat/Services/BLE/BLEDirectedRelaySpool.swift
+index d6149a3f..48d97f68 100644
+--- a/bitchat/Services/BLE/BLEDirectedRelaySpool.swift
++++ b/bitchat/Services/BLE/BLEDirectedRelaySpool.swift
+@@ -12,6 +12,9 @@ struct BLEDirectedRelaySpoolEntry {
+ /// spooled noiseEncrypted packet keeps the framed-file decompression cap, so
+ /// a ~1 KB compressed frame can decode to ~1 MB, and a window-only bound let
+ /// a stream of such frames pin gigabytes before the first entry expired.
++/// The bytes charged are `retainedPayloadBytes`: a decoded packet also keeps
++/// its received wire bytes for relay, and a DEFLATE stream can be larger
++/// than the payload it inflates to.
+ struct BLEDirectedRelaySpool {
+     private struct Key: Hashable {
+         let recipient: PeerID
+@@ -31,7 +34,7 @@ struct BLEDirectedRelaySpool {
+     private var packets: [Key: StoredPacket] = [:]
+     /// Enqueue order, oldest first: the eviction order, and the drain order.
+     private var order: [Key] = []
+-    /// Sum of spooled payload sizes, maintained on every insert/remove.
++    /// Sum of spooled `retainedPayloadBytes`, maintained on every insert/remove.
+     private var payloadBytes = 0
+ 
+     init(
+@@ -61,17 +64,17 @@ struct BLEDirectedRelaySpool {
+         enqueuedAt: Date
+     ) -> Bool {
+         let key = Key(recipient: recipient, messageID: messageID)
+-        guard packets[key] == nil, packet.payload.count <= byteBudget else {
++        guard packets[key] == nil, packet.retainedPayloadBytes <= byteBudget else {
+             return false
+         }
+ 
+         packets[key] = StoredPacket(packet: packet, enqueuedAt: enqueuedAt)
+         order.append(key)
+-        payloadBytes += packet.payload.count
++        payloadBytes += packet.retainedPayloadBytes
+         while order.count > capacity || payloadBytes > byteBudget {
+             let victim = order.removeFirst()
+             if let evicted = packets.removeValue(forKey: victim) {
+-                payloadBytes -= evicted.packet.payload.count
++                payloadBytes -= evicted.packet.retainedPayloadBytes
+             }
+         }
+         return true
+@@ -100,7 +103,7 @@ struct BLEDirectedRelaySpool {
+                 freshOrder.append(key)
+             } else {
+                 packets.removeValue(forKey: key)
+-                payloadBytes -= stored.packet.payload.count
++                payloadBytes -= stored.packet.retainedPayloadBytes
+             }
+         }
+         order = freshOrder
+diff --git a/bitchat/Sync/GossipSyncManager.swift b/bitchat/Sync/GossipSyncManager.swift
+index c54140f0..27e1215a 100644
+--- a/bitchat/Sync/GossipSyncManager.swift
++++ b/bitchat/Sync/GossipSyncManager.swift
+@@ -14,26 +14,28 @@ final class GossipSyncManager {
+     private struct PacketStore {
+         private(set) var packets: [String: BitchatPacket] = [:]
+         private(set) var order: [String] = []
+-        /// Sum of retained payload sizes, maintained on every insert/remove.
++        /// Sum of retained payload sizes (`retainedPayloadBytes`: the decoded
++        /// payload or the received wire bytes, whichever is larger),
++        /// maintained on every insert/remove.
+         private var payloadBytes = 0
+ 
+         /// Evicts oldest-first until both the count and the byte budget hold.
+         /// The count cap alone let a few max-size packets per slot pin
+         /// hundreds of MB; the budget bounds memory whatever the sizes.
+         mutating func insert(idHex: String, packet: BitchatPacket, capacity: Int, byteBudget: Int) {
+-            guard capacity > 0, packet.payload.count <= byteBudget else { return }
++            guard capacity > 0, packet.retainedPayloadBytes <= byteBudget else { return }
+             if let existing = packets[idHex] {
+-                payloadBytes += packet.payload.count - existing.payload.count
++                payloadBytes += packet.retainedPayloadBytes - existing.retainedPayloadBytes
+                 packets[idHex] = packet
+             } else {
+                 packets[idHex] = packet
+                 order.append(idHex)
+-                payloadBytes += packet.payload.count
++                payloadBytes += packet.retainedPayloadBytes
+             }
+             while order.count > capacity || payloadBytes > byteBudget {
+                 let victim = order.removeFirst()
+                 if let evicted = packets.removeValue(forKey: victim) {
+-                    payloadBytes -= evicted.payload.count
++                    payloadBytes -= evicted.retainedPayloadBytes
+                 }
+             }
+         }
+@@ -51,7 +53,7 @@ final class GossipSyncManager {
+                 guard let packet = packets[key] else { continue }
+                 if shouldRemove(packet) {
+                     packets.removeValue(forKey: key)
+-                    payloadBytes -= packet.payload.count
++                    payloadBytes -= packet.retainedPayloadBytes
+                 } else {
+                     nextOrder.append(key)
+                 }
+@@ -669,8 +671,8 @@ final class GossipSyncManager {
+                 droppedAny = true
+                 continue
+             }
+-            guard keptBytes + packet.payload.count <= config.messageByteBudget else { break }
+-            keptBytes += packet.payload.count
++            guard keptBytes + packet.retainedPayloadBytes <= config.messageByteBudget else { break }
++            keptBytes += packet.retainedPayloadBytes
+             kept.append((PacketIdUtil.computeId(packet).hexEncodedString(), packet))
+         }
+         for entry in kept.reversed() {
+diff --git a/bitchatTests/GossipSyncManagerTests.swift b/bitchatTests/GossipSyncManagerTests.swift
+index 41f9f801..5ba60956 100644
+--- a/bitchatTests/GossipSyncManagerTests.swift
++++ b/bitchatTests/GossipSyncManagerTests.swift
+@@ -1012,6 +1012,39 @@ struct GossipSyncManagerTests {
+         #expect(manager._messageCount(for: PeerID(hexData: packets[2].senderID)) == 1)
+     }
+ 
++    /// A received packet also retains its wire bytes, and a valid DEFLATE
++    /// stream can be far larger than the payload it inflates to; the store
++    /// charges the larger of the two so a few-byte message cannot pin a
++    /// frame-sized stream for a few bytes of budget.
++    @Test func messageStoreChargesRetainedWireBytes() throws {
++        var config = GossipSyncManager.Config()
++        config.messageByteBudget = 250
++        let manager = GossipSyncManager(myPeerID: myPeerID, config: config, requestSyncManager: RequestSyncManager())
++
++        // Three 1-byte payloads, each remembered with a 100-byte wire stream.
++        var packets = try makeBudgetPackets(type: .message).map { packet in
++            BitchatPacket(
++                type: packet.type,
++                senderID: packet.senderID,
++                recipientID: nil,
++                timestamp: packet.timestamp,
++                payload: Data([0x01]),
++                signature: nil,
++                ttl: 1
++            )
++        }
++        for index in packets.indices {
++            packets[index].wirePayload = WirePayload(bytes: Data(repeating: UInt8(index), count: 100), compressed: true, forPayload: packets[index].payload)
++        }
++        packets.forEach(manager.onPublicPacketSeen)
++
++        // 300 retained bytes against a 250-byte budget: the oldest goes,
++        // exactly as it does for three 100-byte payloads.
++        #expect(manager._messageCount(for: PeerID(hexData: packets[0].senderID)) == 0)
++        #expect(manager._messageCount(for: PeerID(hexData: packets[1].senderID)) == 1)
++        #expect(manager._messageCount(for: PeerID(hexData: packets[2].senderID)) == 1)
++    }
++
+     @Test func fragmentFileAndGroupStoresEvictOldestPastTheirByteBudgets() async throws {
+         var config = GossipSyncManager.Config()
+         config.fragmentByteBudget = 250
+diff --git a/bitchatTests/Services/BLEDirectedRelaySpoolTests.swift b/bitchatTests/Services/BLEDirectedRelaySpoolTests.swift
+index 6f02032a..42ad9f11 100644
+--- a/bitchatTests/Services/BLEDirectedRelaySpoolTests.swift
++++ b/bitchatTests/Services/BLEDirectedRelaySpoolTests.swift
+@@ -104,6 +104,34 @@ struct BLEDirectedRelaySpoolTests {
+         #expect(drained.map { $0.packet.payload.first } == [1, 2])
+     }
+ 
++    /// A decoded packet keeps its received wire bytes for relay, and a valid
++    /// DEFLATE stream can be far larger than the payload it inflates to, so
++    /// the budget must charge the larger of the two.
++    @Test
++    func enqueueChargesRetainedWireBytesNotJustThePayload() {
++        let recipient = PeerID(str: "1122334455667788")
++        let now = Date()
++        var spool = BLEDirectedRelaySpool(capacity: 10, byteBudget: 250)
++
++        // Three bytes of payload carried by a 200-byte stream: 200 against the budget.
++        var inflated = makePacket(payload: [0x01, 0x02, 0x03])
++        inflated.wirePayload = WirePayload(bytes: Data(repeating: 0xAB, count: 200), compressed: true, forPayload: inflated.payload)
++        let first = spool.enqueue(packet: inflated, recipient: recipient, messageID: "inflated-1", enqueuedAt: now)
++        #expect(first)
++
++        // A second one would reach 400 > 250: the first is evicted, not kept beside it.
++        let second = spool.enqueue(packet: inflated, recipient: recipient, messageID: "inflated-2", enqueuedAt: now.addingTimeInterval(1))
++        #expect(second)
++        #expect(spool.count == 1)
++
++        // Larger than the whole budget: refused outright, as an oversized payload would be.
++        var oversized = makePacket(payload: [0x04])
++        oversized.wirePayload = WirePayload(bytes: Data(repeating: 0xCD, count: 251), compressed: true, forPayload: oversized.payload)
++        let refused = spool.enqueue(packet: oversized, recipient: recipient, messageID: "oversized", enqueuedAt: now)
++        #expect(!refused)
++        #expect(spool.count == 1)
++    }
++
+     @Test
+     func enqueueEvictsOldestPastTheCountCap() {
+         let now = Date()
 diff --git a/localPackages/BitFoundation/Sources/BitFoundation/BinaryProtocol.swift b/localPackages/BitFoundation/Sources/BitFoundation/BinaryProtocol.swift
 index 8590db7d..f59813e7 100644
 --- a/localPackages/BitFoundation/Sources/BitFoundation/BinaryProtocol.swift
@@ -81,7 +275,7 @@ index 8590db7d..f59813e7 100644
      }
  }
 diff --git a/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift b/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift
-index db286ae3..4db1b9e3 100644
+index db286ae3..bdcade67 100644
 --- a/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift
 +++ b/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift
 @@ -8,6 +8,41 @@
@@ -126,7 +320,7 @@ index db286ae3..4db1b9e3 100644
  /// The core packet structure for all BitChat protocol messages.
  /// Encapsulates all data needed for routing through the mesh network,
  /// including TTL for hop limiting and optional encryption.
-@@ -23,7 +58,15 @@ public struct BitchatPacket: Codable {
+@@ -23,7 +58,26 @@ public struct BitchatPacket: Codable {
      public var ttl: UInt8
      public var route: [Data]?
      public var isRSR: Bool
@@ -136,6 +330,17 @@ index db286ae3..4db1b9e3 100644
 +    /// whether or not one remembers its wire bytes.
 +    public var wirePayload: WirePayload? = nil
 +
++    /// What a store holding this packet keeps alive: the decoded payload, or
++    /// the received wire bytes when those are larger. A valid DEFLATE stream
++    /// may be far larger than what it inflates to (stored blocks, or many empty
++    /// blocks before a one-byte final block), so a byte budget charged by
++    /// `payload.count` alone would let a few-byte message pin a frame-sized
++    /// stream. For every frame a reference encoder emits, compressed bytes are
++    /// smaller than the payload and this equals `payload.count`.
++    public var retainedPayloadBytes: Int {
++        max(payload.count, wirePayload?.bytes.count ?? 0)
++    }
++
 +    private enum CodingKeys: String, CodingKey {
 +        case version, type, senderID, recipientID, timestamp, payload, signature, ttl, route, isRSR
 +    }
@@ -143,7 +348,7 @@ index db286ae3..4db1b9e3 100644
      public init(type: UInt8, senderID: Data, recipientID: Data?, timestamp: UInt64, payload: Data, signature: Data?, ttl: UInt8, version: UInt8 = 1, route: [Data]? = nil, isRSR: Bool = false) {
          self.version = version
          self.type = type
-@@ -51,7 +94,7 @@ public struct BitchatPacket: Codable {
+@@ -51,7 +105,7 @@ public struct BitchatPacket: Codable {
      public func toBinaryDataForSigning() -> Data? {
          // Create a copy without signature and with fixed TTL for signing
          // TTL must be excluded because it changes during relay
@@ -152,7 +357,7 @@ index db286ae3..4db1b9e3 100644
              type: type,
              senderID: senderID,
              recipientID: recipientID,
-@@ -63,6 +106,11 @@ public struct BitchatPacket: Codable {
+@@ -63,6 +117,11 @@ public struct BitchatPacket: Codable {
              route: route,
              isRSR: false // RSR flag is mutable and not part of the signature
          )
@@ -166,10 +371,10 @@ index db286ae3..4db1b9e3 100644
      
 diff --git a/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift b/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift
 new file mode 100644
-index 00000000..9466a5c8
+index 00000000..4c0a1766
 --- /dev/null
 +++ b/localPackages/BitFoundation/Tests/BitFoundationTests/BinaryProtocolWirePayloadTests.swift
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,269 @@
 +//
 +// BinaryProtocolWirePayloadTests.swift
 +// BitFoundationTests
@@ -289,6 +494,33 @@ index 00000000..9466a5c8
 +        let preimage = try #require(decoded.toBinaryDataForSigning())
 +        #expect(preimage == signingForm(of: frame))
 +        #expect(preimage != fresh(type: 0x02, ttl: 7, payload: payload).toBinaryDataForSigning())
++    }
++
++    /// The retained stream can be larger than the payload it inflates to: a
++    /// store that charged `payload.count` would hold frame-sized streams for
++    /// a few-byte budget each. `retainedPayloadBytes` is what to charge.
++    @Test func retainedBytesCountTheWireStreamWhenItIsLarger() throws {
++        let payload = compressiblePayload
++        let stream = storedDeflate(payload)
++        var body = Data()
++        body.append(UInt8(payload.count >> 8))
++        body.append(UInt8(payload.count & 0xFF))
++        body.append(stream)
++        let frame = v1Frame(type: 0x02, ttl: 7, flags: BinaryProtocol.Flags.isCompressed, body: body)
++
++        let decoded = try #require(BinaryProtocol.decode(frame))
++        #expect(decoded.wirePayload?.bytes.count == stream.count)
++        #expect(stream.count > payload.count)
++        #expect(decoded.retainedPayloadBytes == stream.count)
++
++        // A frame compressed by a reference encoder is smaller than its payload,
++        // so there the charge is the payload size, as before.
++        let ownFrame = try #require(fresh(type: 0x02, ttl: 7, payload: payload).toBinaryData(padding: false))
++        let own = try #require(BinaryProtocol.decode(ownFrame))
++        #expect(own.wirePayload?.compressed == true)
++        #expect(own.retainedPayloadBytes == payload.count)
++        // And a locally built packet, with no wire bytes, charges its payload.
++        #expect(fresh(type: 0x02, ttl: 7, payload: payload).retainedPayloadBytes == payload.count)
 +    }
 +
 +    @Test func reencodeReproducesOurOwnCompressedFrame() throws {
