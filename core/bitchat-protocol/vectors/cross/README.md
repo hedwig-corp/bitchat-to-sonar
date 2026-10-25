@@ -1,13 +1,21 @@
-# Cross-replay: bitchat iOS against bitchat-android
+# Cross-replay: four bitchat implementations against each other
 
 `../bitchat-ios.json` and `../bitchat-android.json` are each one reference
 client's own output. `regenerate.sh` shows each client still produces its own
-file; `tests/vectors.rs` shows the Rust crate agrees with both. This directory
-shows whether the two reference clients agree **with each other**.
+file. This directory runs four codecs over **both** files and holds them to
+each other:
+
+| observer | codec | built from |
+|---|---|---|
+| `ios` | stock bitchat iOS | permissionlesstech/bitchat HEAD (BitFoundation tests + app codecs) |
+| `android` | stock bitchat-android | permissionlesstech/bitchat-android HEAD (app unit tests) |
+| `sonar-ios` | Sonar iOS | this checkout's `ios/bitchat` codec files (`sonar-ios-codec.sh`) |
+| `sonar-rust` | Sonar Android | this checkout's crate (`examples/cross_observer.rs`) |
 
 ```
-scripts/bitchat-vectors/cross-replay.sh            # both upstreams at HEAD
+scripts/bitchat-vectors/cross-replay.sh            # all four
 scripts/bitchat-vectors/cross-replay.sh --only ios # one observer
+scripts/bitchat-vectors/cross-replay.sh --only sonar-ios,sonar-rust   # Sonar only, no clone
 scripts/bitchat-vectors/cross-replay.sh --only ios \
   --ios-repo https://github.com/<fork>/bitchat --ios-rev <branch>   # a proposed fix
 ```
@@ -23,11 +31,13 @@ How it works:
    app-target codecs, as `regenerate.sh` does) and `SonarCrossObserverTest.kt`
    (installed into bitchat-android's unit tests) run every operation through
    the real codec and record the result. They compare nothing.
-3. `cross.py compare` checks four directions. Self-replay (iOS on iOS,
+3. `cross.py compare` checks every direction. Self-replay (iOS on iOS,
    Android on Android) must agree completely; that is what shows the harness
-   is right. Cross-replay differences must each match an entry in
-   `ledger.json`, including fields a codec cannot express ("not modeled"),
-   and every entry must still reproduce.
+   is right. Every other difference must match an entry in `ledger.json`,
+   including fields a codec cannot express ("not modeled"), and every entry
+   must still reproduce. Sonar iOS is also held directly to Sonar Android
+   (`--expect-from`), and that pair has no ledger entries at all: the two
+   Sonar platforms must agree on every field.
 
 `ledger.json` is the machine-checked form of SPEC.md §12.1. When upstream
 changes one side, CI fails in one of two ways: an unexplained difference (a
