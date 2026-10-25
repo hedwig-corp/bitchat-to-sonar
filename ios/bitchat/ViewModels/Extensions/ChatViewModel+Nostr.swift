@@ -176,6 +176,9 @@ extension ChatViewModel {
         case .privateFile, .authenticatedPeerState:
             // Mesh-Noise-only payloads (SPEC §10): Nostr delivery ignores them.
             break
+        case .groupInvite, .groupKeyUpdate, .voiceFrame, .vouch:
+            // Upstream iOS features Sonar does not implement.
+            break
         }
     }
 
@@ -413,6 +416,9 @@ extension ChatViewModel {
             break
         case .privateFile, .authenticatedPeerState:
             // Mesh-Noise-only payloads (SPEC §10): Nostr delivery ignores them.
+            break
+        case .groupInvite, .groupKeyUpdate, .voiceFrame, .vouch:
+            // Upstream iOS features Sonar does not implement.
             break
         }
     }
@@ -661,6 +667,9 @@ extension ChatViewModel {
                             break
                         case .privateFile, .authenticatedPeerState:
                             // Mesh-Noise-only payloads (SPEC §10): Nostr delivery ignores them.
+                            break
+                        case .groupInvite, .groupKeyUpdate, .voiceFrame, .vouch:
+                            // Upstream iOS features Sonar does not implement.
                             break
                         }
                     }

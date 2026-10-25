@@ -291,7 +291,9 @@ struct BinaryProtocolTests {
         let repeatedString = String(repeating: "This is a test message. ", count: 200)
         let largePayload = repeatedString.data(using: .utf8)!
         
-        let packet = TestHelpers.createTestPacket(payload: largePayload)
+        // A public message: 4 800 bytes is within its 128 KiB ceiling (an
+        // announce, the helper's default type, is capped at 4 KiB).
+        let packet = TestHelpers.createTestPacket(type: MessageType.message.rawValue, payload: largePayload)
         
         // Encode (should compress)
         let encodedData = try #require(BinaryProtocol.encode(packet), "Failed to encode packet with large payload")
@@ -307,6 +309,24 @@ struct BinaryProtocolTests {
         #expect(decodedPacket.payload == largePayload)
     }
     
+    /// Per-type ceilings (PacketPayloadLimits; SPEC.md §11), the same verdicts
+    /// as the crate and stock bitchat iOS: a control frame over 4 KiB is
+    /// refused whether it arrives plain or compressed, while the same bytes as
+    /// a public message decode.
+    @Test("Control frames over 4 KiB are rejected; the same payload as a message decodes")
+    func perTypeDecodeCeilings() throws {
+        let payload = Data(String(repeating: "This is a test message. ", count: 200).utf8) // 4 800 B, compressible
+        let asMessage = try #require(BinaryProtocol.encode(TestHelpers.createTestPacket(type: MessageType.message.rawValue, payload: payload)))
+        #expect(BinaryProtocol.decode(asMessage)?.payload == payload)
+        let asAnnounce = try #require(BinaryProtocol.encode(TestHelpers.createTestPacket(type: MessageType.announce.rawValue, payload: payload)))
+        #expect(BinaryProtocol.decode(asAnnounce) == nil, "compressed announce declaring 4 800 bytes must be refused")
+        let noise = Data((0..<4_800).map { UInt8(truncatingIfNeeded: $0 &* 131 &+ 7) }) // high entropy: stays uncompressed
+        let plainAnnounce = try #require(BinaryProtocol.encode(TestHelpers.createTestPacket(type: MessageType.announce.rawValue, payload: noise)))
+        #expect(BinaryProtocol.decode(plainAnnounce) == nil, "plain announce of 4 800 bytes must be refused")
+        let atCap = try #require(BinaryProtocol.encode(TestHelpers.createTestPacket(type: MessageType.announce.rawValue, payload: Data(noise.prefix(4_096)))))
+        #expect(BinaryProtocol.decode(atCap) != nil, "an announce of exactly 4 KiB is allowed")
+    }
+
     @Test("Small payloads should not be compressed")
     func smallPayloadNoCompression() throws {
         let smallPayload = "Hi".data(using: .utf8)!

@@ -105,6 +105,13 @@ enum NoisePayloadType: UInt8 {
     case privateMessage = 0x01      // Private chat message
     case readReceipt = 0x02         // Message was read
     case delivered = 0x03           // Message was delivered
+    // Upstream bitchat iOS features Sonar does not implement. Decoded so the
+    // verdict matches the crate and stock iOS (cross-replay vectors), then
+    // dropped by BLEService; never emitted.
+    case groupInvite = 0x06         // Private-group invite (creator-signed state)
+    case groupKeyUpdate = 0x07      // Private-group key rotation / roster update
+    case voiceFrame = 0x08          // Live push-to-talk frame
+    case vouch = 0x12               // Transitive-verification vouches
     // Verification (QR-based OOB binding)
     case verifyChallenge = 0x10     // Verification challenge
     case verifyResponse  = 0x11     // Verification response
@@ -136,6 +143,10 @@ enum NoisePayloadType: UInt8 {
         case .privateMessage: return "privateMessage"
         case .readReceipt: return "readReceipt"
         case .delivered: return "delivered"
+        case .groupInvite: return "groupInvite"
+        case .groupKeyUpdate: return "groupKeyUpdate"
+        case .voiceFrame: return "voiceFrame"
+        case .vouch: return "vouch"
         case .verifyChallenge: return "verifyChallenge"
         case .verifyResponse: return "verifyResponse"
         case .privateFile: return "privateFile"

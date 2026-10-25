@@ -4310,12 +4310,10 @@ extension BLEService {
         var scheduledPackets: [(packet: BitchatPacket, recipient: Data?, index: Int)] = []
 
         for (index, fragment) in fragments.enumerated() {
-            var payload = Data()
-            payload.append(fragmentID)
-            payload.append(contentsOf: withUnsafeBytes(of: UInt16(index).bigEndian) { Data($0) })
-            payload.append(contentsOf: withUnsafeBytes(of: UInt16(fragments.count).bigEndian) { Data($0) })
-            payload.append(packet.type)
-            payload.append(fragment)
+            let payload = FragmentHeader.encodePayload(
+                fragmentID: fragmentID, index: index, total: fragments.count,
+                originalType: packet.type, data: Data(fragment)
+            )
 
             let fragmentRecipient: Data? = {
                 if let only = context.directedPeer { return Data(hexString: only.id) }
@@ -4441,26 +4439,18 @@ extension BLEService {
             return
         }
 
-        // Minimum header: 8 bytes ID + 2 index + 2 total + 1 type
-        guard packet.payload.count >= 13 else { return }
+        // Header parse (8-byte id, u16 index, u16 total, original type) with the
+        // DoS bound on `total`; see FragmentHeader.
+        guard let header = FragmentHeader(payload: packet.payload) else { return }
 
         // Compute compact fragment key (sender: 8 bytes, id: 8 bytes), big-endian
         var senderU64: UInt64 = 0
         for b in packet.senderID.prefix(8) { senderU64 = (senderU64 << 8) | UInt64(b) }
-        var fragU64: UInt64 = 0
-        for b in packet.payload.prefix(8) { fragU64 = (fragU64 << 8) | UInt64(b) }
-        // Parse big-endian UInt16 safely without alignment assumptions
-        let idxHi = UInt16(packet.payload[8])
-        let idxLo = UInt16(packet.payload[9])
-        let index = Int((idxHi << 8) | idxLo)
-        let totHi = UInt16(packet.payload[10])
-        let totLo = UInt16(packet.payload[11])
-        let total = Int((totHi << 8) | totLo)
-        let originalType = packet.payload[12]
-        let fragmentData = packet.payload.suffix(from: 13)
-
-        // Sanity checks - add reasonable upper bound on total to prevent DoS
-        guard total > 0 && total <= 10000 && index >= 0 && index < total else { return }
+        let fragU64 = header.fragmentID
+        let index = header.index
+        let total = header.total
+        let originalType = header.originalType
+        let fragmentData = header.fragmentData
 
         let isBroadcastFragment: Bool = {
             guard let recipient = packet.recipientID else { return true }
@@ -5354,6 +5344,11 @@ extension BLEService {
                 handlePrivateFile(Data(payloadData), from: peerID, timestampMs: packet.timestamp)
             case .authenticatedPeerState:
                 handleAuthenticatedPeerState(Data(payloadData), from: peerID)
+            case .groupInvite, .groupKeyUpdate, .voiceFrame, .vouch:
+                // Upstream iOS features Sonar does not implement: known, so not
+                // logged as garbage, and dropped. We never advertise the matching
+                // capability bits, so a well-behaved peer does not send them.
+                SecureLogger.debug("Ignoring unsupported noise payload \(payloadType) from \(peerID.id.prefix(8))…", category: .session)
             case .none:
                 SecureLogger.warning("⚠️ Unknown noise payload type: \(payloadType)")
             }
