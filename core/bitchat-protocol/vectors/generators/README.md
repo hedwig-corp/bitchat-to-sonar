@@ -14,8 +14,10 @@ Both read `SONAR_VECTOR_OUT` for the output path. Do not run them by hand:
 revision), installs the generator, runs it, normalizes the dump
 (`normalize.py`: drops the two 70000-byte stress cases, writes long
 single-byte runs as `repeat:xx*N`) and diffs it against the committed file
-(`diff.py`, keyed by kind + name). CI does the same weekly and on every PR
-touching the crate.
+(`diff.py`, keyed by kind + name). CI does the same daily and on every PR
+touching the crate. The step that makes the iOS app-target codecs compile
+inside BitFoundation's tests is shared with the cross-replay
+(`scripts/bitchat-vectors/lib.sh`, `install_ios_app_codecs`).
 
 Adding a case: extend the generator, run `regenerate.sh --write`, and replay
 with `cargo test -p bitchat-protocol --test vectors`; the Rust harness fails on

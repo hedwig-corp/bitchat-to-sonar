@@ -342,6 +342,38 @@ In practice: Noise frames are high‑entropy (unaffected); announces with
 nicknames under ~30 bytes stay under 100 B (unaffected); long signed public
 messages and `0x53` announces with a BIP‑353 address are affected.
 
+### 12.1 Stock iOS against stock Android, measured
+
+The table above is read off the code. This part is measured:
+`scripts/bitchat-vectors/cross-replay.sh` feeds bitchat-android's committed
+bytes to the iOS codec and bitchat iOS's committed bytes to the Android codec
+(encode the same fields, decode the other side's frame, rebuild the signature
+preimage from the decoded packet, re-encode it for relay; every TLV in both
+directions). Each codec also replays its own file, which must agree
+completely and is what shows the harness is sound. Every remaining
+difference is an entry in `vectors/cross/ledger.json`, and an entry that
+stops reproducing fails the run. Result at upstream HEAD on 2026-10-25
+(iOS `04995f6`, Android `137ce6d`): the packet frame, padding, compression
+decision, inflate, capabilities, peer id, private message, Noise payload
+framing, peer state and fragment layout agree in both directions. What
+does not:
+
+| # | from → to | difference | effect on the wire |
+|---|---|---|---|
+| 1 | Android → iOS | iOS rebuilds the preimage and relays by re-compressing (★ above) | **bug**: a signed frame whose DEFLATE stream is not Apple's own fails verification on iOS; fix open as permissionlesstech/bitchat#1805 |
+| 2 | iOS → Android | Android has no RSR flag (`0x10`, request-sync response): ignored on decode, dropped on re-encode | none for signatures (RSR is outside the preimage); sync responses go out at TTL 0, so none is relayed; Android's own sync responses carry no RSR bit and reach iOS as ordinary TTL-0 packets |
+| 3 | iOS → Android | iOS-only Noise types: `0x06`/`0x07` private groups, `0x12` vouch | feature gap: Android drops them |
+| 4 | iOS → Android | announce TLVs `0x04` direct neighbors and `0x06` bridge geohash are not modelled by Android (kept as unknown TLVs) | feature gap: Android does not learn iOS topology hints or geohash bridges; the announce still decodes and verifies |
+| 5 | iOS → Android | Android rejects the legacy 8-byte `FILE_SIZE`, a file packet without `FILE_NAME`, and cannot build one without a name or MIME type; it defaults a missing MIME type to `application/octet-stream` | none with current builds: iOS always sends a name, a MIME type and the 4-byte size; files from builds that emitted the legacy shape are dropped |
+| 6 | iOS → Android | iOS enforces per-type payload ceilings (§11); Android only its global maximum | none for real traffic; Android accepts oversized control frames iOS drops (a robustness gap on Android) |
+| 7 | Android → iOS | iOS drops unknown announce TLVs when re-encoding a decoded announce; Android keeps them | none: iOS never re-encodes a received announce |
+| 8 | Android → iOS | iOS derives a peer id from a key of any length; Android only from 32 bytes | none for real Noise keys |
+
+Only #1 breaks an exchange between two stock clients today. #3 and #4 are
+features one side has and the other lacks; #5–#8 are edge cases no stock
+build produces. Sonar's codec takes the permissive side of every row (it
+reads both shapes and never emits the rejected ones).
+
 **Follow-ups this change leaves open** (tracked here so they are not lost):
 
 * The Swift copy on iOS is hand-mirrored. The change was compiled as the
@@ -372,6 +404,13 @@ the app‑target TLV files, and a JUnit test run through the upstream Gradle
 unit‑test harness. The generator sources are in `vectors/generators/`. Two
 multi‑hundred‑KB cases were dropped and single‑byte repeats are written
 `repeat:xx*N`; `tests/vectors.rs` expands them.
+
+The two reference codecs are also replayed against each other's vectors by
+`scripts/bitchat-vectors/cross-replay.sh` (§12.1): `cross.py ops` turns each
+file into neutral operations, observer tests installed into fresh upstream
+checkouts (`vectors/cross/SonarCrossObserver.swift`,
+`SonarCrossObserverTest.kt`) run them through the real codecs, and
+`cross.py compare` holds every difference to `vectors/cross/ledger.json`.
 
 The harness asserts byte equality for everything except DEFLATE streams,
 where it asserts that the upstream stream inflates to the payload, that the

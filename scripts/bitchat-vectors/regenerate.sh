@@ -22,6 +22,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GEN="$ROOT/core/bitchat-protocol/vectors/generators"
 VEC="$ROOT/core/bitchat-protocol/vectors"
+# shellcheck source=scripts/bitchat-vectors/lib.sh
+. "$ROOT/scripts/bitchat-vectors/lib.sh"
 IOS_REPO="https://github.com/permissionlesstech/bitchat"
 ANDROID_REPO="https://github.com/permissionlesstech/bitchat-android"
 IOS_REV="HEAD"; ANDROID_REV="HEAD"; ONLY=""; WRITE=0
@@ -41,38 +43,13 @@ done
 mkdir -p "$OUT"
 echo "work dir: $OUT"
 
-clone_at() { # url dir rev
-  git clone --quiet --filter=blob:none "$1" "$2"
-  git -C "$2" checkout --quiet "$3"
-  git -C "$2" rev-parse --short HEAD
-}
-
 gen_ios() {
   local dir="$OUT/bitchat-ios" rev
   rev="$(clone_at "$IOS_REPO" "$dir" "$IOS_REV")"
   echo "ios: upstream at $rev"
   local tests="$dir/localPackages/BitFoundation/Tests/BitFoundationTests"
-  # The dump itself and the stubs that stand in for app-target types.
-  cp "$GEN/bitchat-ios-swift/SonarVectorDump.swift" "$GEN/bitchat-ios-swift/AppStubs.swift" "$tests/"
-  # App-target TLV codecs, taken FRESH from the checkout so a change there
-  # changes the vectors (the committed App*.swift are the pinned-revision copies).
-  cp "$dir/bitchat/Protocols/Packets.swift" "$tests/AppPackets.swift"
-  cp "$dir/bitchat/Models/NoisePayload.swift" "$tests/AppNoisePayload.swift"
-  cp "$dir/bitchat/Services/BLE/BLEOutboundFragmentPlanner.swift" "$tests/AppBLEOutboundFragmentPlanner.swift"
-  # BitchatFilePacket drags in BitLogger and PrivateMediaMessageIdentity
-  # (app-only); drop both, the TLV codec is self-contained above them.
-  python3 - "$dir/bitchat/Protocols/BitchatFilePacket.swift" "$tests/AppBitchatFilePacket.swift" <<'PY'
-import sys
-src = open(sys.argv[1]).read().split("\n")
-out = []
-for line in src:
-    if line.strip() == "import BitLogger":
-        continue
-    if line.startswith("/// Wire-compatible identity for private media"):
-        break
-    out.append(line)
-open(sys.argv[2], "w").write("\n".join(out).rstrip() + "\n")
-PY
+  cp "$GEN/bitchat-ios-swift/SonarVectorDump.swift" "$tests/"
+  install_ios_app_codecs "$dir" "$tests"
   ( cd "$dir/localPackages/BitFoundation" \
     && SONAR_VECTOR_OUT="$OUT/raw-ios.json" swift test --filter SonarVectorDump 2>&1 | tail -5 )
   [[ -s "$OUT/raw-ios.json" ]] || { echo "ios: generator produced no file" >&2; return 2; }

@@ -280,6 +280,12 @@ Sonar must stay interoperable with both reference clients at all times.
    edit; a new upstream codec needs a generator extension plus a Rust
    harness arm. Drop-in replay tests for the upstream repositories live in
    `core/bitchat-protocol/upstream/`.
+5. The two reference clients are also checked against each other:
+   `scripts/bitchat-vectors/cross-replay.sh` runs stock iOS's codec on
+   bitchat-android's bytes and the reverse, and every difference must be in
+   `core/bitchat-protocol/vectors/cross/ledger.json` (SPEC.md §12.1). A new
+   difference or a ledger entry that stopped reproducing fails the same CI
+   workflow.
 
 ## Regression Invariant Rule
 

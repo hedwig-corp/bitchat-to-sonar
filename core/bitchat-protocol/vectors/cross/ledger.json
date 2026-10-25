@@ -1,0 +1,117 @@
+{
+ "note": "Every way stock bitchat iOS and stock bitchat-android disagree when one codec is fed the other's committed vectors (scripts/bitchat-vectors/cross-replay.sh). source = the codec that produced the bytes, target = the codec that read them. op/field are full-match regexes over the neutral ops of scripts/bitchat-vectors/cross.py; cases is a search regex over the vector case name. status mismatch = the target returned different bytes or a different verdict; not_modeled = the target has no way to express or report that field (data it would drop). An entry that stops reproducing fails the run, so a divergence that upstream fixes cannot linger here. SPEC.md section 12 is the prose form of this file.",
+ "divergences": [
+  {
+   "source": "android", "target": "ios", "status": "mismatch",
+   "op": "packet_decode", "field": "preimage|reencoded_unpadded|reencoded_padded",
+   "cases": "^case4_foreign_deflate_decode_then_reencode$",
+   "reason": "Stock iOS re-compresses the decoded payload with Apple's encoder when it rebuilds the signing preimage and when it relays, instead of reusing the received DEFLATE stream.",
+   "consequence": "A signed frame whose compressed payload came from a different DEFLATE stream than Apple's own fails signature verification on iOS although the signature is valid, and iOS relays rewritten bytes. bitchat-android fixed its side in its #863; the Swift fix is permissionlesstech/bitchat#1805. Bug, iOS side.",
+   "ref": "SPEC.md §12 ★; permissionlesstech/bitchat#1805"
+  },
+  {
+   "source": "android", "target": "ios", "status": "mismatch",
+   "op": "announce_decode", "field": "reencoded",
+   "cases": "unknown_tlv_0x7f",
+   "reason": "iOS AnnouncementPacket keeps no unknown TLVs, so decode then encode drops them; bitchat-android preserves them in order.",
+   "consequence": "None on the wire: iOS never re-encodes a received announce (it relays the packet with its payload bytes untouched and verifies the signature over those bytes). Matters only to code that rebuilds an announce from a decoded one.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "android", "target": "ios", "status": "mismatch",
+   "op": "noise_decode", "field": "decodes",
+   "cases": "^noise_decode_type_0x07$",
+   "reason": "0x07 is iOS's private-group key update (NoisePayloadType.groupKeyUpdate); bitchat-android has no private groups and rejects the type.",
+   "consequence": "Feature gap, not a codec bug: private-group key updates (and invites, 0x06) from iOS are dropped by Android, so Android users cannot be in iOS private groups.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "android", "target": "ios", "status": "mismatch",
+   "op": "peer_id", "field": "peer_id",
+   "cases": "^key_31_bytes_invalid$",
+   "reason": "iOS PeerID(publicKey:) hashes any key length; bitchat-android derives a peer id only from a 32-byte Noise key.",
+   "consequence": "None for real keys (Noise static keys are always 32 bytes). iOS is more permissive with malformed input.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "android", "target": "ios", "status": "not_modeled",
+   "op": "fragment_encode", "field": "\\*",
+   "cases": "^fragment_1_of_3_type_0x22$",
+   "reason": "Harness coverage, not a divergence: iOS builds fragment payloads inline in BLEOutboundFragmentPlanner and has no standalone encoder to call. The same case's decode op passes on iOS, and iOS planner output is decoded by Android.",
+   "consequence": "None.",
+   "ref": "vectors/cross/SonarCrossObserver.swift"
+  },
+  {
+   "source": "ios", "target": "android", "status": "mismatch",
+   "op": "packet_decode", "field": "reencoded_unpadded|reencoded_padded",
+   "cases": "^v1_rsr_flag$",
+   "reason": "bitchat-android's BitchatPacket has no RSR (request-sync response, flag 0x10) field: it ignores the bit on decode and drops it on re-encode.",
+   "consequence": "Signatures are unaffected (iOS clears RSR in the preimage). iOS sends sync responses at TTL 0, so Android never relays them; Android's own sync responses carry no RSR bit, so iOS handles them as ordinary TTL-0 packets rather than solicited responses. Not traced end to end through iOS's ingress guard.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "ios", "target": "android", "status": "not_modeled",
+   "op": "packet_encode", "field": "\\*",
+   "cases": "^v1_rsr_flag$",
+   "reason": "Same gap as the RSR decode entry: Android cannot build a packet with the RSR bit.",
+   "consequence": "See the RSR decode entry.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "ios", "target": "android", "status": "mismatch",
+   "op": "packet_decode", "field": "decodes",
+   "cases": "_over_cap$|_declares_5000$",
+   "reason": "iOS rejects frames over per-type payload ceilings (PacketPayloadLimits: e.g. an announce over the control-message cap, a fragment over the fragment cap, a compressed payload declaring more than the cap); bitchat-android checks only its global MAX_PAYLOAD_LENGTH.",
+   "consequence": "No interop effect for real traffic (no client sends such frames). Android accepts oversized control frames iOS drops: a robustness gap on Android.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "ios", "target": "android", "status": "mismatch|not_modeled",
+   "op": "noise_decode", "field": "decodes|type|data",
+   "cases": "^noise_payload_decode_12$",
+   "reason": "0x12 is iOS's vouch payload (transitive verification); bitchat-android does not know the type and rejects it.",
+   "consequence": "Feature gap: vouches from iOS are dropped by Android.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "ios", "target": "android", "status": "mismatch|not_modeled",
+   "op": "file_decode", "field": "decodes|name|size|mime|content",
+   "cases": "^file_decode_legacy_size_8_content_len_2$",
+   "reason": "iOS still accepts the legacy file TLV shape (8-byte FILE_SIZE); bitchat-android requires the 4-byte form and rejects the packet.",
+   "consequence": "Files from builds that still emit the legacy shape are dropped by Android. Current iOS encodes the 4-byte form.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "ios", "target": "android", "status": "mismatch|not_modeled",
+   "op": "file_decode", "field": "decodes|name|size|mime|content",
+   "cases": "^file_decode_content_only$",
+   "reason": "bitchat-android requires a FILE_NAME TLV; iOS decodes a file packet carrying content only.",
+   "consequence": "No effect with current builds: iOS's media paths (ChatMediaPreparation) always set a file name and MIME type. A sender that omits the name is dropped by Android.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "ios", "target": "android", "status": "not_modeled",
+   "op": "file_encode", "field": "\\*",
+   "cases": "^file_packet_2_noname$|^file_packet_4_big\\.bin$",
+   "reason": "bitchat-android's BitchatFilePacket constructor requires a file name and a MIME type; iOS can encode a packet without either.",
+   "consequence": "Same as the content-only decode entry: harmless while iOS always names files.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "ios", "target": "android", "status": "mismatch",
+   "op": "file_decode", "field": "mime",
+   "cases": "^file_decode_two_content_tlvs_concatenate$",
+   "reason": "bitchat-android substitutes application/octet-stream for a missing MIME type; iOS keeps it absent.",
+   "consequence": "Cosmetic: the receiver shows a generic file type.",
+   "ref": "SPEC.md §12"
+  },
+  {
+   "source": "ios", "target": "android", "status": "not_modeled",
+   "op": "announce_encode|announce_decode", "field": "\\*|neighbors|geohash",
+   "cases": "^announce_(1_bob|2_carol|5_dave|6_erin|7_frank|8_|9_h)",
+   "reason": "bitchat-android's IdentityAnnouncement has no direct-neighbors (TLV 0x04) or bridge-geohash (TLV 0x06) field: it keeps them as unknown TLVs and does not interpret them.",
+   "consequence": "Android does not learn iOS's mesh topology hints or geohash bridge announcements; the announce itself decodes and verifies.",
+   "ref": "SPEC.md §12"
+  }
+ ]
+}
