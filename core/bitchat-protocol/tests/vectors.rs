@@ -103,6 +103,19 @@ fn packet_from(input: &Value) -> Packet {
     p
 }
 
+/// Is the reference encoder's stream for `payload` one we must reproduce
+/// byte for byte? bitchat iOS's always is (Apple = zlib level 5 = ours).
+/// bitchat-android's is the JDK at level 6, which we reproduce wherever
+/// levels 5 and 6 agree (`300_bytes_a_b33` is a payload where they do not).
+fn deflate_byte_exact(file: &str, payload: &[u8]) -> bool {
+    if file.contains("ios") {
+        return true;
+    }
+    let mut level6 = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+    std::io::Write::write_all(&mut level6, payload).unwrap();
+    Some(level6.finish().unwrap()) == compression::compress(payload)
+}
+
 fn run(file: &str) {
     let cases = load(file);
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
@@ -132,8 +145,13 @@ fn run(file: &str) {
                     Some(stream) => {
                         // We must INFLATE the foreign encoder's stream exactly...
                         assert_eq!(compression::decompress(&stream, payload.len()).as_deref(), Some(&payload[..]), "{ctx}: inflate upstream stream");
-                        // ...and agree that the payload is worth compressing.
-                        assert!(compression::compress(&payload).is_some(), "{ctx}: upstream compressed, we did not");
+                        // ...and emit the identical stream where the reference
+                        // encoder is reference zlib at our level (always for iOS;
+                        // for the JDK's level 6 wherever level 5 agrees with it).
+                        let ours = compression::compress(&payload).unwrap_or_else(|| panic!("{ctx}: upstream compressed, we did not"));
+                        if deflate_byte_exact(file, &payload) {
+                            assert_eq!(ours, stream, "{ctx}: our DEFLATE stream is the reference encoder's");
+                        }
                     }
                     None => {
                         if payload.len() >= compression::THRESHOLD_BYTES {
@@ -158,9 +176,9 @@ fn run(file: &str) {
                 let flags = expected_unpadded[11];
                 let compressed = flags & bitchat_protocol::flags::IS_COMPRESSED != 0;
                 let ours = p.encode_unpadded().unwrap_or_else(|e| panic!("{ctx}: {e}"));
-                if compressed {
-                    // DEFLATE output is encoder-specific: compare structure and
-                    // the round trip, not the stream bytes.
+                if compressed && !deflate_byte_exact(file, &p.payload) {
+                    // A JDK level-6 stream that level 5 does not reproduce:
+                    // compare structure and the round trip, not the bytes.
                     assert_eq!(ours[..12], expected_unpadded[..12], "{ctx}: header");
                     assert_eq!(ours[11], flags, "{ctx}: flags (compression decision)");
                     assert_eq!(Packet::decode(&ours).unwrap().payload, p.payload, "{ctx}: our stream round-trips");

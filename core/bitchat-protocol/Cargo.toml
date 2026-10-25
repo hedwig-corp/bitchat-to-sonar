@@ -10,9 +10,16 @@ rust-version.workspace = true
 name = "bitchat_protocol"
 
 [dependencies]
-# Raw DEFLATE for the `isCompressed` payload path. Pure-Rust backend so the
-# crate cross-compiles to iOS/Android with no C toolchain in the loop.
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Raw DEFLATE for the `isCompressed` payload path, on reference zlib built
+# from source (`static`). Not miniz_oxide or zlib-rs: their streams differ from
+# zlib's, and stock bitchat iOS (1.8.0) rebuilds signature preimages by
+# re-compressing with Apple's encoder, which is reference zlib at level 5. With
+# the same algorithm our signed frames verify there (see compression.rs). Never
+# the system zlib: Android's is Chromium's fork, which emits different streams.
+# The C build adds no toolchain the workspace does not already need
+# (libsqlite3-sys and ring compile C for every target).
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+libz-sys = { version = "1", default-features = false, features = ["static"] }
 sha2 = "0.10"
 # Ed25519 packet signatures (RFC 8032; interoperates with CryptoKit and
 # the JVM implementation upstream Android uses).

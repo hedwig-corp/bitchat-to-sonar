@@ -7,9 +7,19 @@
 //! `java.util.zip.Deflater(nowrap = true)`). Android's inflater additionally
 //! accepts a zlib-wrapped stream; this crate does too.
 //!
-//! DEFLATE output is not canonical: three encoders give three byte strings
-//! for one input. That is why a verifier must never re-compress a received
-//! payload to rebuild a signature preimage — see [`crate::packet::WirePayload`].
+//! DEFLATE output is not canonical: different encoders give different byte
+//! strings for one input. That is why a verifier must never re-compress a
+//! received payload to rebuild a signature preimage — see
+//! [`crate::packet::WirePayload`].
+//!
+//! The encoder here is reference zlib at [`LEVEL`] 5, which is exactly what
+//! Apple's `COMPRESSION_ZLIB` emits (measured byte for byte over a corpus that
+//! separates the levels; SPEC.md §3). Stock bitchat iOS still rebuilds
+//! preimages by re-compressing, so emitting Apple's stream is what lets our
+//! signed compressible frames verify there. bitchat-android uses
+//! `java.util.zip.Deflater` at its default, level 6: identical to level 5 for
+//! most payloads, not for all — Android verifies over the received bytes, so
+//! that difference costs nothing there.
 
 use std::io::Read;
 
@@ -19,6 +29,9 @@ use flate2::Compression;
 
 /// Payloads shorter than this are never compressed.
 pub const THRESHOLD_BYTES: usize = 100;
+
+/// zlib compression level: Apple `COMPRESSION_ZLIB`'s.
+pub const LEVEL: u32 = 5;
 
 /// The reference heuristic: long enough, and not already high-entropy.
 pub fn should_compress(payload: &[u8]) -> bool {
@@ -43,7 +56,7 @@ pub fn compress(payload: &[u8]) -> Option<Vec<u8>> {
     if payload.len() < THRESHOLD_BYTES {
         return None;
     }
-    let mut enc = DeflateEncoder::new(Vec::with_capacity(payload.len()), Compression::default());
+    let mut enc = DeflateEncoder::new(Vec::with_capacity(payload.len()), Compression::new(LEVEL));
     std::io::Write::write_all(&mut enc, payload).ok()?;
     let out = enc.finish().ok()?;
     if out.is_empty() || out.len() >= payload.len() {

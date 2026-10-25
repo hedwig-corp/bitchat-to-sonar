@@ -33,6 +33,7 @@ class SonarVectorDumpTest {
         return ByteArray(n) { src[it % src.size] }
     }
     private fun ascii(s: String) = s.toByteArray(Charsets.UTF_8)
+    private val aB33x300 = cycle("A" + "B".repeat(33), 300)
 
     private fun case(name: String, kind: String, input: Map<String, Any?>, expected: Map<String, Any?>) =
         mapOf("name" to name, "kind" to kind, "input" to input, "expected" to expected)
@@ -158,6 +159,9 @@ class SonarVectorDumpTest {
         }
         val cPayloads = LinkedHashMap(scPayloads)
         cPayloads["1000_bytes_quick_brown_fox"] = cycle("The quick brown fox jumps over the lazy dog. ", 1000)
+        // "A" + 33 x "B", repeated to 300 bytes: the JDK's default level (6) and
+        // Apple's COMPRESSION_ZLIB (level 5) emit different streams for it.
+        cPayloads["300_bytes_a_b33"] = aB33x300
         for ((n, p) in cPayloads) {
             val c = CompressionUtil.compress(p)
             val expected = mutableMapOf<String, Any?>("compressed" to c)
@@ -209,6 +213,7 @@ class SonarVectorDumpTest {
         cases += packetCase("3_v1_broadcast_recipient_100_zero_bytes_compressed", 1, 2, 7, 1709600000000L, sender, "ffffffffffffffff", null, rep(0, 100), null).first
         val (c4, p4) = packetCase("4_v1_300_compress-me_sig22", 1, 2, 7, 1709600000000L, sender, null, null, cycle("compress-me", 300), sig22)
         cases += c4
+        cases += packetCase("10_v1_300_a_b33_sig22", 1, 2, 7, 1709600000000L, sender, null, null, aB33x300, sig22).first
         cases += packetCase("5_v1_256_bytes_0_to_255_not_compressed", 1, 2, 7, 1709600000000L, sender, null, null, ByteArray(256) { it.toByte() }, null).first
         cases += packetCase("6_v2_route_recipient_route-test", 2, 1, 6, 1720000000000L, sender, "2122232425262728", route, ascii("route-test"), null).first
         cases += packetCase("7_v2_route_compressed_compress-me_x150", 2, 3, 6, 1740000000000L, sender, null, route, cycle("compress-me", 1650), null).first

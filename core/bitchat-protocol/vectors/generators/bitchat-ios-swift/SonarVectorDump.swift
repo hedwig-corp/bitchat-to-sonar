@@ -52,6 +52,10 @@ private let compressMe300 = repeatText("compress-me", upTo: 300)
 private let bytes256 = seq(256) { UInt8($0) }
 private let mod512 = seq(512) { UInt8($0 % 256) }
 private let fox1000 = repeatText("The quick brown fox jumps over the lazy dog. ", upTo: 1000)
+/// "A" + 33 x "B", repeated to 300 bytes: zlib levels 5 (Apple COMPRESSION_ZLIB)
+/// and 6 (the JDK's default) emit different streams for it, so it shows the two
+/// reference encoders disagreeing on real bytes. None of the payloads above does.
+private let aB33x300 = repeatText("A" + String(repeating: "B", count: 33), upTo: 300)
 
 // Hand-built raw frame (no padding) for reject vectors.
 private func rawFrame(version: UInt8, type: UInt8, ttl: UInt8, ts: UInt64, flags: UInt8,
@@ -108,7 +112,7 @@ struct SonarVectorDump {
             c.add("should_compress_\(name)", "should_compress", input: ["payload": hx(p)],
                   expected: ["result": CompressionUtil.shouldCompress(p)])
         }
-        for (name, p) in compressPayloads + [("fox_1000", fox1000)] {
+        for (name, p) in compressPayloads + [("fox_1000", fox1000), ("a_b33_300", aB33x300)] {
             c.add("compress_\(name)", "compress", input: ["payload": hx(p)],
                   expected: ["compressed": hx(CompressionUtil.compress(p))])
         }
@@ -133,6 +137,7 @@ struct SonarVectorDump {
             PE(name: "v1_recipient_signed", p: BitchatPacket(type: 0x02, senderID: senderA, recipientID: recipB, timestamp: 1709600000000, payload: ascii("Private signed"), signature: sigA0, ttl: 7)),
             PE(name: "v1_broadcast_sentinel_zeros100_compressed", p: BitchatPacket(type: 0x02, senderID: senderA, recipientID: bcast, timestamp: 1709600000000, payload: zeros100, signature: nil, ttl: 7)),
             PE(name: "v1_compress_me_300_signed", p: BitchatPacket(type: 0x02, senderID: senderA, recipientID: nil, timestamp: 1709600000000, payload: compressMe300, signature: sig22, ttl: 7)),
+            PE(name: "v1_a_b33_300_signed", p: BitchatPacket(type: 0x02, senderID: senderA, recipientID: nil, timestamp: 1709600000000, payload: aB33x300, signature: sig22, ttl: 7)),
             PE(name: "v1_bytes_0_255_not_compressed", p: BitchatPacket(type: 0x02, senderID: senderA, recipientID: nil, timestamp: 1709600000000, payload: bytes256, signature: nil, ttl: 7)),
             PE(name: "v2_route3_route_test", p: BitchatPacket(type: 0x01, senderID: senderA, recipientID: bytes("2122232425262728"), timestamp: 1720000000000, payload: ascii("route-test"), signature: nil, ttl: 6, version: 2, route: route3)),
             PE(name: "v2_route3_compressed", p: BitchatPacket(type: 0x03, senderID: senderA, recipientID: nil, timestamp: 1740000000000, payload: repeatText("compress-me", times: 150), signature: nil, ttl: 7, version: 2, route: route3)),
