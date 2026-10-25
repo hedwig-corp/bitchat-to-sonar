@@ -69,7 +69,17 @@ A payload is compressed when **both** hold:
 The stream is **raw DEFLATE** (no zlib header, no checksum): Apple
 `COMPRESSION_ZLIB`, `java.util.zip.Deflater(nowrap = true)`, `flate2` raw
 `DeflateEncoder` here. If the stream is not strictly shorter than the payload
-the frame is sent uncompressed. Decoders MUST inflate raw DEFLATE and MAY also
+the frame is sent uncompressed.
+
+The encoders are not interchangeable byte for byte. Measured on 76 payloads
+built to separate zlib's levels: Apple `COMPRESSION_ZLIB` is exactly reference
+zlib at **level 5**; the JDK's `Deflater` default is level 6, and the two differ
+on 16 of the 76 (vector pair `compress_a_b33_300` / `300_bytes_a_b33` pins one).
+miniz_oxide and zlib-rs differ from both. This crate encodes with reference
+zlib, built from source, at level 5, so its streams are Apple's: stock iOS's
+re-compressing verifier (§12 ★) then reproduces our bytes, and Sonar iOS
+(Apple's encoder) and Sonar Android emit identical frames. Never the system
+zlib on Android, which is Chromium's fork. Decoders MUST inflate raw DEFLATE and MAY also
 accept a zlib-wrapped stream (bitchat-android and this crate do; iOS does
 not — never emit zlib).
 
@@ -304,7 +314,9 @@ before the plaintext fallback; Sonar does not (tracked in §12).
 
 bitchat-android uses one 10 MiB frame cap and a 50 000:1 ratio bound; the
 stricter iOS set above is what this crate enforces, so nothing a conforming
-sender emits is lost.
+sender emits is lost. Sonar iOS enforces the same table
+(`ios/bitchat/Protocols/PacketPayloadLimits.swift`; it used to cap every type
+at the framed-file size with a 50 000:1 ratio bound).
 
 ## 12. Compatibility matrix
 
@@ -328,13 +340,20 @@ crate works around; ✗ a Sonar gap that this crate closes on the Rust side.
 | `0x53` Sonar announce | ignored | ignored | yes | yes |
 | legacy `0x22` consent prompt | yes | n/a | no (gap) | no (gap) |
 | `announceV2` / groups / board / couriers / PTT | yes | partial | decode as opaque, ignore | ignore |
+| DEFLATE encoder | zlib level 5 (Apple) | zlib level 6 (JDK) | zlib level 5 (was miniz: different streams) | zlib level 5 (Apple) |
+| per-type decode ceilings (§11) | yes | no (global cap) | yes | yes (this change; was one frame-wide cap) |
+| Noise `0x06`/`0x07`/`0x08`/`0x12` | handled | rejected (`0x08` decoded) | decoded, dropped | decoded, dropped (this change; was rejected) |
+| private message, trailing lone byte | ignored | ignored | ignored | ignored (this change; was rejected) |
+| announce unknown TLVs on re-encode | dropped | kept | kept | kept (this change; was dropped) |
 
 ★ **bitchat iOS re‑compresses for verification.** It rebuilds the signature
 preimage with `BinaryProtocol.encode` over the decoded payload, so a signed
 frame whose compressible (≥100 B, low‑entropy) payload was produced by any
 other DEFLATE encoder — or sent uncompressed — fails verification there.
-Nothing a sender can do fixes this except keeping such payloads under 100 B or
-high‑entropy; it needs the §5 rule upstream (as bitchat-android already has).
+A sender avoids it only by emitting exactly Apple's stream (zlib level 5),
+which is what Sonar now does on both platforms (§3); bitchat-android's JDK
+stream (level 6) differs for some payloads, so stock Android traffic still
+hits it. The real fix is the §5 rule upstream (as bitchat-android already has).
 The fix is proposed upstream as permissionlesstech/bitchat#1805
 (`upstream/bitchat-ios-verify-over-wire-payload.patch`); until it ships, stock
 iOS builds keep the defect.
@@ -360,7 +379,7 @@ does not:
 
 | # | from → to | difference | effect on the wire |
 |---|---|---|---|
-| 1 | Android → iOS | iOS rebuilds the preimage and relays by re-compressing (★ above) | **bug**: a signed frame whose DEFLATE stream is not Apple's own fails verification on iOS; fix open as permissionlesstech/bitchat#1805 |
+| 1 | Android → iOS | iOS rebuilds the preimage and relays by re-compressing (★ above) | **bug**: a signed frame whose DEFLATE stream is not Apple's own fails verification on iOS; that includes ordinary bitchat-android frames, because the JDK compresses at zlib level 6 and Apple at 5 (`10_v1_300_a_b33_sig22` is a real Android frame stock iOS rejects); fix open as permissionlesstech/bitchat#1805 |
 | 2 | iOS → Android | Android has no RSR flag (`0x10`, request-sync response): ignored on decode, dropped on re-encode | none for signatures (RSR is outside the preimage); sync responses go out at TTL 0, so none is relayed; Android's own sync responses carry no RSR bit and reach iOS as ordinary TTL-0 packets |
 | 3 | iOS → Android | iOS-only Noise types: `0x06`/`0x07` private groups, `0x12` vouch | feature gap: Android drops them |
 | 4 | iOS → Android | announce TLVs `0x04` direct neighbors and `0x06` bridge geohash are not modelled by Android (kept as unknown TLVs) | feature gap: Android does not learn iOS topology hints or geohash bridges; the announce still decodes and verifies |
@@ -371,8 +390,28 @@ does not:
 
 Only #1 breaks an exchange between two stock clients today. #3 and #4 are
 features one side has and the other lacks; #5–#8 are edge cases no stock
-build produces. Sonar's codec takes the permissive side of every row (it
-reads both shapes and never emits the rejected ones).
+build produces.
+
+**Sonar against both, measured the same way.** The harness also runs Sonar
+Android's codec (this crate, `examples/cross_observer.rs`) and Sonar iOS's
+codec (the app's own `ios/bitchat` files compiled into a throwaway package by
+`scripts/bitchat-vectors/sonar-ios-codec.sh`) over both reference files, and
+holds the two Sonar codecs to each other on every operation. Result:
+
+* Sonar iOS and Sonar Android agree on every field of every operation from
+  both files, with no ledger entry for the pair.
+* Each agrees with stock bitchat iOS everywhere except the reply-parent
+  private-message TLV `0x04`, which Sonar decodes (§8.2; never sent to a
+  stock peer).
+* Each agrees with stock bitchat-android except where Sonar sides with stock
+  iOS (Noise `0x07`, 31-byte keys, the zlib level), plus Sonar's own
+  extensions (`0x04` reply, file `0x05` message id).
+
+Because Sonar's packet encodings, compressed ones included, are byte-identical
+to stock iOS's for every packet case, and stock iOS verifies its own frames
+(self-replay), stock iOS verifies Sonar's signed frames: the iOS bug in #1
+does not reach Sonar's traffic. Stock bitchat-android verifies over the bytes
+it receives, so Sonar's frames verify there too.
 
 **Follow-ups this change leaves open** (tracked here so they are not lost):
 

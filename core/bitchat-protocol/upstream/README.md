@@ -14,6 +14,12 @@ point at.
 When either lands, drop the corresponding copy here and have
 `scripts/check-bitchat-upstream-drift.sh` cover the upstream test file instead.
 
+The vector copies inside those PRs predate the zlib-level case
+(`compress_a_b33_300` / `v1_a_b33_300_signed` on iOS, `300_bytes_a_b33` /
+`10_v1_300_a_b33_sig22` on Android, added 2026-10-25): each PR still replays
+its own codec's output green, but carries 181 − 2 and 93 − 2 cases. Refresh
+them from `../vectors/` on the next push to either PR.
+
 ## Vector replay tests (`bitchat-ios/`, `bitchat-android/`)
 
 Drop-in tests for each upstream repository that replay `../vectors/*.json`

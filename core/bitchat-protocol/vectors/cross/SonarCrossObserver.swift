@@ -1,11 +1,15 @@
 //
 // SonarCrossObserver.swift
-// Runs inside permissionlesstech/bitchat's BitFoundationTests (installed by
-// scripts/bitchat-vectors/cross-replay.sh, next to fresh copies of the
-// app-target codecs). Feeds every neutral operation produced by
-// scripts/bitchat-vectors/cross.py to the real iOS codec and writes what it
-// returned. It judges nothing: cross.py compares the outputs with the codec
-// that produced the vectors and classifies every difference.
+// Feeds every neutral operation produced by scripts/bitchat-vectors/cross.py
+// to a real Swift bitchat codec and writes what it returned. It judges
+// nothing: cross.py compares the outputs with the codec that produced the
+// vectors and classifies every difference. Two hosts, both set up by
+// scripts/bitchat-vectors/cross-replay.sh:
+//
+//   * stock bitchat iOS: inside permissionlesstech/bitchat's
+//     BitFoundationTests, next to fresh copies of the app-target codecs;
+//   * Sonar iOS (-D SONAR_IOS): in a throwaway package compiled from
+//     ios/bitchat's own codec files (scripts/bitchat-vectors/sonar-ios-codec.sh).
 //
 // SONAR_CROSS_OPS     colon-separated list of ops files
 // SONAR_CROSS_OUT_DIR results land here as results-<source>.json
@@ -13,7 +17,13 @@
 
 import Foundation
 import Testing
+#if SONAR_IOS
+@testable import SonarIOSCodec
+private let observerName = "sonar-ios"
+#else
 @testable import BitFoundation
+private let observerName = "ios"
+#endif
 
 private func hx(_ d: Data?) -> Any { d.map { $0.hexEncodedString() } ?? NSNull() }
 private func nul(_ v: Any?) -> Any { v ?? NSNull() }
@@ -108,7 +118,15 @@ private func runOp(_ op: String, _ i: Input) throws -> [String: Any] {
         guard let p = AuthenticatedPeerStatePacket.decode(from: i.hex("bytes")!) else { return ["decodes": false] }
         return ["decodes": true, "caps": String(p.capabilities.rawValue), "signing": hx(p.signingPublicKey)]
     case "pm_encode":
-        return ["encoded": hx(PrivateMessagePacket(messageID: i.str("message_id")!, content: i.str("content")!).encode())]
+        let pm = PrivateMessagePacket(messageID: i.str("message_id")!, content: i.str("content")!)
+        #if SONAR_IOS
+        // What Sonar sends a stock peer is the reference encoding; the extended
+        // one (long TLVs, reply parent) goes only to a verified Sonar peer and
+        // is byte-identical whenever the message fits the reference shape.
+        return ["encoded": hx(pm.encodeLegacy()), "encoded_extended": hx(pm.encode())]
+        #else
+        return ["encoded": hx(pm.encode())]
+        #endif
     case "pm_decode":
         guard let p = PrivateMessagePacket.decode(from: i.hex("bytes")!) else { return ["decodes": false] }
         return ["decodes": true, "message_id": p.messageID, "content": p.content]
@@ -129,6 +147,12 @@ private func runOp(_ op: String, _ i: Input) throws -> [String: Any] {
         return ["decodes": true, "name": nul(f.fileName), "size": nul(f.fileSize.map { String($0) }),
                 "mime": nul(f.mimeType), "content": hx(f.content), "reencoded": hx(f.encode())]
     case "fragment_decode":
+        #if SONAR_IOS
+        // The parse BLEService runs on every received fragment.
+        guard let h = FragmentHeader(payload: i.hex("payload")!) else { return ["decodes": false] }
+        return ["decodes": true, "fragment_id": String(format: "%016llx", h.fragmentID), "index": h.index,
+                "total": h.total, "type": Int(h.originalType), "data": hx(h.fragmentData)]
+        #else
         // iOS parses fragments from the packet's payload (BLEFragmentHeader); the
         // carrier packet's other fields do not take part in the parse.
         let carrier = BitchatPacket(type: 0x20, senderID: Data(repeating: 0x11, count: 8), recipientID: nil,
@@ -136,11 +160,19 @@ private func runOp(_ op: String, _ i: Input) throws -> [String: Any] {
         guard let h = BLEFragmentHeader(packet: carrier) else { return ["decodes": false] }
         return ["decodes": true, "fragment_id": String(format: "%016llx", h.key.id), "index": h.index,
                 "total": h.total, "type": Int(h.originalType), "data": hx(h.fragmentData)]
+        #endif
     case "fragment_encode":
-        // iOS builds fragment payloads inline in BLEOutboundFragmentPlanner; there
-        // is no standalone encoder to call. Its output is covered by the
+        #if SONAR_IOS
+        // The encoder BLEService's send path calls.
+        return ["encoded": hx(FragmentHeader.encodePayload(
+            fragmentID: i.hex("fragment_id")!, index: i.int("index")!, total: i.int("total")!,
+            originalType: UInt8(i.int("type")!), data: i.hex("data")!))]
+        #else
+        // Stock iOS builds fragment payloads inline in BLEOutboundFragmentPlanner;
+        // there is no standalone encoder to call. Its output is covered by the
         // fragment_decode ops generated from the iOS planner vectors.
         throw Unsupported(why: "no standalone fragment-payload encoder on iOS")
+        #endif
     default:
         throw Unsupported(why: "unknown op \(op)")
     }
@@ -169,11 +201,11 @@ struct SonarCrossObserver {
                     results.append(["id": id, "error": "\(error)"])
                 }
             }
-            let out: [String: Any] = ["observer": "ios", "source": source, "results": results]
+            let out: [String: Any] = ["observer": observerName, "source": source, "results": results]
             let bytes = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
             let dest = URL(fileURLWithPath: outDir).appendingPathComponent("results-\(source).json")
             try bytes.write(to: dest)
-            print("CROSS observer=ios source=\(source) ops=\(ops.count) -> \(dest.path)")
+            print("CROSS observer=\(observerName) source=\(source) ops=\(ops.count) -> \(dest.path)")
         }
     }
 }

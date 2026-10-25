@@ -21,7 +21,7 @@ This script does, in three steps:
       what it returned. They compare nothing; all judgement is here.
 
   compare  --ops ops.json --results results.json --source S --target T
-           [--ledger ledger.json] [--report out.json]
+           [--ledger ledger.json] [--report out.json] [--expect-from other.json]
       Compare the target codec's outputs with the source codec's. Every
       mismatch must be explained by an entry in the ledger
       (`vectors/cross/ledger.json`, keyed by source, target, op, field and a
@@ -30,6 +30,12 @@ This script does, in three steps:
       into a visible "stale entry" failure instead of a silently obsolete
       note. Self-replay (S == T) must match exactly with no ledger at all,
       which is what proves the harness itself is sound.
+
+      --expect-from replaces each op's expected values with another
+      observer's outputs for the same op (same keys only), so two
+      implementations can be held to each other directly -- e.g. Sonar iOS
+      against Sonar Android on both reference files. S then names that
+      observer.
 
 Exit status of compare: 0 all explained and no stale entries, 1 otherwise.
 """
@@ -344,9 +350,28 @@ def compare(args):
     ops = json.load(open(args.ops))
     res = json.load(open(args.results))
     out = {r["id"]: r for r in res["results"]}
+    if args.expect_from:
+        other = {r["id"]: r for r in json.load(open(args.expect_from))["results"]}
+        kept = []
+        for op in ops["ops"]:
+            r = other.get(op["id"])
+            if not r or "out" not in r:
+                continue  # the reference observer could not run it: nothing to hold the target to
+            exp = {k: r["out"][k] for k in op["exp"] if k in r["out"]}
+            # Fields both observers report beyond the vector's own record.
+            for k in ("encoded_extended",):
+                if k in r["out"]:
+                    exp[k] = r["out"][k]
+            if exp:
+                kept.append(dict(op, exp=exp))
+        ops = dict(ops, ops=kept)
+    # An entry may name the reference file it applies to ("vectors": "ios" or
+    # "android"); needed when one source/target pair runs over both files.
+    vectors = ops.get("source")
     ledger = [] if args.source == args.target or not args.ledger else [
         e for e in json.load(open(args.ledger))["divergences"]
-        if e["source"] == args.source and e["target"] == args.target]
+        if e["source"] == args.source and e["target"] == args.target
+        and e.get("vectors", vectors) == vectors]
     hits = {i: 0 for i in range(len(ledger))}
     explained, unexplained, errors, not_modeled, ok = [], [], [], [], 0
     gaps_explained = []
@@ -422,6 +447,7 @@ def main():
         b.add_argument(f, required=True)
     b.add_argument("--ledger")
     b.add_argument("--report")
+    b.add_argument("--expect-from", dest="expect_from")
     args = p.parse_args()
     if args.cmd == "ops":
         res = build_ops(args.vectors)
