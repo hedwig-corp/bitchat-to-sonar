@@ -436,8 +436,8 @@ it receives, so Sonar's frames verify there too.
 
 ## 13. Test vectors
 
-`vectors/bitchat-ios.json` (179 cases) and `vectors/bitchat-android.json`
-(91 cases) were produced by running the reference codecs themselves — a Swift
+`vectors/bitchat-ios.json` (181 cases) and `vectors/bitchat-android.json`
+(93 cases) were produced by running the reference codecs themselves — a Swift
 Testing case dropped into `localPackages/BitFoundation/Tests` plus copies of
 the app‑target TLV files, and a JUnit test run through the upstream Gradle
 unit‑test harness. The generator sources are in `vectors/generators/`. Two
