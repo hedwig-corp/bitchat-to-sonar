@@ -4,7 +4,7 @@ A JUnit test for `permissionlesstech/bitchat-android` that replays the shared
 wire-format vectors in `core/bitchat-protocol/vectors/bitchat-android.json`
 against the upstream Kotlin codec, so upstream guards its own bytes with the
 same file other clients check against. Verified green on upstream `dfc67dad`
-(release 2.0.3): 91/91 cases byte-exact, JBR 17.0.12, Gradle 9.6.1, AGP 9.3.1.
+(release 2.0.3): 93/93 cases byte-exact, JBR 17.0.12, Gradle 9.6.1, AGP 9.3.1.
 
 ## Pitch for the upstream PR
 

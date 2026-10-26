@@ -8,17 +8,18 @@ point at.
 
 | Upstream PR | Contents | Verified before opening |
 |---|---|---|
-| [permissionlesstech/bitchat#1805](https://github.com/permissionlesstech/bitchat/pull/1805) | the wire-payload patch + `bitchat-ios/` replay tests + `vectors/bitchat-ios.json` (two copies) | `swift test` 206/206 in BitFoundation, `xcodebuild test` 7 tests / 80 cases in the app target plus the gossip-store and relay-spool budget suites, SwiftLint `--strict` clean (upstream's lint job is blocking). Review round 1 (Codex): stores now charge `retainedPayloadBytes` |
-| [permissionlesstech/bitchat-android#994](https://github.com/permissionlesstech/bitchat-android/pull/994) | `bitchat-android/BitchatVectorReplayTest.kt` + `vectors/bitchat-android.json` as `app/src/test/resources/contracts/bitchat-wire-protocol-v1-v2.json` | 91/91 on upstream `d1da9716` (app and wear); mutation check fails per corrupted field |
+| [permissionlesstech/bitchat#1805](https://github.com/permissionlesstech/bitchat/pull/1805) | the wire-payload patch + `bitchat-ios/` replay tests + `vectors/bitchat-ios.json` (two copies) | `swift test` 207/207 in BitFoundation, `xcodebuild test` 7 tests / 80 cases in the app target plus the gossip-store and relay-spool budget suites, SwiftLint `--strict` clean (upstream's lint job is blocking). Review round 1 (Codex): stores now charge `retainedPayloadBytes` |
+| [permissionlesstech/bitchat-android#994](https://github.com/permissionlesstech/bitchat-android/pull/994) | `bitchat-android/BitchatVectorReplayTest.kt` + `vectors/bitchat-android.json` as `app/src/test/resources/contracts/bitchat-wire-protocol-v1-v2.json` | 93/93 on upstream `d1da9716` (app and wear); mutation check fails per corrupted field |
 
 When either lands, drop the corresponding copy here and have
 `scripts/check-bitchat-upstream-drift.sh` cover the upstream test file instead.
 
-The vector copies inside those PRs predate the zlib-level case
-(`compress_a_b33_300` / `v1_a_b33_300_signed` on iOS, `300_bytes_a_b33` /
-`10_v1_300_a_b33_sig22` on Android, added 2026-10-25): each PR still replays
-its own codec's output green, but carries 181 − 2 and 93 − 2 cases. Refresh
-them from `../vectors/` on the next push to either PR.
+Both PRs carry the current vector files (181 and 93 cases, including the
+zlib-level case `compress_a_b33_300` / `v1_a_b33_300_signed` on iOS and
+`300_bytes_a_b33` / `10_v1_300_a_b33_sig22` on Android, refreshed
+2026-10-26). #1805 also pins the Android frame `10_v1_300_a_b33_sig22`
+directly in `stockAndroidFrameKeepsTheAndroidSigningPreimage`; that test
+fails on upstream `30c58eee`, which is the stock-iOS verification bug.
 
 ## Vector replay tests (`bitchat-ios/`, `bitchat-android/`)
 
@@ -60,7 +61,7 @@ signature is unchanged. Verified on a clean
 detached worktree of upstream with Xcode 27 / Swift 6.4: `git apply --check`
 succeeds, the whole BitFoundation suite passes (194 tests in 15 suites, up
 from 188), and the vector replay in `bitchat-ios/` still passes against
-`../vectors/bitchat-ios.json` (11 Swift Testing + 7 XCTest tests, 179 cases,
+`../vectors/bitchat-ios.json` (11 Swift Testing + 7 XCTest tests, 181 cases,
 0 failures), as expected since the change only affects re-encoding of
 *decoded* packets. Sonar's own copy of the fix is tested by
 `ios/bitchatTests/Protocol/BinaryProtocolWirePayloadTests.swift`.
