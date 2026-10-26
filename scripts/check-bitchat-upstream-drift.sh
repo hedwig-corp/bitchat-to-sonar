@@ -44,7 +44,7 @@ IOS_PATHS=(
   bitchat/Services/BLE/BLEOutboundPacketPolicy.swift
 )
 ANDROID_REPO="https://github.com/permissionlesstech/bitchat-android"
-ANDROID_PIN="dfc67dad"
+ANDROID_PIN="97db392"
 ANDROID_PATHS=(
   app/src/main/java/com/bitchat/android/protocol/BinaryProtocol.kt
   app/src/main/java/com/bitchat/android/protocol/MessagePadding.kt
