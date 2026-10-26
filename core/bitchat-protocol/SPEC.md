@@ -6,7 +6,7 @@ written from the two reference clients, not from their documentation:
 | Reference | Revision | Codec files |
 |---|---|---|
 | permissionlesstech/bitchat (iOS/macOS) | `30c58eee` (1.8.0, 2026‑10‑23) | `localPackages/BitFoundation/Sources/BitFoundation/{BinaryProtocol,BitchatPacket,MessagePadding,CompressionUtil,PeerCapabilities,PeerID,MessageType,PacketPayloadLimits}.swift`, `bitchat/Protocols/{Packets,BitchatFilePacket,BitchatProtocol}.swift`, `bitchat/Noise/NoiseProtocol.swift` |
-| permissionlesstech/bitchat-android | `dfc67dad` (2.0.3, 2026‑10‑22) | `app/src/main/java/com/bitchat/android/{protocol/BinaryProtocol,protocol/MessagePadding,protocol/CompressionUtil,model/IdentityAnnouncement,model/PeerCapabilities,model/NoiseEncrypted,model/BitchatFilePacket,model/FragmentPayload,noise/NoiseSession,noise/NoisePeerIdentity}.kt` |
+| permissionlesstech/bitchat-android | `97db392` (main, 2026‑10‑26; codec output identical to `dfc67dad` 2.0.3) | `app/src/main/java/com/bitchat/android/{protocol/BinaryProtocol,protocol/MessagePadding,protocol/CompressionUtil,model/IdentityAnnouncement,model/PeerCapabilities,model/NoiseEncrypted,model/BitchatFilePacket,model/FragmentPayload,noise/NoiseSession,noise/NoisePeerIdentity}.kt` |
 
 Where the two disagree, §12 says which one this crate follows and why.
 Byte-exact vectors produced by running those codecs live in `vectors/` and are
@@ -312,9 +312,12 @@ before the plaintext fallback; Sonar does not (tracked in §12).
 | `0x01`, `0x2C`, `0x03`, `0x23`, `0x24`, `0x29`, `0x10`, `0x26`, `0x27` | 4 KiB |
 | anything else (incl. `0x53`) | 128 KiB |
 
-bitchat-android uses one 10 MiB frame cap and a 50 000:1 ratio bound; the
-stricter iOS set above is what this crate enforces, so nothing a conforming
-sender emits is lost. Sonar iOS enforces the same table
+bitchat-android adopted this table and the 1032:1 ratio bound in `30f911f`
+(2026‑10‑25; before it, one 10 MiB frame cap and a 50 000:1 bound). Two
+rows still differ there: `0x22`/`0x11` keep its 10 MiB frame cap, and
+`0x2C`, a type Android does not know, falls to the 128 KiB default. The iOS
+set above is what this crate enforces, so nothing a conforming sender emits
+is lost. Sonar iOS enforces the same table
 (`ios/bitchat/Protocols/PacketPayloadLimits.swift`; it used to cap every type
 at the framed-file size with a 50 000:1 ratio bound).
 
@@ -341,7 +344,7 @@ crate works around; ✗ a Sonar gap that this crate closes on the Rust side.
 | legacy `0x22` consent prompt | yes | n/a | no (gap) | no (gap) |
 | `announceV2` / groups / board / couriers / PTT | yes | partial | decode as opaque, ignore | ignore |
 | DEFLATE encoder | zlib level 5 (Apple) | zlib level 6 (JDK) | zlib level 5 (was miniz: different streams) | zlib level 5 (Apple) |
-| per-type decode ceilings (§11) | yes | no (global cap) | yes | yes (this change; was one frame-wide cap) |
+| per-type decode ceilings (§11) | yes | yes since `30f911f` (was one global cap) | yes | yes (this change; was one frame-wide cap) |
 | Noise `0x06`/`0x07`/`0x08`/`0x12` | handled | rejected (`0x08` decoded) | decoded, dropped | decoded, dropped (this change; was rejected) |
 | private message, trailing lone byte | ignored | ignored | ignored | ignored (this change; was rejected) |
 | announce unknown TLVs on re-encode | dropped | kept | kept | kept (this change; was dropped) |
@@ -371,10 +374,12 @@ preimage from the decoded packet, re-encode it for relay; every TLV in both
 directions). Each codec also replays its own file, which must agree
 completely and is what shows the harness is sound. Every remaining
 difference is an entry in `vectors/cross/ledger.json`, and an entry that
-stops reproducing fails the run. Result at upstream HEAD on 2026-10-25
-(iOS `04995f6`, Android `137ce6d`): the packet frame, padding, compression
-decision, inflate, capabilities, peer id, private message, Noise payload
-framing, peer state and fragment layout agree in both directions. What
+stops reproducing fails the run. Result at upstream HEAD on 2026-10-26
+(iOS `04995f6`, Android `97db392`): the packet frame, padding, compression
+decision, inflate, per-type decode ceilings, capabilities, peer id, private
+message, Noise payload framing, peer state and fragment layout agree in both
+directions. The ceilings joined that list when bitchat-android `30f911f`
+adopted iOS's table; the harness reported the old ledger entry as stale. What
 does not:
 
 | # | from → to | difference | effect on the wire |
@@ -384,12 +389,11 @@ does not:
 | 3 | iOS → Android | iOS-only Noise types: `0x06`/`0x07` private groups, `0x12` vouch | feature gap: Android drops them |
 | 4 | iOS → Android | announce TLVs `0x04` direct neighbors and `0x06` bridge geohash are not modelled by Android (kept as unknown TLVs) | feature gap: Android does not learn iOS topology hints or geohash bridges; the announce still decodes and verifies |
 | 5 | iOS → Android | Android rejects the legacy 8-byte `FILE_SIZE`, a file packet without `FILE_NAME`, and cannot build one without a name or MIME type; it defaults a missing MIME type to `application/octet-stream` | none with current builds: iOS always sends a name, a MIME type and the 4-byte size; files from builds that emitted the legacy shape are dropped |
-| 6 | iOS → Android | iOS enforces per-type payload ceilings (§11); Android only its global maximum | none for real traffic; Android accepts oversized control frames iOS drops (a robustness gap on Android) |
-| 7 | Android → iOS | iOS drops unknown announce TLVs when re-encoding a decoded announce; Android keeps them | none: iOS never re-encodes a received announce |
-| 8 | Android → iOS | iOS derives a peer id from a key of any length; Android only from 32 bytes | none for real Noise keys |
+| 6 | Android → iOS | iOS drops unknown announce TLVs when re-encoding a decoded announce; Android keeps them | none: iOS never re-encodes a received announce |
+| 7 | Android → iOS | iOS derives a peer id from a key of any length; Android only from 32 bytes | none for real Noise keys |
 
 Only #1 breaks an exchange between two stock clients today. #3 and #4 are
-features one side has and the other lacks; #5–#8 are edge cases no stock
+features one side has and the other lacks; #5–#7 are edge cases no stock
 build produces.
 
 **Sonar against both, measured the same way.** The harness also runs Sonar

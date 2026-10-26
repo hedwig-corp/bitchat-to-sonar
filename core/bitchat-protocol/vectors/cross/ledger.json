@@ -103,17 +103,6 @@
   {
    "source": "ios",
    "target": "android",
-   "status": "mismatch",
-   "op": "packet_decode",
-   "field": "decodes",
-   "cases": "_over_cap$|_declares_5000$",
-   "reason": "iOS rejects frames over per-type payload ceilings (PacketPayloadLimits: e.g. an announce over the control-message cap, a fragment over the fragment cap, a compressed payload declaring more than the cap); bitchat-android checks only its global MAX_PAYLOAD_LENGTH.",
-   "consequence": "No interop effect for real traffic (no client sends such frames). Android accepts oversized control frames iOS drops: a robustness gap on Android.",
-   "ref": "SPEC.md §12"
-  },
-  {
-   "source": "ios",
-   "target": "android",
    "status": "mismatch|not_modeled",
    "op": "noise_decode",
    "field": "decodes|type|data",
