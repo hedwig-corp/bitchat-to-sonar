@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sonar_core::client::{MediaUpload, SonarClient, DEFAULT_BLOSSOM_SERVER};
 use sonar_core::identity::Identity;
 use sonar_core::marmot::DeliveryState;
+use sonar_core::relay_routes::RelayRoutesConfig;
 use sonar_core::GroupId;
 use sonar_stickers::signal::{
     import_signal_pack_with_options, ImportedSignalPack, ImportedSignalSticker, SignalImportOptions,
@@ -1727,9 +1728,15 @@ impl LoadedConfig {
         ensure_private_dir(&db_dir)?;
         let identity = self.identity()?;
         let db_key = parse_db_key(&self.config.db_key_hex)?;
-        SonarClient::connect(identity, self.relays.clone(), db_dir.join(DB_FILE), db_key)
-            .await
-            .map_err(CliError::Sonar)
+        SonarClient::connect_with_routes(
+            identity,
+            self.relays.clone(),
+            db_dir.join(DB_FILE),
+            db_key,
+            lookup_relays_from_env(),
+        )
+        .await
+        .map_err(CliError::Sonar)
     }
 
     fn identity(&self) -> Result<Identity> {
@@ -1800,6 +1807,16 @@ fn random_hex_32() -> Result<String> {
     getrandom::getrandom(&mut bytes)
         .map_err(|e| CliError::Message(format!("secure random failed: {e}")))?;
     Ok(hex::encode(bytes))
+}
+
+/// Where this CLI looks relay lists up and copies its own. Opt-in: unset
+/// means no lookups and no copies, because most CLI identities are
+/// throwaway peers that must not litter the public directory.
+/// `SONAR_LOOKUP_RELAYS=public` behaves like the apps; a comma-separated
+/// list is a local directory relay set (every record kind); empty or `none`
+/// is explicit off.
+fn lookup_relays_from_env() -> RelayRoutesConfig {
+    RelayRoutesConfig::from_env(RelayRoutesConfig::disabled())
 }
 
 fn validate_relay_strings(relays: Vec<String>) -> Result<Vec<String>> {
