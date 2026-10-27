@@ -5525,7 +5525,7 @@ mod tests {
     /// sets. CDK keeps keysets for an hour, and keysets loaded from its
     /// database count as fresh, so nothing re-reads them until the mint
     /// refuses an output. Found against a real cdk-mintd 0.18.1 (#666 QA,
-    /// QA-165): the pre-melt swap was refused InactiveKeyset, CDK refreshed
+    /// QA-178): the pre-melt swap was refused InactiveKeyset, CDK refreshed
     /// and retried it (paying its fee), then sent the melt's change outputs
     /// on the retired keyset. The mint refused the melt, the send ended
     /// Failed with nothing paid, and the refused swap's saga stayed open,
@@ -5921,7 +5921,7 @@ mod tests {
 
     /// cdk-mintd 0.18.1 names quotes by UUIDv7, whose first 8 hex digits are
     /// the top of a millisecond timestamp: every quote a mint issues within
-    /// ~65 s shares them. These two are QA-166's run against a real mint
+    /// ~65 s shares them. These two are QA-179's run against a real mint
     /// (#666 QA), 40 ms apart: the quote refused QuoteExpired and its
     /// re-quote, which paid. Both logged as `melt 01a1406b`, so the log
     /// could not say which one was sent. Updating this to pass means

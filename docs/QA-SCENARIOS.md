@@ -1266,7 +1266,7 @@ real mint and need the maintainer's approval of the amounts.
   the amount never on screen; Compose ignored that amount and paid the typed
   one.
 
-### QA-165 — A near-exact balance is priced with the mint's input fees
+### QA-178 — A near-exact balance is priced with the mint's input fees
 - **Platforms:** both (one Rust core; iOS on the fake mint, headless with
   `sonar-cashu-cli`; Android manual against a mint the maintainer approves).
 - **Setup:** a `cdk-mintd` 0.18 fakewallet mint whose keyset charges an input
@@ -1327,7 +1327,7 @@ real mint and need the maintainer's approval of the amounts.
   now" — both apps' copy table had one line for every safe failure. Fixed in
   #666: a refusal for its total states the wallet's shortfall sentence.
 
-### QA-166 — A quote that expires before it is sent is re-quoted, never orphaned
+### QA-179 — A quote that expires before it is sent is re-quoted, never orphaned
 - **Platforms:** both (one Rust core; iOS on the fake mint through
   `scripts/qa/mint-proxy.py`; headless with `sonar-cashu-cli --mint <proxy>`).
 - **Steps:** fund the wallet, get a foreign invoice from the second fake mint.
@@ -1376,7 +1376,7 @@ real mint and need the maintainer's approval of the amounts.
   against a local `cdk-mintd` 0.18.1 fakewallet mint).
 - **Steps:** fund the wallet on a 1000 ppk keyset. Stop the mint, `config
   apply` a document with `input_fee_ppk = 0`, start it (it rotates; see
-  QA-165). Without any receive or sync first, pay a foreign invoice that fits
+  QA-178). Without any receive or sync first, pay a foreign invoice that fits
   the balance with the fee shown. Then run any command again and read the log.
 - **Expect:** the send pays once and the mint shows the quote PAID. The log has
   no `Mint rejected outputs with inactive keyset`, no `Melt request failed
@@ -1424,7 +1424,7 @@ real mint and need the maintainer's approval of the amounts.
     `testFeeQuotePricesAnAmountlessInvoiceAtTheTypedAmount` and
     `testAUnifyRequestIsShownWithTheAmountThatWillBePaid`;
   - core `amountless_invoice_carries_the_callers_amount`.
-- **Origin:** #666 QA on Android, 2026-10-27. QA-165's Max step needs an
+- **Origin:** #666 QA on Android, 2026-10-27. QA-178's Max step needs an
   amountless invoice, but both apps refused one before the wallet saw it ("the
   wallet can't set it"), and the fee line priced it at no amount. That rule
   came from Breez, which cannot set an invoice's amount. The Cashu core and
