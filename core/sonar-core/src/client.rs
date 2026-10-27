@@ -1251,6 +1251,11 @@ const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// quorum so slow relays do not hold background sync or push processing open.
 const RELAY_FETCH_QUORUM: usize = MIN_CONNECTED_RELAYS;
 
+/// Point lookups (`fetch_lookup_events`): once one relay has answered with an
+/// event, wait at most this long for the others before returning the newest
+/// copy. Bounds a chat start to ~1 s when a relay stays connected but mute.
+const LOOKUP_GRACE_AFTER_FIRST_HIT: Duration = Duration::from_secs(1);
+
 fn relay_fetch_quorum(total_relays: usize) -> usize {
     if total_relays == 0 {
         0
@@ -2894,12 +2899,9 @@ impl SonarClient {
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(KEY_PACKAGE_FETCH_LIMIT);
-        let mut events: Vec<Event> = self
-            .nostr
-            .fetch_events(filter, FETCH_TIMEOUT)
-            .await?
-            .into_iter()
-            .collect();
+        let mut events = self
+            .fetch_lookup_events(filter, FETCH_TIMEOUT, "key packages")
+            .await?;
         events.sort_by_key(|e| std::cmp::Reverse(e.created_at));
         Ok(events)
     }
@@ -2964,7 +2966,9 @@ impl SonarClient {
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(1);
-        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        let events = self
+            .fetch_lookup_events(filter, FETCH_TIMEOUT, "key package")
+            .await?;
         events
             .into_iter()
             .max_by_key(|e| e.created_at)
@@ -2982,7 +2986,9 @@ impl SonarClient {
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(1);
-        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        let events = self
+            .fetch_lookup_events(filter, FETCH_TIMEOUT, "key package by id")
+            .await?;
         events
             .into_iter()
             .find(|event| event.id == event_id && event.pubkey == author)
@@ -3007,7 +3013,9 @@ impl SonarClient {
             .author(author)
             .identifier(d)
             .limit(1);
-        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        let events = self
+            .fetch_lookup_events(filter, FETCH_TIMEOUT, "key package in slot")
+            .await?;
         events
             .into_iter()
             .filter(|event| event.pubkey == author && event.tags.identifier() == Some(d))
@@ -6245,7 +6253,10 @@ impl SonarClient {
             .author(self.identity().public_key())
             .limit(1);
         let mut servers = Vec::new();
-        for event in self.nostr.fetch_events(filter, FETCH_TIMEOUT).await? {
+        for event in self
+            .fetch_lookup_events(filter, FETCH_TIMEOUT, "blossom servers")
+            .await?
+        {
             for tag in event.tags.iter() {
                 if tag.kind() == TagKind::Custom("server".into()) {
                     if let Some(url) = tag.content() {
@@ -7351,6 +7362,112 @@ impl SonarClient {
             completed_relays,
             total_relays,
         })
+    }
+
+    /// Point lookup across every relay (a KeyPackage, a server list): return
+    /// as soon as enough relays have answered to trust the result, never on
+    /// the slowest one.
+    ///
+    /// `Client::fetch_events` waits for EOSE from *every* relay or the full
+    /// timeout. A relay that stays connected but never answers a REQ (damus
+    /// after a failed NIP-42 AUTH does exactly that, measured 2026-09-30)
+    /// turned every chat start into a `FETCH_TIMEOUT` wait: 10 s for the
+    /// KeyPackage alone, ~34 s from "Start secure chat" to the first message
+    /// leaving the device. Here each relay is fetched on its own task and the
+    /// lookup resolves when the fetch quorum has completed *and* at least one
+    /// event is in hand; with nothing found yet it keeps waiting for the
+    /// remaining relays (a KeyPackage may live on one slow relay only) until
+    /// they all finish or the timeout ends. Late tasks are aborted — nothing
+    /// is buffered, unlike the Marmot sync quorum fetch.
+    async fn fetch_lookup_events(
+        &self,
+        filter: Filter,
+        timeout: Duration,
+        context: &'static str,
+    ) -> Result<Vec<Event>> {
+        let total_relays = self.relays.len();
+        if total_relays == 0 {
+            return Ok(Vec::new());
+        }
+        let quorum = relay_fetch_quorum(total_relays);
+        let mut tasks = tokio::task::JoinSet::new();
+        for relay in self.relays.clone() {
+            let nostr = self.nostr.clone();
+            let filter = filter.clone();
+            tasks.spawn(async move {
+                let relay_label = relay.to_string();
+                let result = nostr.fetch_events_from(vec![relay], filter, timeout).await;
+                (relay_label, result)
+            });
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut completed_relays = 0usize;
+        let mut failed_relays = 0usize;
+        let mut events: Vec<Event> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut last_error: Option<String> = None;
+        // Once something is in hand, give the other relays a short grace to
+        // offer a newer copy (addressable events: newest wins), then stop —
+        // a two-relay set with one mute relay must not pay the full timeout.
+        let mut first_hit_at: Option<tokio::time::Instant> = None;
+        while completed_relays + failed_relays < total_relays {
+            if completed_relays >= quorum && !events.is_empty() {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            let mut until = deadline;
+            if let Some(hit) = first_hit_at {
+                until = until.min(hit + LOOKUP_GRACE_AFTER_FIRST_HIT);
+            }
+            let remaining = until.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, tasks.join_next()).await {
+                Ok(Some(Ok((relay, Ok(relay_events))))) => {
+                    completed_relays += 1;
+                    for event in relay_events {
+                        if seen.insert(event.id) {
+                            events.push(event);
+                        }
+                    }
+                    if !events.is_empty() && first_hit_at.is_none() {
+                        first_hit_at = Some(tokio::time::Instant::now());
+                    }
+                    tracing::debug!(relay, completed_relays, total_relays, context, "lookup relay completed");
+                }
+                Ok(Some(Ok((relay, Err(err))))) => {
+                    failed_relays += 1;
+                    last_error = Some(err.to_string());
+                    tracing::debug!(relay, %err, context, "lookup relay failed");
+                }
+                Ok(Some(Err(err))) => {
+                    failed_relays += 1;
+                    last_error = Some(err.to_string());
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        tasks.abort_all();
+        if completed_relays == 0 {
+            return Err(Error::RelayFetch(format!(
+                "{context}: no relay answered before the timeout{}",
+                last_error
+                    .as_deref()
+                    .map(|err| format!("; last error: {err}"))
+                    .unwrap_or_default()
+            )));
+        }
+        tracing::debug!(
+            completed_relays,
+            failed_relays,
+            total_relays,
+            found = events.len(),
+            context,
+            "lookup resolved"
+        );
+        Ok(events)
     }
 
     async fn process_marmot_events(
@@ -9405,6 +9522,68 @@ mod tests {
     /// treated "fetched nothing" as success — silently consuming catch-up
     /// floors. The breaker must report zero completions (→ retryable), never
     /// attempt, and never read as success.
+    /// A relay that completes the WebSocket handshake and then never answers
+    /// a REQ — what relay.damus.io does after a failed NIP-42 AUTH. Returns
+    /// its ws:// url; the server thread lives for the test's duration.
+    fn spawn_mute_relay() -> RelayUrl {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mute relay");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let Ok(mut ws) = tokio_tungstenite::tungstenite::accept(stream) else {
+                        return;
+                    };
+                    // Read and drop everything (REQ, CLOSE, pings): no EOSE,
+                    // no CLOSED, no NOTICE — a connected, silent relay.
+                    while ws.read().is_ok() {}
+                });
+            }
+        });
+        RelayUrl::parse(&format!("ws://127.0.0.1:{port}")).expect("relay url")
+    }
+
+    /// KeyPackage lookups must resolve from the relays that answer, never
+    /// wait out `FETCH_TIMEOUT` on one that stays connected and mute. Before
+    /// `fetch_lookup_events` this took the full 10 s (measured on the
+    /// simulator and the CLI, 2026-09-30: four such fetches put the first
+    /// message of a new chat ~34 s after "Start secure chat").
+    #[tokio::test]
+    async fn key_package_lookup_does_not_wait_on_a_mute_relay() {
+        let live = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let live_url = live.url().await;
+        let mute_url = spawn_mute_relay();
+
+        let bob = SonarClient::connect_in_memory(
+            crate::identity::Identity::generate(),
+            vec![live_url.clone()],
+        )
+        .await
+        .expect("bob connects");
+        bob.publish_key_package().await.expect("bob publishes");
+        let bob_pubkey = bob.identity().public_key();
+
+        let alice = SonarClient::connect_in_memory(
+            crate::identity::Identity::generate(),
+            vec![mute_url, live_url],
+        )
+        .await
+        .expect("alice connects");
+        let started = Instant::now();
+        let found = alice
+            .fetch_key_package(bob_pubkey)
+            .await
+            .expect("the live relay holds bob's KeyPackage");
+        let elapsed = started.elapsed();
+        assert_eq!(found.pubkey, bob_pubkey);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "lookup waited {elapsed:?} on the mute relay (FETCH_TIMEOUT is {FETCH_TIMEOUT:?})"
+        );
+    }
+
     #[tokio::test]
     async fn quorum_fetch_breaks_open_with_no_relay_connected() {
         let relay = nostr_relay_builder::MockRelay::run()

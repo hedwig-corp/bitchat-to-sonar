@@ -515,6 +515,27 @@ model live radio, TLS, device scheduling, or native UI contention. Exact
 build, log-capture, launch, and validation commands are in
 [`scripts/bench/README.md`](../scripts/bench/README.md#repeatable-send-smoke-checks).
 
+## Chat start with a mute relay (2026-09-30)
+
+`relay.damus.io` answers a failed NIP-42 AUTH by staying connected and never
+replying to the next REQ (`relay needs serviceUrl to be configured before
+AUTH can work` on the client). Every all-relay `fetch_events` then waited the
+full `FETCH_TIMEOUT` (10 s) for its EOSE. Measured with the app's five-relay
+set, `sonar-cli send` to a fresh peer (one KeyPackage lookup, then group
+creation, publish, ack and the 3 s push settle):
+
+| build | wall clock | KeyPackage lookup |
+|---|---|---|
+| before (`Client::fetch_events`, waits for every relay) | 14.5 s | 10.0 s (timeout) |
+| after (`fetch_lookup_events`: answering relays + 1 s grace) | 5.4–5.9 s | ~1 s |
+
+On the iOS simulator the same wait showed as four back-to-back 10 s
+subscription timeouts between "Start secure chat" and `send_local_pending`
+(34 s); afterwards the chat's first send carried `send_first_ack rtt_ms=228`.
+Pinned by `client.rs::key_package_lookup_does_not_wait_on_a_mute_relay`
+(fails at 10.0 s without the change). The Marmot sync path was already
+quorum-based and is unchanged.
+
 ## iOS keyboard-tail structural benchmark
 
 The keyboard benchmark measures the amount of main-thread coordination Sonar
