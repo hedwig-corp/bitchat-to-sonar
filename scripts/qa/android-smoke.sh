@@ -211,6 +211,55 @@ qa002() { # reply arrives in the open chat
   fi
 }
 
+# text_start <substring> — "x y" just inside the top-left corner of the first
+# node containing it, i.e. a bubble's first glyphs. `find` returns the node's
+# centre, which on a wrapped bubble can land past the link.
+text_start() {
+  "$UI" boundst "$1" 2>/dev/null | awk '{print $1 + 40, $2 + 30}'
+}
+
+device_now() { adb -s "$QA_SERIAL" shell 'date "+%m-%d %H:%M:%S.000"' | tr -d '\r'; }
+
+# view_started <host> <since> — something launched a VIEW of https://<host>
+# after device time <since>. Android logs the host and redacts the path, so
+# each run uses a host of its own.
+view_started() {
+  adb -s "$QA_SERIAL" logcat -d -T "$2" 2>/dev/null |
+    grep -q "act=android.intent.action.VIEW dat=https://$1/"
+}
+
+qa189() { # a tapped link opens in the browser; a long press opens the menu instead (#672)
+  [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-189 SKIP "needs QA-001"; return; }
+  local host="qa189-$RUN.example.com" www="www.qa189-$RUN.example.org" since link target xy
+  link="https://$host/a"
+  "$PEERS" send "a-$RUN" "$APP_NPUB" "$link" >/dev/null
+  "$PEERS" send "a-$RUN" "$APP_NPUB" "$www" >/dev/null
+  "$UI" wait "$www" 30 >/dev/null || { record QA-189 FAIL "the peer's links never arrived"; return; }
+  sleep 1
+  since="$(device_now)"
+  xy="$(text_start "$link")"
+  [[ -n "$xy" ]] || { record QA-189 FAIL "no bubble holds $link"; return; }
+  ui longpress $xy
+  "$UI" wait "Reply" 5 >/dev/null || { record QA-189 FAIL "long-press on a link opened no menu"; return; }
+  ui key 4; sleep 1
+  if view_started "$host" "$since"; then
+    record QA-189 FAIL "a long press opened the link as well as the menu"; return
+  fi
+  for target in "$link|$host" "$www|$www"; do
+    since="$(device_now)"
+    xy="$(text_start "${target%%|*}")"
+    [[ -n "$xy" ]] || { record QA-189 FAIL "no bubble holds ${target%%|*}"; return; }
+    ui tap $xy
+    sleep 3
+    view_started "${target##*|}" "$since" ||
+      { record QA-189 FAIL "tapping ${target%%|*} opened nothing (#672)"; go_home >/dev/null; return; }
+    # Back to the same chat for the scenarios after this one.
+    adb -s "$QA_SERIAL" shell am start -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
+    "$UI" wait "$www" 10 >/dev/null || { record QA-189 FAIL "the chat was gone after returning from the browser"; return; }
+  done
+  record QA-189 PASS "both links opened a VIEW (https:// and www. as https://); long press opened the menu only"
+}
+
 # Reaction scenarios run in QA-001's chat, which QA-002 left open.
 reaction_chip_below() { # <message text> <emoji> — the chip sits under that bubble
   local my cy
@@ -935,14 +984,14 @@ echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 # drops input injected into its first screens.
 go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
-# Order matters: QA-002 and the reaction scenarios (QA-100..102, QA-106)
-# reuse QA-001's chat, QA-135 needs QA-004's chat as the newest one, QA-005
+# Order matters: QA-002, QA-189 and the reaction scenarios (QA-100..102,
+# QA-106) reuse QA-001's chat, QA-135 needs QA-004's chat as the newest one, QA-005
 # opens QA-004's, and QA-040 inspects the chat
 # QA-005 left open. QA-187 force-stops the app and shapes the emulator's link,
 # so it runs after the UI scenarios and restores Wi-Fi before QA-050 measures
 # idle CPU. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa187 qa050 qa118; do
+for s in qa001 qa002 qa189 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa187 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"
