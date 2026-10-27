@@ -3603,37 +3603,41 @@ private fun MessageBubbleBody(
     preview: TranscriptPreview,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
-    textLayout: TextLayoutResult?,
-    onTextLayout: (TextLayoutResult) -> Unit,
     onMentionTap: ((String) -> Unit)?,
     uriHandler: androidx.compose.ui.platform.UriHandler,
 ) {
     val s = sonar
+    // Read through the State at tap time. The gesture loop below runs until
+    // `annotated` changes, so a layout handed in as a parameter goes stale
+    // once the bubble reflows (rotation, a resized window).
+    var textLayout by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
     Column {
         Text(
             annotated, color = if (m.mine) onMine else s.text,
             fontSize = 16.sp, lineHeight = 22.4.sp,
             inlineContent = inline,
-            onTextLayout = onTextLayout,
+            onTextLayout = { textLayout = it },
             modifier = Modifier.pointerInput(annotated) {
                 awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
+                    // Judge consumption at the down, never after the up: the
+                    // row's combinedClickable (ReplyDecorated) sees this down
+                    // after our Main pass and consumes it, so checking
+                    // `down.isConsumed` later rejected every tap.
+                    val down = awaitFirstDown()
                     withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
                         waitForUpOrCancellation()
                     } ?: return@awaitEachGesture
-                    if (!down.isConsumed) {
-                        val offset = textLayout?.getOffsetForPosition(down.position)
-                        offset?.let {
-                            val mention = annotated
-                                .getStringAnnotations(MENTION_ANNOTATION_TAG, it, it)
+                    val offset = textLayout?.getOffsetForPosition(down.position)
+                    offset?.let {
+                        val mention = annotated
+                            .getStringAnnotations(MENTION_ANNOTATION_TAG, it, it)
+                            .firstOrNull()
+                        if (mention != null && onMentionTap != null) {
+                            onMentionTap(mention.item)
+                        } else {
+                            annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
                                 .firstOrNull()
-                            if (mention != null && onMentionTap != null) {
-                                onMentionTap(mention.item)
-                            } else {
-                                annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
-                                    .firstOrNull()
-                                    ?.let { link -> uriHandler.openUri(link.item) }
-                            }
+                                ?.let { link -> uriHandler.openUri(link.item) }
                         }
                     }
                 }
@@ -3721,7 +3725,7 @@ internal fun ComposerReplyBanner(
  *  18dp radius, and the time + via icon inlined at the end of the text. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MessageBubble(
+internal fun MessageBubble(
     m: SonarMsg,
     mesh: Boolean = false,
     author: String? = null,
@@ -3765,7 +3769,6 @@ private fun MessageBubble(
             appendBubbleMetaInlineContent()
         }
     }
-    var textLayout by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
     val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
     val inline = mapOf(
         BUBBLE_META_TIME to InlineTextContent(
@@ -3845,8 +3848,6 @@ private fun MessageBubble(
                             preview = preview,
                             expanded = expanded,
                             onExpandedChange = { expanded = it },
-                            textLayout = textLayout,
-                            onTextLayout = { textLayout = it },
                             onMentionTap = onMentionTap,
                             uriHandler = uriHandler,
                         )
@@ -3861,8 +3862,6 @@ private fun MessageBubble(
                     preview = preview,
                     expanded = expanded,
                     onExpandedChange = { expanded = it },
-                    textLayout = textLayout,
-                    onTextLayout = { textLayout = it },
                     onMentionTap = onMentionTap,
                     uriHandler = uriHandler,
                 )

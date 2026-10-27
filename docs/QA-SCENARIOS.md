@@ -140,6 +140,21 @@ is the build under test on a dedicated QA emulator/simulator.
   to equal its own counter, so one lost frame rejected every later message
   until a re-handshake; the reference clients use a 1024-entry sliding window.
 
+### QA-189 — Links and mentions in a bubble open on tap
+- **Platforms:** both (Android by UI test; iOS manual — its bubbles use
+  native `.link` attributes, not this tap handler)
+- **Steps:** in any chat, receive `https://example.com` and `www.example.com`;
+  tap each. In a group, tap an `@mention` of a member. Long-press a link.
+- **Expect:** each tap opens the browser (the `www.` one as `https://`); the
+  mention opens that member's profile; the long press opens the message menu
+  and does not open the link.
+- **How:** Guard: `MessageLinkTapUiTest` (Android, jvm UI test at the real
+  `ReplyDecorated` + `MessageBubble` call site); iOS manual
+- **Origin:** 2026-10-27. Since #587 no tap on Android resolved: the bubble's
+  tap handler checked `down.isConsumed` after the up, by which time the row's
+  `combinedClickable` had consumed the down. It also kept a stale text layout
+  after a reflow.
+
 ## Cross-client Bluetooth mesh (#671)
 
 The codec half of mesh interop is proved in CI: `scripts/bitchat-vectors/cross-replay.sh`
