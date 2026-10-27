@@ -3447,16 +3447,15 @@ class SonarAppState(private val scope: CoroutineScope) {
      * Send sheet fee line (Cashu wallet only): the fee (the mint's reserve
      * plus its input fees on the ecash spent) for paying [sats] to [destination], or null when there is nothing to show —
      * wallet not open, mint offline, quote refused. The line then hides, and
-     * a Send from that sheet consents to no fee (`consentedFeeCeiling`). A
-     * BOLT11 invoice is quoted at its own amount, exactly as
-     * [destinationSendAmount] sends it. The quote is discarded: the send
-     * prepares its own, and pays at most the fee shown from this one.
+     * a Send from that sheet consents to no fee (`consentedFeeCeiling`). The
+     * amount is [walletAmountFor]'s, exactly as [destinationSendAmount] sends
+     * it. The quote is discarded: the send prepares its own, and pays at most
+     * the fee shown from this one.
      */
     suspend fun quoteSendFee(destination: String, sats: Long): Long? {
         val dest = destination.trim()
         if (dest.isEmpty() || sats <= 0 || !WalletBridge.isOpen()) return null
-        val amount = if (isBolt11Invoice(dest)) 0L else sats
-        return (WalletBridge.quoteFee(dest, amount) as? WalletOutcome.Ok)?.value
+        return (WalletBridge.quoteFee(dest, walletAmountFor(dest, sats)) as? WalletOutcome.Ok)?.value
     }
 
     /** [quoteSendFee] for a chat pay: the contact's CACHED offer — never a descriptor fetch. */
@@ -3467,6 +3466,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         val lower = dest.lowercase()
         return lower.startsWith("lnbc") || lower.startsWith("lntb") || lower.startsWith("lnbcrt")
     }
+
+    private fun isAmountlessInvoice(dest: String): Boolean =
+        isBolt11Invoice(dest) && chat.bitchat.sonar.wallet.bolt11AmountSats(dest.lowercase()) == null
+
+    /**
+     * The amount handed to the wallet for [dest]: 0 for an invoice that
+     * carries its own (passing ours risks "Receiver amount and invoice amount
+     * do not match"), the typed [sats] for everything else — an amountless
+     * invoice included. The send and the fee quote share it, so the quote
+     * prices exactly what is sent.
+     */
+    private fun walletAmountFor(dest: String, sats: Long): Long =
+        if (isBolt11Invoice(dest) && !isAmountlessInvoice(dest)) 0L else sats
 
     /** Why a send cannot start right now, or null. */
     private fun walletSendBlockReason(fromLegacy: Boolean): String? = when {
@@ -4076,29 +4088,19 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /**
      * Refuses an external destination the wallet cannot pay, before any
-     * activity is recorded.
+     * activity is recorded, and otherwise picks the amount to hand it
+     * ([walletAmountFor]).
      *
-     * A BOLT11 invoice carries its own amount, and the wallet takes it from
-     * there. Two failure modes come out of ignoring that, both seen on device:
-     *
-     *  * an amountless invoice is simply unpayable — the SDK answers
-     *    "Amount is missing: Expected invoice with an amount" no matter what
-     *    amount we pass, so let the user know instead of taking an amount and
-     *    failing after the fact;
-     *  * supplying our own amount for an invoice that already has one risks
-     *    "Receiver amount and invoice amount do not match", so we pass none and
-     *    let the invoice speak.
-     *
-     * Offers and addresses are the opposite — they need the amount from us.
+     * An amountless invoice is refused only from the old wallet: Breez answers
+     * "Amount is missing: Expected invoice with an amount" whatever amount we
+     * pass. The Cashu wallet quotes it as an amountless melt for the typed
+     * amount. Checked before the wallet's readiness, so a user holding such an
+     * invoice learns it cannot be paid from there at all, not to wait.
      */
     private fun destinationSendAmount(dest: String, sats: Long, fromLegacy: Boolean): DestinationCheck {
+        if (fromLegacy && isAmountlessInvoice(dest)) return DestinationCheck.Refuse(AMOUNTLESS_INVOICE_MESSAGE)
         walletSendBlockReason(fromLegacy)?.let { return DestinationCheck.Refuse(it) }
-        val lower = dest.lowercase()
-        val isBolt11 = isBolt11Invoice(dest)
-        if (isBolt11 && chat.bitchat.sonar.wallet.bolt11AmountSats(lower) == null) {
-            return DestinationCheck.Refuse(AMOUNTLESS_INVOICE_MESSAGE)
-        }
-        return DestinationCheck.Send(if (isBolt11) 0L else sats)
+        return DestinationCheck.Send(walletAmountFor(dest, sats))
     }
 
     private suspend fun sendPaymentReceiptLines(chatId: String, lines: List<String>): Boolean {
@@ -4285,18 +4287,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /**
      * What the sheet shows for a request: a BOLT11 invoice speaks for its own
-     * amount (the URI's `amount` does not override it, as when scanning), and
-     * an amountless one cannot be paid; anything else takes the URI's amount,
-     * or asks for one. Mirrors iOS `SonarAppStore.unifyPayPhase(for:)`.
+     * amount (the URI's `amount` does not override it, as when scanning).
+     * Anything else takes the URI's amount, or asks for one — an amountless
+     * invoice included, which the Cashu wallet paying Unify quotes as an
+     * amountless melt. Mirrors iOS `SonarAppStore.unifyPayPhase(for:)`.
      */
     internal fun unifyPayRequestFor(peerId: String, parsed: UnifyBIP321.Parsed): UnifyPayRequest {
         val dest = parsed.lightning
-        if (isBolt11Invoice(dest)) {
-            val sats = chat.bitchat.sonar.wallet.bolt11AmountSats(dest.lowercase())
-                ?: return UnifyPayRequest(peerId, failure = AMOUNTLESS_INVOICE_MESSAGE)
-            return UnifyPayRequest(peerId, dest, fixedSats = sats)
-        }
-        return UnifyPayRequest(peerId, dest, fixedSats = parsed.amountSats)
+        val invoiceSats = if (isBolt11Invoice(dest)) chat.bitchat.sonar.wallet.bolt11AmountSats(dest.lowercase()) else null
+        return UnifyPayRequest(peerId, dest, fixedSats = invoiceSats ?: parsed.amountSats)
     }
 
     /** The Unify sheet's fee line: waits for the request, then prices it like any destination. */
@@ -5148,7 +5147,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     companion object {
         private const val AUTO_BACKUP_DISCLOSED_PREF = "auto_backup_disclosed"
 
-        /** A Lightning invoice without an amount cannot be paid: the wallet cannot set one for it. */
+        /** An invoice without an amount, paid from the old wallet: Breez cannot set one for it. */
         internal const val AMOUNTLESS_INVOICE_MESSAGE =
             "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
     }

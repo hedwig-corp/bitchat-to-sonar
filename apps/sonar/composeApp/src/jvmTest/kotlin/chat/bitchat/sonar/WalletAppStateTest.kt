@@ -167,6 +167,50 @@ class WalletAppStateTest {
         assertNull(s.quoteSendFee("lno1destination", 500), "a refused quote hides the line")
     }
 
+    /**
+     * An invoice with no amount is paid with the amount typed on the sheet:
+     * the Cashu wallet quotes it as an amountless melt. The fee line prices
+     * that same amount, and `Max` works on it too (QA-165's Max step). Only
+     * the old wallet refuses one — Breez cannot set an invoice's amount.
+     */
+    @Test
+    fun anAmountlessInvoiceIsPaidWithTheTypedAmount() = runBlocking {
+        native.confirmedSats = 10_000
+        native.feeReserveSats = 9
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+        val invoice = "lnbc1pamountlessinvoice"
+
+        assertEquals(9L, s.quoteSendFee(invoice, 700))
+        assertEquals(listOf<Long?>(700L), native.preparedAmounts, "the fee line prices the typed amount")
+
+        val id = assertNotNull(s.beginDestinationPayment(invoice, 700, "Invoice", maxFeeSats = 9))
+        waitUntil("paid") { PaymentActivityStore.get(id)?.status == SonarPaymentActivity.Status.Paid }
+        assertEquals(listOf(700L), native.sentAmounts)
+
+        // Max: the sheet sends the whole balance, and the fee comes out of it.
+        val balance = native.confirmedSats
+        val max = assertNotNull(
+            s.beginDestinationPayment(invoice, balance, "Invoice", maxFeeSats = 9, feeFromAmount = true)
+        )
+        waitUntil("max paid") { PaymentActivityStore.get(max)?.status == SonarPaymentActivity.Status.Paid }
+        assertEquals(listOf(700L, balance - 9), native.sentAmounts)
+        assertEquals(balance, native.preparedAmounts[2], "Max quotes the invoice at the balance first")
+    }
+
+    @Test
+    fun anAmountlessInvoiceIsStillRefusedFromTheOldWallet() = runBlocking {
+        native.confirmedSats = 10_000
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+
+        assertNull(s.beginDestinationPayment("lnbc1pamountlessinvoice", 700, "Invoice", maxFeeSats = null, fromLegacy = true))
+        assertEquals(SonarAppState.AMOUNTLESS_INVOICE_MESSAGE, s.toast)
+        assertEquals(0, native.count("prepareSend"))
+    }
+
     // ── The fee the user consented to (maintainer review, #614) ──
 
     private fun feeChangedText(sats: Long) =
@@ -314,9 +358,9 @@ class WalletAppStateTest {
 
     /**
      * What the Unify sheet shows for a request: a BOLT11 invoice speaks for its
-     * own amount (the URI's `amount` does not override it), an amountless one
-     * is refused before any keypad, and an offer takes the URI's amount or asks
-     * for one. Mirrors iOS `testAUnifyRequestIsShownWithTheAmountThatWillBePaid`.
+     * own amount (the URI's `amount` does not override it); an amountless one
+     * and an offer take the URI's amount or ask for one. Mirrors iOS
+     * `testAUnifyRequestIsShownWithTheAmountThatWillBePaid`.
      */
     @Test
     fun aUnifyRequestIsShownWithTheAmountThatWillBePaid() {
@@ -327,10 +371,8 @@ class WalletAppStateTest {
             SonarAppState.UnifyPayRequest("u1", "lnbc2500n1pinvoice", fixedSats = 250),
             request("lnbc2500n1pinvoice", 999),
         )
-        assertEquals(
-            SonarAppState.UnifyPayRequest("u1", failure = SonarAppState.AMOUNTLESS_INVOICE_MESSAGE),
-            request("lnbc1pinvoice", 500),
-        )
+        assertEquals(SonarAppState.UnifyPayRequest("u1", "lnbc1pinvoice", fixedSats = 500), request("lnbc1pinvoice", 500))
+        assertEquals(SonarAppState.UnifyPayRequest("u1", "lnbc1pinvoice"), request("lnbc1pinvoice", null))
         assertEquals(SonarAppState.UnifyPayRequest("u1", "lno1offer", fixedSats = 700), request("lno1offer", 700))
         assertEquals(SonarAppState.UnifyPayRequest("u1", "lno1offer"), request("lno1offer", null))
     }

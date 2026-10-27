@@ -9693,11 +9693,19 @@ final class SonarAppStore: ObservableObject {
     func usesFeeInclusiveMax(_ source: SNPaymentSource) -> Bool { source == .primary }
 
     /// The amount handed to the wallet for `destination`: 0 for a BOLT11
-    /// invoice (it speaks for its own amount), `sats` for everything else.
-    /// The send path and the fee quote share it, so the quote prices exactly
-    /// what `send` will prepare.
+    /// invoice that carries its own (passing ours risks "Receiver amount and
+    /// invoice amount do not match"), `sats` for everything else — an
+    /// amountless invoice included. The send path and the fee quote share it,
+    /// so the quote prices exactly what `send` will prepare.
     nonisolated static func walletAmount(forDestination destination: String, sats: Int64) -> Int64 {
-        SNPayDestinationKind(destination) == .bolt11 ? 0 : sats
+        isAmountlessInvoice(destination) || SNPayDestinationKind(destination) != .bolt11 ? sats : 0
+    }
+
+    nonisolated static func isAmountlessInvoice(_ destination: String) -> Bool {
+        SNPayDestinationKind(destination) == .bolt11
+            && SNScannedKind.bolt11AmountSats(
+                destination.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            ) == nil
     }
 
     /// The pay sheet's fee quote for paying `destination` from `wallet`. The
@@ -9981,40 +9989,32 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Refuses an external destination the wallet cannot pay, before any
-    /// activity is recorded. Returns the amount to hand the wallet, or the
-    /// message to show the user.
+    /// activity is recorded. Returns the amount to hand the wallet
+    /// (`walletAmount(forDestination:sats:)`), or the message to show the user.
     ///
-    /// A BOLT11 invoice carries its own amount, and the wallet takes it from
-    /// there. Two failure modes come out of ignoring that, both seen on device:
-    ///
-    ///  * an amountless invoice is simply unpayable — the SDK answers
-    ///    "Amount is missing: Expected invoice with an amount" no matter what
-    ///    amount we pass, so let the user know instead of taking an amount and
-    ///    failing after the fact;
-    ///  * supplying our own amount for an invoice that already has one risks
-    ///    "Receiver amount and invoice amount do not match", so we pass none
-    ///    and let the invoice speak.
-    ///
-    /// Offers and addresses are the opposite — they need the amount from us.
+    /// An amountless invoice is refused only from the old wallet: Breez
+    /// answers "Amount is missing: Expected invoice with an amount" whatever
+    /// amount we pass. The Cashu wallet quotes it as an amountless melt for
+    /// the typed amount. Checked before the wallet's readiness, so a user
+    /// holding such an invoice learns it cannot be paid from there at all,
+    /// not to wait.
     private enum SNDestinationCheck {
         /// Amount to hand the wallet (0 lets a BOLT11 invoice speak for itself).
         case send(Int64)
         case refuse(String)
     }
 
-    /// A Lightning invoice without an amount cannot be paid: the wallet
-    /// cannot set one for it.
+    /// An invoice without an amount, paid from the old wallet: Breez cannot
+    /// set one for it.
     static let amountlessInvoiceMessage =
         "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
 
     private func destinationSendAmount(_ dest: String, sats: Int64, source: SNPaymentSource) -> SNDestinationCheck {
+        if source == .legacy, Self.isAmountlessInvoice(dest) {
+            return .refuse(Self.amountlessInvoiceMessage)
+        }
         guard let sender = sendingWallet(source), case .ready = sender.state else {
             return .refuse(String(localized: "Your wallet is still starting. Try again in a moment."))
-        }
-        let lower = dest.lowercased()
-        let isBolt11 = SNPayDestinationKind(dest) == .bolt11
-        if isBolt11, SNScannedKind.bolt11AmountSats(lower) == nil {
-            return .refuse(Self.amountlessInvoiceMessage)
         }
         // Shared with the fee quote, so the quote prices what is sent.
         return .send(Self.walletAmount(forDestination: dest, sats: sats))
@@ -10838,14 +10838,13 @@ final class SonarAppStore: ObservableObject {
 
     /// The sheet phase for a request read from a Unify receiver. A BOLT11
     /// invoice speaks for its own amount (the URI's `amount` does not
-    /// override it, as when scanning); an amountless invoice cannot be paid.
-    /// Anything else takes the URI's amount, or asks for one.
+    /// override it, as when scanning). Anything else takes the URI's amount,
+    /// or asks for one — an amountless invoice included, which the Cashu
+    /// wallet paying Unify quotes as an amountless melt.
     static func unifyPayPhase(for parsed: UnifyBIP321.Parsed) -> UnifyPayPhase {
         let destination = parsed.lightning
-        if SNPayDestinationKind(destination) == .bolt11 {
-            guard let sats = SNScannedKind.bolt11AmountSats(destination.lowercased()) else {
-                return .failed(amountlessInvoiceMessage)
-            }
+        if SNPayDestinationKind(destination) == .bolt11,
+           let sats = SNScannedKind.bolt11AmountSats(destination.lowercased()) {
             return .confirm(destination: destination, sats: sats)
         }
         if let sats = parsed.amountSats {

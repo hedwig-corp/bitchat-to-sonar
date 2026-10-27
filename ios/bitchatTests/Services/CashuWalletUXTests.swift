@@ -77,9 +77,25 @@ final class CashuWalletUXTests: XCTestCase {
         XCTAssertEqual(native.preparedAmounts, [nil])
 
         XCTAssertEqual(SonarAppStore.walletAmount(forDestination: "LNBC5U1PINVOICE", sats: 500), 0)
-        XCTAssertEqual(SonarAppStore.walletAmount(forDestination: "lntb1pinvoice", sats: 500), 0)
+        XCTAssertEqual(SonarAppStore.walletAmount(forDestination: "lntb5u1pinvoice", sats: 500), 0)
         XCTAssertEqual(SonarAppStore.walletAmount(forDestination: "lno1offer", sats: 500), 500)
         XCTAssertEqual(SonarAppStore.walletAmount(forDestination: "alice@example.com", sats: 500), 500)
+        await releaseQuietly(service)
+    }
+
+    /// An invoice with no amount is priced at the typed amount, exactly as the
+    /// Cashu wallet sends it (an amountless melt).
+    func testFeeQuotePricesAnAmountlessInvoiceAtTheTypedAmount() async throws {
+        let native = FakeCashuNative()
+        native.feeReserve = 3
+        let (service, wallet) = try await openWallet(native)
+
+        let fee = try await SonarAppStore.feeQuoter(wallet: wallet, destination: "lnbc1pamountlessinvoice")(700)
+        XCTAssertEqual(fee, 3)
+        XCTAssertEqual(native.preparedAmounts, [700])
+
+        XCTAssertEqual(SonarAppStore.walletAmount(forDestination: "lntb1pinvoice", sats: 500), 500)
+        XCTAssertEqual(SonarAppStore.walletAmount(forDestination: " LNBC1PINVOICE ", sats: 500), 500)
         await releaseQuietly(service)
     }
 
