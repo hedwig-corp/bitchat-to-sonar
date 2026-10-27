@@ -1606,7 +1606,7 @@ real mint and need the maintainer's approval of the amounts.
   came from Breez, which cannot set an invoice's amount. The Cashu core and
   mint could pay it all along. Now only the old wallet refuses it.
 
-### QA-187 — A send that swaps first reports all it cost as its fee
+### QA-188 — A send that swaps first reports all it cost as its fee
 - **Platforms:** both (one Rust core; headless with `sonar-cashu-cli`
   against a local `cdk-mintd` 0.18.1 fakewallet mint at `input_fee_ppk =
   1000`). Neither host recomputes the fee: iOS `CashuWalletService.map` and
