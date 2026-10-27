@@ -387,6 +387,12 @@ enum SonarPushProcessor {
         // Ownership is held by the outer single-flight loop so trailing
         // refreshes share one notified-ID set.
 
+        // These banners belong to the account whose store this wake drains.
+        // Name it on every banner (the app-level fallback would read the
+        // active account at POST time), and post nothing if a switch lands
+        // while the wake runs: the rows could then be the other account's.
+        let wakeAccount = SonarAccountRegistry.snapshot().active?.pubkeyHex
+
         // Hydrate the unread baseline from local storage BEFORE refresh.
         // Cold/background launches often have an empty in-memory summary
         // cache; capturing that empty map would treat every existing unread
@@ -455,17 +461,27 @@ enum SonarPushProcessor {
         // via gap recovery after the returned drain list are not dropped.
         // Delta skips message tips already bannered from the drain list.
         var notified = 0
-        if !drained.isEmpty {
-            notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
+        let sameAccount = { SonarAccountRegistry.snapshot().active?.pubkeyHex == wakeAccount }
+        if !drained.isEmpty, sameAccount() {
+            notified = await notifyDrained(
+                drained, marmot: marmot, prefs: prefs,
+                accountPubkeyHex: wakeAccount, isSameAccount: sameAccount
+            )
         }
         // Reload summaries so delta sees gap-recovery advances during name resolve.
         _ = await marmot.loadLocalSummaries()
-        notified += await notifyNewlyUnread(
-            before: beforeUnread,
-            baselineHydrated: baselineHydrated,
-            marmot: marmot,
-            prefs: prefs
-        )
+        if sameAccount() {
+            notified += await notifyNewlyUnread(
+                before: beforeUnread,
+                baselineHydrated: baselineHydrated,
+                marmot: marmot,
+                prefs: prefs,
+                accountPubkeyHex: wakeAccount,
+                isSameAccount: sameAccount
+            )
+        } else {
+            log.info("Marmot wakeup: active account changed during the wake — banners skipped")
+        }
 
         switch (notified > 0, synced) {
         case (true, _):
@@ -511,7 +527,9 @@ enum SonarPushProcessor {
     private static func notifyDrained(
         _ drained: [DrainNotificationInfo],
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        accountPubkeyHex: String?,
+        isSameAccount: () -> Bool
     ) async -> Int {
         var notified = 0
         for notif in drained {
@@ -592,6 +610,9 @@ enum SonarPushProcessor {
             var userInfo: [String: Any] = [SonarNotificationKeys.marmotWake: true]
             if let conversationId {
                 userInfo[SonarNotificationKeys.conversationId] = conversationId
+                if let accountPubkeyHex {
+                    userInfo[SonarNotificationKeys.accountPubkey] = accountPubkeyHex
+                }
             }
             if !notif.messageIdHex.isEmpty {
                 userInfo["sonar.messageId"] = notif.messageIdHex
@@ -614,6 +635,9 @@ enum SonarPushProcessor {
                 messageIdHex: notif.messageIdHex.isEmpty ? nil : notif.messageIdHex,
                 conversationId: conversationId
             )
+            // Name resolution above awaits: re-check the account right before
+            // posting, and abandon the batch if a switch landed meanwhile.
+            guard isSameAccount() else { return notified }
             NotificationService.shared.sendLocalNotification(
                 title: routed.title,
                 body: routed.body,
@@ -634,7 +658,9 @@ enum SonarPushProcessor {
         before: [String: SonarPushUnreadDelta.Fingerprint],
         baselineHydrated: Bool,
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        accountPubkeyHex: String?,
+        isSameAccount: () -> Bool
     ) async -> Int {
         let after = marmot.conversationSummariesByGroup.values.filter { summary in
             SonarPushUnreadDelta.isNewlyAdvanced(
@@ -713,6 +739,9 @@ enum SonarPushProcessor {
             var userInfo: [String: Any] = [SonarNotificationKeys.marmotWake: true]
             if let conversationId {
                 userInfo[SonarNotificationKeys.conversationId] = conversationId
+                if let accountPubkeyHex {
+                    userInfo[SonarNotificationKeys.accountPubkey] = accountPubkeyHex
+                }
             }
 
             guard let routed = SonarLocalNotificationRouter.make(
@@ -731,6 +760,9 @@ enum SonarPushProcessor {
                 messageIdHex: nil,
                 conversationId: conversationId
             )
+            // Name resolution above awaits: re-check the account right before
+            // posting, and abandon the batch if a switch landed meanwhile.
+            guard isSameAccount() else { return notified }
             NotificationService.shared.sendLocalNotification(
                 title: routed.title,
                 body: routed.body,

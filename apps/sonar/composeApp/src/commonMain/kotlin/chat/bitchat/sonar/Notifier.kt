@@ -22,6 +22,8 @@ expect object Notifier {
         sound: SonarNotificationSound = SonarNotificationSound.Default,
         conversationId: String? = null,
         messageId: String? = null,
+        /** Background-account banner: the tap switches to this account first. */
+        accountPubkeyHex: String? = null,
     )
     /** Dismiss delivered notifications that belong to any of [conversationIds]. */
     fun clearConversations(conversationIds: Collection<String>)

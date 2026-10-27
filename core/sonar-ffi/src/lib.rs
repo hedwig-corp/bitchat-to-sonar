@@ -143,6 +143,178 @@ pub fn wipe_marmot_database(db_path: String) -> FfiResult<()> {
     Ok(())
 }
 
+/// One registered account (see `sonar_core::accounts`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AccountInfo {
+    /// 64-char lowercase hex x-only public key.
+    pub pubkey_hex: String,
+    pub npub: String,
+    pub label: Option<String>,
+    /// Absolute path of this account's `marmot.sqlite`; every core sidecar
+    /// hangs off it. Pass it to `SonarNode.connect` and the `db_path` exports.
+    pub db_path: String,
+    /// Suffix for host secret names: `""` keeps the legacy unsuffixed names,
+    /// otherwise `account_secret_key_name(base, tag)` gives `base.tag`.
+    pub secret_tag: String,
+    pub is_legacy: bool,
+    pub is_active: bool,
+    pub added_at: u64,
+    pub last_active_at: u64,
+}
+
+/// Registry snapshot for the switcher UI and the NSE.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AccountRegistryInfo {
+    pub accounts: Vec<AccountInfo>,
+    /// Resolved active account (explicit pointer, else most recently active).
+    pub active_pubkey_hex: Option<String>,
+    pub max_accounts: u32,
+}
+
+/// Outcome of `account_registry_remove`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AccountRemovalInfo {
+    pub removed: AccountInfo,
+    pub new_active: AccountInfo,
+}
+
+fn account_info(
+    data_dir: &Path,
+    entry: &sonar_core::accounts::AccountEntry,
+    active_hex: Option<&str>,
+) -> AccountInfo {
+    AccountInfo {
+        pubkey_hex: entry.pubkey_hex.clone(),
+        npub: entry.npub.clone(),
+        label: entry.label.clone(),
+        db_path: entry.db_path(data_dir).to_string_lossy().into_owned(),
+        secret_tag: entry.secret_tag.clone(),
+        is_legacy: entry.is_legacy(),
+        is_active: active_hex == Some(entry.pubkey_hex.as_str()),
+        added_at: entry.added_at,
+        last_active_at: entry.last_active_at,
+    }
+}
+
+fn registry_info(data_dir: &Path) -> FfiResult<AccountRegistryInfo> {
+    let reg = sonar_core::accounts::AccountRegistry::load(data_dir)?;
+    let active_hex = reg.active().map(|a| a.pubkey_hex.clone());
+    Ok(AccountRegistryInfo {
+        accounts: reg
+            .accounts
+            .iter()
+            .map(|e| account_info(data_dir, e, active_hex.as_deref()))
+            .collect(),
+        active_pubkey_hex: active_hex,
+        max_accounts: sonar_core::accounts::MAX_ACCOUNTS as u32,
+    })
+}
+
+/// Load `<data_dir>/accounts.json`. Missing ⇒ empty registry; a file that
+/// does not parse is an error — hosts fall back to the legacy single-account
+/// path for that launch and never mint a key or store because of it.
+#[uniffi::export]
+pub fn account_registry_load(data_dir: String) -> FfiResult<AccountRegistryInfo> {
+    registry_info(Path::new(&data_dir))
+}
+
+/// Register the pre-registry store (`<data_dir>/marmot.sqlite`, unsuffixed
+/// secrets) in place as `pubkey` (hex or npub). Idempotent; refuses a second
+/// key for the legacy slot. Returns the full registry after the change.
+#[uniffi::export]
+pub fn account_registry_register_legacy(
+    data_dir: String,
+    pubkey: String,
+) -> FfiResult<AccountRegistryInfo> {
+    let dir = Path::new(&data_dir);
+    sonar_core::accounts::register_legacy(dir, &pubkey)?;
+    registry_info(dir)
+}
+
+/// Add `pubkey` (hex or npub) under `<data_dir>/accounts/<hex>/`. An already
+/// registered key is returned unchanged (treat as a switch, never a
+/// replacement). Does not change the active account.
+#[uniffi::export]
+pub fn account_registry_add(
+    data_dir: String,
+    pubkey: String,
+    label: Option<String>,
+) -> FfiResult<AccountInfo> {
+    let dir = Path::new(&data_dir);
+    let entry = sonar_core::accounts::add_account(dir, &pubkey, label.as_deref())?;
+    let reg = sonar_core::accounts::AccountRegistry::load(dir)?;
+    let active = reg.active().map(|a| a.pubkey_hex.clone());
+    Ok(account_info(dir, &entry, active.as_deref()))
+}
+
+/// Make `pubkey` active. Hosts close the current node first and open the
+/// returned `db_path` afterwards.
+#[uniffi::export]
+pub fn account_registry_set_active(data_dir: String, pubkey: String) -> FfiResult<AccountInfo> {
+    let dir = Path::new(&data_dir);
+    let entry = sonar_core::accounts::set_active(dir, &pubkey)?;
+    Ok(account_info(dir, &entry, Some(entry.pubkey_hex.as_str())))
+}
+
+#[uniffi::export]
+pub fn account_registry_set_label(
+    data_dir: String,
+    pubkey: String,
+    label: Option<String>,
+) -> FfiResult<AccountInfo> {
+    let dir = Path::new(&data_dir);
+    let entry = sonar_core::accounts::set_label(dir, &pubkey, label.as_deref())?;
+    let reg = sonar_core::accounts::AccountRegistry::load(dir)?;
+    let active = reg.active().map(|a| a.pubkey_hex.clone());
+    Ok(account_info(dir, &entry, active.as_deref()))
+}
+
+/// Remove `pubkey`: wipes its store and sidecars and its `accounts/<hex>`
+/// directory, never the data dir. Refuses the last account. Call with no
+/// live node on that store; clear the account's secrets afterwards using
+/// `removed.secret_tag`.
+#[uniffi::export]
+pub fn account_registry_remove(data_dir: String, pubkey: String) -> FfiResult<AccountRemovalInfo> {
+    let dir = Path::new(&data_dir);
+    let out = sonar_core::accounts::remove_account(dir, &pubkey)?;
+    Ok(AccountRemovalInfo {
+        removed: account_info(dir, &out.removed, None),
+        new_active: account_info(
+            dir,
+            &out.new_active,
+            Some(out.new_active.pubkey_hex.as_str()),
+        ),
+    })
+}
+
+/// After an nsec restore replaced the key behind `old_pubkey` in place: point
+/// the registry row at `new_pubkey`. Returns the row, or `None` when `old`
+/// was never registered (pre-registry install). Refuses a `new` that already
+/// has its own row.
+#[uniffi::export]
+pub fn account_registry_replace_pubkey(
+    data_dir: String,
+    old_pubkey: String,
+    new_pubkey: String,
+) -> FfiResult<Option<AccountInfo>> {
+    let dir = Path::new(&data_dir);
+    let entry = sonar_core::accounts::replace_pubkey(dir, &old_pubkey, &new_pubkey)?;
+    let reg = sonar_core::accounts::AccountRegistry::load(dir)?;
+    let active = reg.active().map(|a| a.pubkey_hex.clone());
+    Ok(entry.map(|e| account_info(dir, &e, active.as_deref())))
+}
+
+/// Host secret name for `base` under `secret_tag` (`base` or `base.tag`).
+#[uniffi::export]
+pub fn account_secret_key_name(base: String, secret_tag: String) -> String {
+    sonar_core::accounts::secret_key_name(&base, &secret_tag)
+}
+
+#[uniffi::export]
+pub fn account_registry_max_accounts() -> u32 {
+    sonar_core::accounts::MAX_ACCOUNTS as u32
+}
+
 /// Result of uploading an encrypted account backup to Blossom.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AccountBackupUploadInfo {

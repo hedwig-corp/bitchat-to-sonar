@@ -21,6 +21,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -47,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.BackupFormat
 import chat.bitchat.sonar.Screen
+import chat.bitchat.sonar.SonarAccount
 import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarClock
@@ -88,6 +92,21 @@ import chat.bitchat.sonar.resources.replace_this_account_with_an_nsec_from
 import chat.bitchat.sonar.resources.restore_account
 import chat.bitchat.sonar.resources.restoring
 import chat.bitchat.sonar.resources.this_replaces_the_account_on_this_phone
+import chat.bitchat.sonar.resources.accounts
+import chat.bitchat.sonar.resources.add_account
+import chat.bitchat.sonar.resources.create_a_new_key_or_sign_in_with_an_nsec
+import chat.bitchat.sonar.resources.you_can_keep_up_to_accounts_on_this
+import chat.bitchat.sonar.resources.only_the_selected_account_is_online
+import chat.bitchat.sonar.resources.switch_account
+import chat.bitchat.sonar.resources.this_removes_from_this_phone_its_chats
+import chat.bitchat.sonar.resources.removing
+import chat.bitchat.sonar.resources.remove_from_this_phone
+import chat.bitchat.sonar.resources.your_current_account_stays_on_this
+import chat.bitchat.sonar.resources.label_optional_e_g_work
+import chat.bitchat.sonar.resources.adding
+import chat.bitchat.sonar.resources.create_new_account
+import chat.bitchat.sonar.resources.or_sign_in_with_an_existing_key
+import chat.bitchat.sonar.resources.sign_in_with_this_key
 import kotlinx.coroutines.delay
 import org.jetbrains.compose.resources.stringResource
 
@@ -106,6 +125,8 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var eraseAsk by remember { mutableStateOf(false) }
     var exportKey by remember { mutableStateOf(false) }
     var restoreKey by remember { mutableStateOf(false) }
+    var addAccount by remember { mutableStateOf(false) }
+    var accountAction by remember { mutableStateOf<SonarAccount?>(null) }
     var currencyPick by remember { mutableStateOf(false) }
     var notif by remember { mutableStateOf(false) }
     var appicon by remember { mutableStateOf(false) }
@@ -116,6 +137,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var transcriptPolicyHost by remember { mutableStateOf(false) }
     state.prefsVersion // subscribe so toggles recompose
     LaunchedEffect(Unit) {
+        state.refreshAccounts()
         state.refreshBackupPolicy()
         state.refreshStorageBytes()
     }
@@ -148,6 +170,35 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     )
                 }
                 SNIcon(SNIconName.Chevron, 15.dp, s.text3, weight = 2.2f)
+            }
+
+            // Accounts (switcher): every account on this phone, the active one
+            // checked. Tap an inactive row for Switch / Remove; the last row adds.
+            // Mirror of iOS SonarSettingsScreen.accountsSection.
+            if (state.accounts.isNotEmpty()) {
+                SNSectionLabel(stringResource(Res.string.accounts))
+                SNSettingsCard {
+                    state.accounts.forEach { account ->
+                        SNSettingsRow(
+                            icon = SNIconName.Key,
+                            tone = if (account.isActive) SNTone.Cyan else SNTone.Default,
+                            label = state.accountDisplayName(account),
+                            sub = account.shortNpub,
+                            trail = if (account.isActive) SNTrail.Check else SNTrail.Chevron,
+                        ) { if (!account.isActive) accountAction = account }
+                    }
+                    SNSettingsRow(
+                        icon = SNIconName.Plus, tone = SNTone.Cyan,
+                        label = stringResource(Res.string.add_account),
+                        sub = if (state.canAddAccount) {
+                            stringResource(Res.string.create_a_new_key_or_sign_in_with_an_nsec)
+                        } else {
+                            stringResource(Res.string.you_can_keep_up_to_accounts_on_this, state.maxAccounts.toString())
+                        },
+                        divider = false,
+                    ) { if (state.canAddAccount) addAccount = true }
+                }
+                StNote(stringResource(Res.string.only_the_selected_account_is_online))
             }
 
             SNSectionLabel("App")
@@ -370,6 +421,10 @@ fun SonarSettingsScreen(state: SonarAppState) {
     if (eraseAsk) EraseChatsSheet(onErase = { eraseAsk = false; state.eraseAllChats() }, onClose = { eraseAsk = false })
     if (exportKey) ExportKeySheet(state, onClose = { exportKey = false })
     if (restoreKey) RestoreAccountSheet(state, onClose = { restoreKey = false })
+    if (addAccount) AddAccountSheet(state, onClose = { addAccount = false })
+    accountAction?.let { account ->
+        AccountActionSheet(state, account, onClose = { accountAction = null })
+    }
     if (currencyPick) CurrencySheet(
         selected = state.currency,
         onPick = { state.selectCurrency(it); currencyPick = false },
@@ -664,7 +719,7 @@ private fun RestoreAccountSheet(state: SonarAppState, onClose: () -> Unit) {
                     } ?: onClose()
                 }
             }
-            SNGhostButton(stringResource(Res.string.cancel)) { onClose() }
+            SNGhostButton(stringResource(Res.string.cancel)) { if (!inFlight) onClose() }
         }
     }
 }
@@ -914,4 +969,206 @@ internal fun formatThousands(n: Long): String =
 internal fun shortKey(npub: String?): String {
     val k = npub ?: return "connecting…"
     return if (k.length > 20) k.take(14) + "…" + k.takeLast(6) else k
+}
+
+
+/**
+ * Home avatar long-press / Settings → Accounts: pick the account to go online
+ * as. Only the selected account is online; the others still get notifications.
+ * Mirror of the iOS home-avatar context menu.
+ */
+@Composable
+fun AccountSwitcherSheet(state: SonarAppState, onClose: () -> Unit, onAdd: () -> Unit) {
+    var inFlight by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) { state.refreshAccounts() }
+    Sheet(stringResource(Res.string.switch_account), onClose) {
+        SNSettingsCard {
+            state.accounts.forEach { account ->
+                SNSettingsRow(
+                    icon = SNIconName.Key,
+                    tone = if (account.isActive) SNTone.Cyan else SNTone.Default,
+                    label = state.accountDisplayName(account),
+                    sub = account.shortNpub,
+                    trail = if (account.isActive) SNTrail.Check else SNTrail.None,
+                ) {
+                    if (account.isActive || inFlight) return@SNSettingsRow
+                    inFlight = true
+                    error = null
+                    state.switchAccount(account.pubkeyHex) { result ->
+                        inFlight = false
+                        result.onSuccess { onClose() }
+                            .onFailure { error = it.message?.takeIf { m -> m.isNotBlank() } ?: it.toString() }
+                    }
+                }
+            }
+            SNSettingsRow(
+                icon = SNIconName.Plus, tone = SNTone.Cyan,
+                label = stringResource(Res.string.add_account),
+                divider = false,
+            ) { onClose(); onAdd() }
+        }
+        if (error != null) {
+            Text(
+                error!!, color = sonar.danger, fontSize = 13.sp, lineHeight = 17.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+        Column(Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp)) {
+            SNGhostButton(stringResource(Res.string.cancel)) { if (!inFlight) onClose() }
+        }
+    }
+}
+
+/** Tap on an inactive account row: switch to it, or remove it from this phone. */
+@Composable
+private fun AccountActionSheet(state: SonarAppState, account: SonarAccount, onClose: () -> Unit) {
+    var inFlight by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var confirmRemove by remember { mutableStateOf(false) }
+    Sheet(state.accountDisplayName(account), onClose) {
+        if (confirmRemove) {
+            SheetCopy(stringResource(Res.string.this_removes_from_this_phone_its_chats, state.accountDisplayName(account)))
+        } else {
+            SheetCopy(account.npub)
+        }
+        if (error != null) {
+            Text(
+                error!!, color = sonar.danger, fontSize = 13.sp, lineHeight = 17.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+        Column(
+            Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (confirmRemove) {
+                DangerPrimaryButton(
+                    if (inFlight) stringResource(Res.string.removing) else stringResource(Res.string.remove_from_this_phone),
+                ) {
+                    if (inFlight) return@DangerPrimaryButton
+                    inFlight = true
+                    error = null
+                    state.removeAccount(account.pubkeyHex) { result ->
+                        inFlight = false
+                        result.onSuccess { onClose() }.onFailure { error = it.message?.takeIf { m -> m.isNotBlank() } ?: it.toString() }
+                    }
+                }
+            } else {
+                SNPrimaryButton(stringResource(Res.string.switch_account), disabled = inFlight) {
+                    inFlight = true
+                    error = null
+                    state.switchAccount(account.pubkeyHex) { result ->
+                        inFlight = false
+                        result.onSuccess { onClose() }.onFailure { error = it.message?.takeIf { m -> m.isNotBlank() } ?: it.toString() }
+                    }
+                }
+                SNGhostButton(stringResource(Res.string.remove_from_this_phone)) { confirmRemove = true }
+            }
+            SNGhostButton(stringResource(Res.string.cancel)) { if (!inFlight) onClose() }
+        }
+    }
+}
+
+/** Settings → Accounts → Add account: a fresh key, or sign in with an existing
+ *  `nsec1…`. The current account keeps everything. Mirror of iOS
+ *  SNAddAccountSheetContent. */
+@Composable
+private fun AddAccountSheet(state: SonarAppState, onClose: () -> Unit) {
+    val s = sonar
+    val clipboard = LocalClipboardManager.current
+    var nsec by remember { mutableStateOf("") }
+    var label by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var inFlight by remember { mutableStateOf(false) }
+    val nsecOk = nsec.trim().matches(Regex("^nsec1[0-9a-z]{20,}$"))
+    fun add(key: String?) {
+        if (inFlight) return
+        inFlight = true
+        error = null
+        state.addAccount(key, label.trim().takeIf { it.isNotEmpty() }) { result ->
+            inFlight = false
+            result.onSuccess { onClose() }.onFailure { error = it.message?.takeIf { m -> m.isNotBlank() } ?: it.toString() }
+        }
+    }
+    Sheet(stringResource(Res.string.add_account), onClose) {
+        SheetCopy(stringResource(Res.string.your_current_account_stays_on_this))
+        Box(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp)
+                .clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                .padding(horizontal = 15.dp, vertical = 12.dp),
+        ) {
+            if (label.isEmpty()) {
+                Text(stringResource(Res.string.label_optional_e_g_work), color = s.text3, fontSize = 15.sp)
+            }
+            BasicTextField(
+                value = label,
+                onValueChange = { label = it },
+                singleLine = true,
+                textStyle = TextStyle(color = s.text, fontSize = 15.sp),
+                cursorBrush = SolidColor(s.accent),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Column(Modifier.padding(start = 8.dp, end = 8.dp, top = 10.dp)) {
+            SNPrimaryButton(
+                if (inFlight) stringResource(Res.string.adding) else stringResource(Res.string.create_new_account),
+                disabled = inFlight,
+            ) { add(null) }
+        }
+        Text(
+            stringResource(Res.string.or_sign_in_with_an_existing_key),
+            color = s.text3, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        )
+        Box(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp).heightIn(min = 84.dp)
+                .clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                .padding(horizontal = 15.dp, vertical = 14.dp),
+        ) {
+            if (nsec.isEmpty()) {
+                Text("nsec1...", color = s.text3, fontSize = 15.sp)
+            }
+            // A signing secret: password keyboard (no autocorrect, no IME
+            // learning), masked by default. Paste still works.
+            BasicTextField(
+                value = nsec,
+                onValueChange = { nsec = it },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false),
+                visualTransformation = PasswordVisualTransformation(),
+                textStyle = TextStyle(color = s.text, fontSize = 15.sp, lineHeight = 20.sp),
+                cursorBrush = SolidColor(s.accent),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Row(
+            Modifier.padding(horizontal = 8.dp).clip(CircleShape).background(s.accentSoft)
+                .clickable { clipboard.getText()?.text?.let { nsec = it.trim() } }
+                .padding(horizontal = 14.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SNXIcon(SNXIconName.Copy, 16.dp, s.accentDeep, weight = 2f)
+            Spacer(Modifier.width(7.dp))
+            Text(stringResource(Res.string.paste_from_clipboard), color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        }
+        if (error != null) {
+            Text(
+                error!!, color = s.danger, fontSize = 13.sp, lineHeight = 17.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+        Column(
+            Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            SNPrimaryButton(
+                if (inFlight) stringResource(Res.string.adding) else stringResource(Res.string.sign_in_with_this_key),
+                disabled = !nsecOk || inFlight,
+            ) { add(nsec.trim()) }
+            SNGhostButton(stringResource(Res.string.cancel)) { if (!inFlight) onClose() }
+        }
+    }
 }

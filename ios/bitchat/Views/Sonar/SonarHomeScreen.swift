@@ -193,6 +193,27 @@ struct SonarHomeScreen: View {
             SNIconButton(Text("Settings"), action: { store.push(.settings) }) {
                 SonarAvatar(name: store.nick.isEmpty ? "you" : store.nick, size: 32)
             }
+            // Long-press: the account switcher (Telegram-style), only once a
+            // second account exists so single-account installs see no change.
+            .contextMenu {
+                if store.accounts.count > 1 {
+                    ForEach(store.accounts) { account in
+                        Button {
+                            store.switchAccountFromUI(account.pubkeyHex)
+                        } label: {
+                            Label(
+                                store.displayName(for: account),
+                                systemImage: account.isActive ? "checkmark.circle.fill" : "person.circle"
+                            )
+                        }
+                        .disabled(account.isActive)
+                    }
+                    Divider()
+                    Button { store.push(.settings) } label: {
+                        Label(String(localized: "Add account"), systemImage: "plus")
+                    }
+                }
+            }
             Text("sonar")
                 .font(SonarTheme.uiFont(size: 27, weight: .heavy))
                 .kerning(-27 * 0.02)
