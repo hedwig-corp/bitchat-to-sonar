@@ -129,6 +129,13 @@ data class PaymentStatus(
      * again` pays it. Null for every other state.
      */
     val feeChangedSats: Long? = null,
+    /**
+     * A [PayPhase.FailedSafe] payment the wallet refused because the amount
+     * plus its fee exceeds the balance: the wallet's sentence, with the
+     * figures. The screen states it instead of "No route", which blames the
+     * payee for a shortfall that is the user's. Null for every other state.
+     */
+    val insufficientFundsText: String? = null,
 )
 
 /** One action button in the status card (paystatus.jsx `acts`). */
@@ -326,6 +333,8 @@ fun paymentStatusOf(
     canRetry: Boolean,
     /** The new fee when the wallet refused this send because the fee rose. */
     feeChangedSats: Long? = null,
+    /** The wallet's shortfall sentence when it refused this send for its total. */
+    insufficientFundsText: String? = null,
 ): PaymentStatus {
     if (live != null && activity.status == SonarPaymentActivity.Status.Pending) {
         return PaymentStatus(
@@ -352,9 +361,10 @@ fun paymentStatusOf(
         elapsedSecs = (reference - activity.createdAtSecs).coerceAtLeast(0L).toInt(),
         preimage = activity.preimage,
         canRetry = canRetry,
-        // Only a concluded failure is "the fee changed"; a row that later
-        // settled (or is still pending) says what it is.
+        // Only a concluded failure is "the fee changed" or "short of funds"; a
+        // row that later settled (or is still pending) says what it is.
         feeChangedSats = feeChangedSats.takeIf { phase == PayPhase.FailedSafe },
+        insufficientFundsText = insufficientFundsText.takeIf { phase == PayPhase.FailedSafe },
     )
 }
 

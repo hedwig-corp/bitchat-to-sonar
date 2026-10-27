@@ -217,6 +217,28 @@ final class SonarPaymentStatusTests: XCTestCase {
         )
     }
 
+    /// A send refused for its total states the wallet's shortfall sentence
+    /// where "No route" would be — again only on a concluded failure (Compose
+    /// `aShortfallIsStatedOnlyOnAFailedPayment`).
+    func testAShortfallIsStatedOnlyOnAFailedPayment() {
+        let shortfall = "Amount plus fee (500 + 40 sats) exceeds your balance of 520 sats."
+        let failed = snPaymentStatus(
+            activity: activity(.failed), live: nil, now: Date(), canRetry: true, insufficientFundsText: shortfall
+        )
+        XCTAssertEqual(failed.phase, .failedSafe)
+        XCTAssertEqual(failed.insufficientFundsText, shortfall)
+        XCTAssertEqual(SNPayStatusCopy.hint(for: failed), shortfall)
+
+        let paid = snPaymentStatus(
+            activity: activity(.paid), live: nil, now: Date(), canRetry: true, insufficientFundsText: shortfall
+        )
+        XCTAssertNil(paid.insufficientFundsText)
+        let inFlight = snPaymentStatus(
+            activity: activity(.pending), live: liveSend(), now: Date(), canRetry: true, insufficientFundsText: shortfall
+        )
+        XCTAssertNil(inFlight.insufficientFundsText)
+    }
+
     // MARK: Home strip
 
     func testOnlyLivePhasesEverReachTheHomeStrip() {

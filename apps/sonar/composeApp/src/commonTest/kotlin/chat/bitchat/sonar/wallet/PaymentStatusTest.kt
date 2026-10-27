@@ -139,6 +139,33 @@ class PaymentStatusTest {
         )
     }
 
+    /**
+     * A send refused for its total carries the wallet's shortfall sentence, so
+     * the screen states it instead of "No route" — again only on a concluded
+     * failure.
+     */
+    @Test
+    fun aShortfallIsStatedOnlyOnAFailedPayment() {
+        val shortfall = "Amount plus fee (500 + 40 sats) exceeds your balance of 520 sats."
+        val failed = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Failed, settledAtSecs = 1_010),
+            live = null, nowSecs = 2_000, canRetry = true, insufficientFundsText = shortfall,
+        )
+        assertEquals(PayPhase.FailedSafe, failed.phase)
+        assertEquals(shortfall, failed.insufficientFundsText)
+
+        val paid = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Paid, settledAtSecs = 1_004),
+            live = null, nowSecs = 2_000, canRetry = true, insufficientFundsText = shortfall,
+        )
+        assertNull(paid.insufficientFundsText)
+        val inFlight = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Pending), live(), nowSecs = 1_001, canRetry = true,
+            insufficientFundsText = shortfall,
+        )
+        assertNull(inFlight.insufficientFundsText)
+    }
+
     @Test
     fun aPendingRowWithNoLiveSendIsUnknownNotFailed() {
         // The process died mid-send. We genuinely cannot say the payment

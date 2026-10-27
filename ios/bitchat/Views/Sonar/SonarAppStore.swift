@@ -1471,6 +1471,10 @@ final class SonarAppStore: ObservableObject {
     /// one the user agreed to, with the NEW fee. The status screen states it,
     /// and `Try again` — tapped after reading it — sends with it as the ceiling.
     private var paymentFeeChanged: [String: Int64] = [:]
+    /// External payments the wallet refused because the amount plus its fee
+    /// exceeds the balance, with the wallet's sentence and its figures. The
+    /// status screen states it where "No route" would be.
+    private var paymentShortfalls: [String: String] = [:]
     /// The Unify send whose sheet is waiting on a pending outcome.
     private var unifyPendingActivity: (peerId: String, activityId: String, sats: Int64)?
     /// Invalidates in-flight toast dismissals when a newer toast is shown.
@@ -10137,6 +10141,9 @@ final class SonarAppStore: ObservableObject {
                 if case .feeChanged(let fee) = error as? CashuWalletError {
                     self.paymentFeeChanged[activityId] = fee
                 }
+                if case .insufficientFunds = error as? CashuWalletError {
+                    self.paymentShortfalls[activityId] = error.localizedDescription
+                }
                 self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 SecureLogger.error("Sonar destination payment failed: \(error)", category: .session)
                 // The status screen states the failure in full, and the home
@@ -10221,7 +10228,8 @@ final class SonarAppStore: ObservableObject {
             live: livePayments[activityId],
             now: Date(),
             canRetry: paymentDestinations[activityId] != nil,
-            feeChangedSats: paymentFeeChanged[activityId]
+            feeChangedSats: paymentFeeChanged[activityId],
+            insufficientFundsText: paymentShortfalls[activityId]
         )
     }
 
@@ -10270,6 +10278,7 @@ final class SonarAppStore: ObservableObject {
         paymentFeeFromAmount = []
         paymentFeeCeilings = [:]
         paymentFeeChanged = [:]
+        paymentShortfalls = [:]
         cancelledPayments = []
         unifyPendingActivity = nil
     }

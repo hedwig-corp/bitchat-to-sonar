@@ -1457,7 +1457,8 @@ real mint and need the maintainer's approval of the amounts.
 - **Expect:** the quote's `fees_sats` is the reserve PLUS about one sat per
   proof spent, and `affordable` is false; the app's fee line says the same
   "up to N", and Send is refused up front with "Amount plus fee exceeds your
-  balance" and the real figures. Nothing is sent: the mint has the UNPAID
+  balance" and the real figures, on the payment status screen too (never "No
+  route to …", which blames the payee). Nothing is sent: the mint has the UNPAID
   quote and no melt request, the balance is unchanged and nothing reads as
   pending. Max pays the largest amount the fees allow. A send that fits pays
   once, and the mint's fee check passes (it refuses a melt that underpays).
@@ -1480,6 +1481,8 @@ real mint and need the maintainer's approval of the amounts.
   `a_melt_costing_more_than_the_agreed_fee_is_refused_before_confirm`;
   app side `CashuWalletEngineTest.theWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`,
   `CashuWalletServiceTests.testTheWholeFeeNotJustTheReserveIsCheckedAgainstTheBalance`.
+  Status screen: `WalletAppStateTest.aDestinationPaymentShortOfItsFeeStatesTheShortfallOnTheStatusScreen`,
+  `CashuWalletServiceTests.testADestinationPaymentShortOfItsFeeStatesTheShortfallOnTheStatusScreen`.
   Max: `CashuWalletEngineTest.maxStillPaysWhenTheReducedAmountQuotesAHigherFee`,
   `CashuWalletServiceTests.testMaxStillPaysWhenTheReducedAmountQuotesAHigherFee`;
   the price it can reach: `an_amount_a_direct_melt_of_every_proof_covers_is_affordable`.
@@ -1495,7 +1498,10 @@ real mint and need the maintainer's approval of the amounts.
   the same one-step Max paid. Fixed in #666: both apps step Max down by
   the overshoot (at most 3 quotes), and the core prices an amount CDK
   cannot fund as a direct melt of every proof, the cheapest way to spend
-  them all, instead of refusing it.
+  them all, instead of refusing it. #666 iOS app QA, 2026-10-27 (980 sats on
+  1,005): nothing was spent, but the status screen read "No route to … right
+  now" — both apps' copy table had one line for every safe failure. Fixed in
+  #666: a refusal for its total states the wallet's shortfall sentence.
 
 ### QA-166 — A quote that expires before it is sent is re-quoted, never orphaned
 - **Platforms:** both (one Rust core; iOS on the fake mint through

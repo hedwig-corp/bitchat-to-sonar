@@ -93,6 +93,11 @@ struct SNPaymentStatus: Equatable, Identifiable {
     /// states it instead of "No route" — the user must read it before `Try
     /// again` pays it. nil for every other state.
     var feeChangedSats: Int64? = nil
+    /// A `.failedSafe` payment the wallet refused because the amount plus its
+    /// fee exceeds the balance: the wallet's sentence, with the figures. The
+    /// screen states it instead of "No route", which blames the payee for a
+    /// shortfall that is the user's. nil for every other state.
+    var insufficientFundsText: String? = nil
 }
 
 /// An external payment this process is sending right now.
@@ -189,13 +194,17 @@ enum SNPayStatusCopy {
         }
     }
 
-    /// The `.rs-hint` line for `status`. Deviation from the design's copy
+    /// The `.rs-hint` line for `status`. Deviations from the design's copy
     /// table: a send refused because the network fee rose states the NEW fee
     /// instead of "No route" — `Try again` pays it, so the user must read it
-    /// first. Mirrors the Compose status screen.
+    /// first — and one refused for its total states the shortfall with its
+    /// figures. Mirrors the Compose status screen.
     static func hint(for status: SNPaymentStatus) -> String {
         if let fee = status.feeChangedSats {
             return CashuWalletError.feeChangedMessage(feeSats: fee)
+        }
+        if let shortfall = status.insufficientFundsText {
+            return shortfall
         }
         return hint(status.phase, payee: status.payeeName, sats: status.sats)
     }
@@ -357,7 +366,9 @@ func snPaymentStatus(
     now: Date,
     canRetry: Bool,
     /// The new fee when the wallet refused this send because the fee rose.
-    feeChangedSats: Int64? = nil
+    feeChangedSats: Int64? = nil,
+    /// The wallet's shortfall sentence when it refused this send for its total.
+    insufficientFundsText: String? = nil
 ) -> SNPaymentStatus {
     if let live, activity.status == .pending {
         return SNPaymentStatus(
@@ -385,9 +396,10 @@ func snPaymentStatus(
         elapsedSeconds: Int(max(0, reference.timeIntervalSince(activity.createdAt))),
         preimage: activity.preimage,
         canRetry: canRetry,
-        // Only a concluded failure is "the fee changed"; a row that later
-        // settled (or is still pending) says what it is.
-        feeChangedSats: phase == .failedSafe ? feeChangedSats : nil
+        // Only a concluded failure is "the fee changed" or "short of funds"; a
+        // row that later settled (or is still pending) says what it is.
+        feeChangedSats: phase == .failedSafe ? feeChangedSats : nil,
+        insufficientFundsText: phase == .failedSafe ? insufficientFundsText : nil
     )
 }
 
