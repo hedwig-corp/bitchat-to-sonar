@@ -140,6 +140,137 @@ is the build under test on a dedicated QA emulator/simulator.
   to equal its own counter, so one lost frame rejected every later message
   until a re-handshake; the reference clients use a 1024-entry sliding window.
 
+## Cross-client Bluetooth mesh (#671)
+
+The codec half of mesh interop is proved in CI: `scripts/bitchat-vectors/cross-replay.sh`
+feeds every vector of both reference clients through four codecs (stock
+bitchat iOS, stock bitchat-android, Sonar iOS, Sonar Android) and fails on any
+difference not in `core/bitchat-protocol/vectors/cross/ledger.json`. It does
+not prove that two phones talk: no vector runs a live Noise handshake, BLE
+fragmentation timing or a relay hop. This section is that check.
+
+**Needs physical phones.** Emulators and simulators have no usable BLE mesh.
+At least three phones: two for the pair under test, one as the relay in
+QA-185. Builds:
+
+| Label | Build |
+|---|---|
+| SI | Sonar iOS from the branch under test |
+| SA | Sonar Android from the branch under test |
+| BI | stock bitchat iOS from the App Store |
+| BI+ | stock bitchat iOS built from permissionlesstech/bitchat#1805 |
+| BA | stock bitchat-android from the Play Store or its latest GitHub release |
+
+Run QA-180 to QA-186, plus QA-164, QA-165 and QA-166, in both directions for
+every pair below, and note the exact app versions in the report:
+
+| Pair | Expected |
+|---|---|
+| SI ↔ SA | everything passes |
+| SA ↔ BA | everything passes |
+| SA ↔ BI | everything passes |
+| SI ↔ BA | everything passes |
+| SI ↔ BI | everything passes |
+| BI ↔ BA | known failure: QA-182 from BA to BI drops some messages (stock iOS bug) |
+| BI+ ↔ BA | everything passes: this is the #1805 fix on real devices |
+
+A failure in any other cell is a bug: reproduce it, add a vector for the
+shape if the codec is at fault, and extend the scenario here.
+
+### QA-180 — Each client discovers the other
+- **Platforms:** every pair in the matrix above.
+- **Steps:** with both phones in Bluetooth range and both apps open, set a
+  distinct nickname on each side and wait 30 s.
+- **Expect:** each phone lists the other with its nickname within 30 s,
+  and the entry stays while both are in range. Between two Sonars, the
+  later scenarios behave as Sonar-to-Sonar (QA-165: one long message, a
+  real reply), which shows the `0x53` announce verified.
+- **How:** manual · Guard: `cross-replay.sh` announce and capability ops,
+  `vectors.rs::bitchat_ios_vectors`, `vectors.rs::bitchat_android_vectors`
+- **Origin:** #671. Discovery was never exercised across all four clients
+  on hardware.
+
+### QA-181 — A short public message arrives
+- **Platforms:** every pair.
+- **Steps:** send a public message under 100 characters, for example `hello
+  from <label>`, from each side.
+- **Expect:** it arrives once, with the right sender, within a few seconds.
+  It travels uncompressed, so this is the baseline for QA-182.
+- **How:** manual · Guard: `vectors.rs::bitchat_ios_vectors`, `vectors.rs::bitchat_android_vectors`
+- **Origin:** #671.
+
+### QA-182 — A long, repetitive public message arrives
+- **Platforms:** every pair.
+- **Steps:** paste this exact 300-character message into a public chat and
+  send it from each side. It is compressed and signed, and the two
+  reference compressors emit different bytes for it:
+  ```bash
+  python3 -c "print((('A' + 'B' * 33) * 9)[:300])"
+  ```
+- **Expect:** it arrives once on every pair except BA → BI, where stock
+  iOS drops it as unverified. BA → BI+ must deliver it. SA and SI → BI must
+  deliver it too, because Sonar compresses exactly like Apple.
+- **How:** manual · Guard: `vectors.rs::bitchat_android_vectors` (case
+  `10_v1_300_a_b33_sig22`), `BinaryProtocolWirePayloadTests.stockAndroidFrameKeepsTheAndroidSigningPreimage`
+  in #1805
+- **Origin:** #671. Stock iOS rebuilds the signing preimage by
+  re-compressing with zlib level 5; Android signs a level-6 stream.
+  QA-164 is the same shape with a looser payload.
+
+### QA-183 — A private message opens a Noise session both ways
+- **Platforms:** every pair.
+- **Steps:** with no earlier DM between the two, open a private chat from
+  one side and send `ping`; reply `pong` from the other; then send five
+  more messages each way.
+- **Expect:** all twelve messages arrive in order as private messages, and
+  neither app shows an error or asks to retry.
+- **How:** manual · Guard: `noise.rs::handshake_then_framed_bidirectional_transport`
+  (Sonar against itself; no vector covers a live handshake with a stock
+  client)
+- **Origin:** #671. Noise payload framing is cross-checked; the handshake
+  between different clients is not.
+
+### QA-184 — A message larger than one Bluetooth packet arrives whole
+- **Platforms:** every pair.
+- **Steps:** send this random 1,600-character text, which cannot be
+  compressed and so must be split into fragments, publicly and then as a
+  DM:
+  ```bash
+  head -c 1200 /dev/urandom | base64 | tr -d '\n'
+  ```
+- **Expect:** each arrives once, complete and identical to what was sent;
+  no partial message, no duplicate.
+- **How:** manual · Guard: `cross-replay.sh` fragment ops
+- **Origin:** #671. Fragment layout is cross-checked; reassembly timing
+  across clients is not.
+
+### QA-185 — A relayed signed message still verifies
+- **Platforms:** chains A → B → C where A and C are out of each other's
+  range and B is in range of both. Run at least SA → BI → SI,
+  SI → BA → SA, BA → SA → BI+ and BA → SI → BI.
+- **Steps:** send QA-181's and QA-182's messages publicly from A.
+- **Expect:** C receives both, attributed to A, and does not mark them
+  unverified. Through a Sonar relay, a BA message reaching BI still fails
+  QA-182, because the relay forwards Android's original bytes; the same
+  message reaching BI+ arrives.
+- **How:** manual · Guard: `signing.rs::compressed_payload_verifies_from_wire_bytes_not_a_recompression`
+- **Origin:** #671. A relay that re-compressed would break every signed
+  frame from a different compressor.
+
+### QA-186 — A file reaches a stock client
+- **Platforms:** SA and SI → BA and BI; SI ↔ SA.
+- **Steps:** send a small photo in a DM from Sonar to the other client.
+- **Expect:** the stock client shows the photo with its name. Between two
+  Sonars it also arrives, with the delivery receipt. A stock client never
+  drops the file over Sonar's extra file tag, which Sonar sends only to
+  peers it has verified as Sonar.
+- **How:** manual · Guard: `mesh_engine.rs::media_goes_encrypted_once_the_peer_proved_private_media`
+  (no message-id tag without a verified `0x53`),
+  `mesh_engine.rs::media_falls_back_to_signed_plaintext_without_a_proof`,
+  `mesh_engine.rs::recipient_delivery_receipt_round_trips_for_text_and_media`
+- **Origin:** #671. bitchat-android builds before its #826 drop a file with
+  an unknown TLV (SPEC §8.3).
+
 ## Media
 
 ### QA-010 — Send a photo
