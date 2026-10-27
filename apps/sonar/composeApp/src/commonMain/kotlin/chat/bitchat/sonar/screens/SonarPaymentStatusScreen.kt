@@ -215,12 +215,14 @@ private fun StatusCard(
             )
         }
 
-        // .rs-hint. Deviation from the design's copy table: a send refused
+        // .rs-hint. Deviations from the design's copy table: a send refused
         // because the network fee rose states the NEW fee instead of "No
-        // route" — `Try again` below pays it, so the user must read it first.
+        // route" — `Try again` below pays it, so the user must read it first —
+        // and one refused for its total states the shortfall with its figures.
         Text(
             status.feeChangedSats
                 ?.let { stringResource(Res.string.the_network_fee_is_now_up_to_nothing, feeLineAmount(it)) }
+                ?: status.insufficientFundsText
                 ?: PayStatusCopy.hint(status.phase, status.payeeName, status.sats),
             color = s.text2, fontSize = 12.5.sp, lineHeight = 19.sp,
             modifier = Modifier.padding(top = 12.dp),

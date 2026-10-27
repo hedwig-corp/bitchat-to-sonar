@@ -3634,6 +3634,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val paymentFeeChanged = mutableMapOf<String, Long>()
 
     /**
+     * Payments the wallet refused because the amount plus its fee exceeds the
+     * balance, with the wallet's sentence and its figures. The status screen
+     * states it where "No route" would be.
+     */
+    private val paymentShortfalls = mutableMapOf<String, String>()
+
+    /**
      * Starts paying an arbitrary Lightning destination from the send-payment
      * picker. Returns the activity id to open the status screen on, or null
      * when the destination was refused before anything was sent (the reason is
@@ -3732,6 +3739,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     result.quotedFeeSats?.let { paymentFeeChanged[payId] = it }
                 }
                 failureMessage = failureMessage ?: sendErrorText(result)
+                if (result.errorKind == SendErrorKind.InsufficientFunds) {
+                    failureMessage?.let { paymentShortfalls[payId] = it }
+                }
                 // The status screen states the failure in full, and the home
                 // strip clears on a terminal state — so without this a user who
                 // walked away from the screen would never learn it failed.
@@ -3793,6 +3803,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             nowSecs = SonarClock.nowSecs(),
             canRetry = paymentDestinations.containsKey(activityId),
             feeChangedSats = paymentFeeChanged[activityId],
+            insufficientFundsText = paymentShortfalls[activityId],
         )
     }
 
@@ -3839,6 +3850,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         paymentFeeFromAmount.clear()
         paymentFeeCeilings.clear()
         paymentFeeChanged.clear()
+        paymentShortfalls.clear()
         cancelledPayments.clear()
     }
 

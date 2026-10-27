@@ -576,6 +576,41 @@ final class CashuWalletServiceTests: XCTestCase {
         await service.releaseQuietly()
     }
 
+    /// QA-165 on the status screen, through the REAL store call sites: 500
+    /// sats plus a 40-sat fee on a 520-sat balance is refused before anything
+    /// is sent, and the screen states the shortfall with its figures, not "No
+    /// route", which blames the payee (Compose
+    /// `aDestinationPaymentShortOfItsFeeStatesTheShortfallOnTheStatusScreen`).
+    func testADestinationPaymentShortOfItsFeeStatesTheShortfallOnTheStatusScreen() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 520
+        native.feeReserve = 40
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        let wallet = CashuWallet(keychain: MockKeychain(), service: service)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online && service.balance?.isLive == true }
+        let (store, cleanup) = makeIsolatedSonarAppStore(wallet: wallet)
+        defer { cleanup() }
+
+        let id = try XCTUnwrap(store.beginDestinationPayment("lno1destination", sats: 500, displayName: "Dest", maxFeeSats: 40))
+        await waitUntil { store.paymentActivityLedger.entries[id]?.status == .failed }
+        XCTAssertEqual(native.count("send"), 0, "nothing is sent")
+        let shortfall = SonarSpendableBalance.insufficientMessage(amountSats: 500, feeSats: 40, balanceSats: 520)
+        XCTAssertEqual(store.paymentActivityLedger.entries[id]?.failure, shortfall)
+        let status = try XCTUnwrap(store.paymentStatus(id))
+        XCTAssertEqual(status.phase, .failedSafe)
+        XCTAssertEqual(status.insufficientFundsText, shortfall)
+        XCTAssertNil(status.feeChangedSats)
+        XCTAssertEqual(SNPayStatusCopy.hint(for: status), shortfall, "the status screen states the shortfall")
+
+        // A send that then fits pays, and its row carries no shortfall.
+        native.confirmedSats = 10_000
+        let retry = try XCTUnwrap(store.retryDestinationPayment(id))
+        await waitUntil { store.paymentActivityLedger.entries[retry]?.status == .paid }
+        XCTAssertNil(store.paymentStatus(retry)?.insufficientFundsText)
+        await service.releaseQuietly()
+    }
+
     /// A fee-inclusive `Max` refused for its fee stays a `Max` on `Try again`
     /// (else it could never fit the balance).
     func testTryAgainAfterAFeeChangeKeepsAMaxSendAMaxSend() async throws {

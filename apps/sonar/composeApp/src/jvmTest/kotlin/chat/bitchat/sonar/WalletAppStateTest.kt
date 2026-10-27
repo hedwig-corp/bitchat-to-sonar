@@ -257,6 +257,36 @@ class WalletAppStateTest {
         assertNull(s.paymentStatus(retry2)!!.feeChangedSats)
     }
 
+    /**
+     * QA-165 on the status screen: 500 sats plus a 40-sat fee on a 520-sat
+     * balance is refused before anything is sent, and the screen states the
+     * shortfall with its figures, not "No route", which blames the payee.
+     */
+    @Test
+    fun aDestinationPaymentShortOfItsFeeStatesTheShortfallOnTheStatusScreen() = runBlocking {
+        native.confirmedSats = 520
+        native.feeReserveSats = 40
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+
+        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 500, "Dest", maxFeeSats = 40))
+        waitUntil("refused") { PaymentActivityStore.get(id)?.status == SonarPaymentActivity.Status.Failed }
+        assertEquals(0, native.count("send"), "nothing is sent")
+        val shortfall = "Amount plus fee (500 + 40 sats) exceeds your balance of 520 sats."
+        assertEquals(shortfall, PaymentActivityStore.get(id)!!.failure)
+        val status = assertNotNull(s.paymentStatus(id))
+        assertEquals(chat.bitchat.sonar.wallet.PayPhase.FailedSafe, status.phase)
+        assertEquals(shortfall, status.insufficientFundsText, "the status screen states the shortfall")
+        assertNull(status.feeChangedSats)
+
+        // A send that then fits pays, and its row carries no shortfall.
+        native.confirmedSats = 10_000
+        val retry = assertNotNull(s.retryDestinationPayment(id))
+        waitUntil("paid") { PaymentActivityStore.get(retry)?.status == SonarPaymentActivity.Status.Paid }
+        assertNull(s.paymentStatus(retry)!!.insufficientFundsText)
+    }
+
     /** A fee-inclusive `Max` refused for its fee stays a `Max` on `Try again` (else it could never fit). */
     @Test
     fun tryAgainAfterAFeeChangeKeepsAMaxSendAMaxSend() = runBlocking {
