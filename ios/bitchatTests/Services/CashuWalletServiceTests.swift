@@ -602,6 +602,40 @@ final class CashuWalletServiceTests: XCTestCase {
         await service.releaseQuietly()
     }
 
+    /// An invoice with no amount is paid with the amount typed on the sheet:
+    /// the Cashu wallet quotes it as an amountless melt, and `Max` works on
+    /// it too (QA-165's Max step). Only the old wallet refuses one — Breez
+    /// cannot set an invoice's amount. Mirrors Compose
+    /// `WalletAppStateTest.anAmountlessInvoiceIsPaidWithTheTypedAmount`.
+    func testAnAmountlessInvoiceIsPaidWithTheTypedAmount() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 9
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        let wallet = CashuWallet(keychain: MockKeychain(), service: service)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online && service.balance?.isLive == true }
+        let (store, cleanup) = makeIsolatedSonarAppStore(wallet: wallet)
+        defer { cleanup() }
+        let invoice = "lnbc1pamountlessinvoice"
+
+        let id = try XCTUnwrap(store.beginDestinationPayment(invoice, sats: 700, displayName: "Invoice", maxFeeSats: 9))
+        await waitUntil { store.paymentActivityLedger.entries[id]?.status == .paid }
+        XCTAssertEqual(native.preparedAmounts, [700])
+        XCTAssertEqual(native.sentPrepared.map(\.amountSats), [700])
+
+        let max = try XCTUnwrap(store.beginDestinationPayment(
+            invoice, sats: 10_000, displayName: "Invoice", maxFeeSats: 9, feeFromAmount: true
+        ))
+        await waitUntil { store.paymentActivityLedger.entries[max]?.status == .paid }
+        XCTAssertEqual(native.sentPrepared.map(\.amountSats), [700, 9_991], "Max takes the fee out of the balance")
+
+        XCTAssertNil(store.beginDestinationPayment(invoice, sats: 700, displayName: "Invoice", maxFeeSats: nil, source: .legacy))
+        XCTAssertEqual(store.toast, SonarAppStore.amountlessInvoiceMessage)
+        XCTAssertEqual(native.sentPrepared.count, 2, "the old wallet is refused before anything is sent")
+        await service.releaseQuietly()
+    }
+
     // MARK: Unify nearby sends
 
     /// A store whose Cashu wallet is ready, and a Unify receiver serving `uri`.
@@ -679,9 +713,8 @@ final class CashuWalletServiceTests: XCTestCase {
     }
 
     /// What the Unify sheet shows for a request: a BOLT11 invoice speaks for
-    /// its own amount (the URI's `amount` does not override it), an
-    /// amountless invoice is refused before any keypad, and an offer takes
-    /// the URI's amount or asks for one.
+    /// its own amount (the URI's `amount` does not override it); an
+    /// amountless invoice and an offer take the URI's amount or ask for one.
     func testAUnifyRequestIsShownWithTheAmountThatWillBePaid() {
         typealias Parsed = UnifyBIP321.Parsed
         XCTAssertEqual(
@@ -690,7 +723,11 @@ final class CashuWalletServiceTests: XCTestCase {
         )
         XCTAssertEqual(
             SonarAppStore.unifyPayPhase(for: Parsed(lightning: "lnbc1pinvoice", amountSats: 500)),
-            .failed(SonarAppStore.amountlessInvoiceMessage)
+            .confirm(destination: "lnbc1pinvoice", sats: 500)
+        )
+        XCTAssertEqual(
+            SonarAppStore.unifyPayPhase(for: Parsed(lightning: "lnbc1pinvoice", amountSats: nil)),
+            .amount(destination: "lnbc1pinvoice")
         )
         XCTAssertEqual(
             SonarAppStore.unifyPayPhase(for: Parsed(lightning: "lno1offer", amountSats: 700)),

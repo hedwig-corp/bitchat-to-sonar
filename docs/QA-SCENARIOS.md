@@ -1571,6 +1571,35 @@ real mint and need the maintainer's approval of the amounts.
   reports a failure instead of falling back to the cache) before a melt is
   priced or sent, and one read serves 60 s.
 
+### QA-177 — An invoice with no amount is paid with the amount typed
+- **Platforms:** both apps. The core quotes it as an amountless melt;
+  mint.hedwig.sh advertises `amountless: true` for BOLT11 in NUT-05.
+- **Steps:** on a second mint or node, create a BOLT11 invoice with no amount
+  (`lnbc1p…`). In Send, paste it. Type 700 and read the fee line, then Send.
+  Repeat with **Max**. On a device with an old Breez wallet, pay the same
+  invoice from the old wallet's card. On a Unify receiver serving
+  `lightning:<amountless invoice>`, with and without `?amount=500`, open
+  Send sats.
+- **Expect:** the sheet asks for an amount, and the fee line prices the typed
+  amount. Send pays exactly 700 once, and Max pays the balance minus the fee
+  shown. From the old wallet, Send is refused up front with "This invoice has
+  no amount…", even if that wallet isn't connected, and nothing is quoted.
+  The Unify sheet shows 500 when the URI names it, and a keypad when it
+  doesn't.
+- **Guard:**
+  - Compose `WalletAppStateTest.anAmountlessInvoiceIsPaidWithTheTypedAmount`,
+    `anAmountlessInvoiceIsStillRefusedFromTheOldWallet` and
+    `aUnifyRequestIsShownWithTheAmountThatWillBePaid`;
+  - iOS `testAnAmountlessInvoiceIsPaidWithTheTypedAmount`,
+    `testFeeQuotePricesAnAmountlessInvoiceAtTheTypedAmount` and
+    `testAUnifyRequestIsShownWithTheAmountThatWillBePaid`;
+  - core `amountless_invoice_carries_the_callers_amount`.
+- **Origin:** #666 QA on Android, 2026-10-27. QA-165's Max step needs an
+  amountless invoice, but both apps refused one before the wallet saw it ("the
+  wallet can't set it"), and the fee line priced it at no amount. That rule
+  came from Breez, which cannot set an invoice's amount. The Cashu core and
+  mint could pay it all along. Now only the old wallet refuses it.
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs
