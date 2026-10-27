@@ -43,7 +43,7 @@ fi
 
 # --- areas -----------------------------------------------------------------
 ios=0 android=0 core=0 corelib=0 wallet=0 breez=0 messaging=0 share=0 localtime=0
-ui=0 i18n=0 perf=0 transcript=0 code=0 harness=0 ffi=0 mirror_kt=0 mirror_swift=0
+ui=0 i18n=0 perf=0 transcript=0 code=0 harness=0 ffi=0 mirror_kt=0 mirror_swift=0 mesh=0
 while IFS= read -r f; do
   b="${f##*/}"   # keyword areas match the file name: every Compose path contains "chat/bitchat"
   case "$f" in
@@ -54,6 +54,11 @@ while IFS= read -r f; do
   esac
   case "$f" in core/sonar-core/src/*) corelib=1 ;; esac
   case "$f" in scripts/qa/*) harness=1 ;; esac
+  # The bitchat BLE mesh: wire codec, engine, BLE transport, the iOS codec copy.
+  case "$f" in
+    core/bitchat-protocol/*|core/sonar-ble/*|core/sonar-core/src/mesh*|scripts/bitchat-vectors/*|\
+    ios/bitchat/Protocols/*|ios/bitchat/Noise/*|ios/bitchat/Services/BLE/*) mesh=1 ;;
+  esac
   case "$f" in core/sonar-ffi/src/*) ffi=1 ;; esac
   case "$b" in SonarAppState.kt) mirror_kt=1 ;; SonarAppStore.swift) mirror_swift=1 ;; esac
   case "$f" in core/sonar-wallet*|*/wallet/*|*SonarWalletKit*) wallet=1 ;; esac
@@ -95,7 +100,7 @@ breez_key=0
 
 echo "base: $BASE ($(git rev-parse --short "$MB")) · $(wc -l <<< "$changed" | tr -d ' ') changed files"
 areas=""
-for a in core ffi wallet breez messaging transcript share localtime ui i18n perf harness; do
+for a in core ffi mesh wallet breez messaging transcript share localtime ui i18n perf harness; do
   (( ${!a} )) && areas+=" $a"
 done
 printf 'areas:%s' "${areas:- (none)}"
@@ -165,6 +170,16 @@ if (( ios )); then
   fi
 fi
 
+if (( mesh )); then
+  # All four bitchat codecs against both reference vector files (CLAUDE.md,
+  # bitchat Wire Protocol Rule 5). Clones both upstream repositories.
+  if (( xcode && jdk )) && [[ -n "$SDK" ]] && have cargo; then
+    run "T1  scripts/bitchat-vectors/cross-replay.sh   # stock iOS, stock Android, Sonar iOS, Sonar Android"
+  else
+    not "bitchat cross-replay (scripts/bitchat-vectors/cross-replay.sh): needs macOS + Xcode, JDK 17, an Android SDK and Rust; CI runs it"
+  fi
+fi
+
 # Tier 2 — end-to-end on a dedicated emulator/simulator against sonar-cli peers.
 peers=1
 if (( code && ! cli )); then
@@ -201,6 +216,10 @@ fi
 # Tier 3 — registry sections to walk (the agent drives, the registry says how).
 (( messaging )) && WALK+=("Messaging (QA-001…008)" "Reactions (QA-100…106)" "Notifications and lifecycle (QA-020…023)")
 (( share )) && WALK+=("Share sheet (QA-080…092)")
+if (( mesh )); then
+  WALK+=("Cross-client Bluetooth mesh (QA-164…166, QA-180…186) — Sonar iOS/Android against stock bitchat iOS/Android, physical phones only")
+  not "Cross-client Bluetooth mesh (QA-164…166, QA-180…186): emulators and simulators have no usable BLE mesh — needs three physical phones and the stock bitchat apps"
+fi
 (( localtime )) && WALK+=("Private local time (QA-070…077, QA-093)")
 (( ui )) && WALK+=("Accessibility (QA-040…043)" "Settings (QA-060)")
 (( perf )) && WALK+=("Performance (QA-050…053) — and docs/PERFORMANCE.md when startup changed")
