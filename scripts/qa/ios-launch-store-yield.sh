@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ios-launch-store-yield.sh — QA-164, iOS leg: a cold launch must not wait for
+# ios-launch-store-yield.sh — QA-187, iOS leg: a cold launch must not wait for
 # a notification-extension wake that holds the Marmot store lock.
 #
 #   QA_UDID=<uuid> SONAR_BENCH_NSEC=nsec1… scripts/qa/ios-launch-store-yield.sh [--budget-ms 3000]
@@ -110,7 +110,7 @@ run_mode() { # none | yield | stubborn
   echo "  $mode: t0→t1=${!v:-?}ms $(tr '\n' ' ' < "$out")"
 }
 
-echo "Sonar iOS store-yield check (QA-164) on $UDID, budget ${BUDGET}ms"
+echo "Sonar iOS store-yield check (QA-187) on $UDID, budget ${BUDGET}ms"
 run_mode none
 run_mode yield
 run_mode stubborn
@@ -124,5 +124,5 @@ fi
 grep -q 'host-wants notification received' "$WORK/standin-yield.txt" || { echo "FAIL the app never asked the holder to yield"; fail=1; }
 (( MS_none <= BUDGET )) || { echo "FAIL no-holder launch ${MS_none}ms over budget"; fail=1; }
 (( MS_yield <= BUDGET )) || { echo "FAIL yielding-holder launch ${MS_yield}ms over budget"; fail=1; }
-(( fail == 0 )) && echo "PASS QA-164 (iOS): paint ${MS_none}ms alone, ${MS_yield}ms with a yielding holder, ${MS_stubborn}ms with the old holder"
+(( fail == 0 )) && echo "PASS QA-187 (iOS): paint ${MS_none}ms alone, ${MS_yield}ms with a yielding holder, ${MS_stubborn}ms with the old holder"
 exit "$fail"

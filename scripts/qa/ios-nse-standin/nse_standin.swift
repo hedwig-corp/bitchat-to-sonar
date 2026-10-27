@@ -1,4 +1,4 @@
-// QA-164 (iOS leg). Stand-in for the notification extension's store-lock
+// QA-187 (iOS leg). Stand-in for the notification extension's store-lock
 // behaviour, driven by scripts/qa/ios-launch-store-yield.sh against the REAL app
 // on a simulator. `simctl push` never runs the real extension there.
 //   nse_standin <lockfile> yield     -> hold the flock; release when the app
