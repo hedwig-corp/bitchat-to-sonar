@@ -844,8 +844,8 @@ qa093() { # turning sharing off withdraws your time; a peer's revoke clears the 
   fi
 }
 
-# qa164 helpers: emulator console link shaping, always undone.
-qa164_shape() {
+# qa187 helpers: emulator console link shaping, always undone.
+qa187_shape() {
   # Console shaping applies to the emulated mobile-data link only, and its
   # latency setting is a no-op on current images, so: Wi-Fi off (traffic
   # moves to mobile data, which is the report) and GSM bandwidth. A TLS +
@@ -854,25 +854,25 @@ qa164_shape() {
   adb -s "$QA_SERIAL" emu network speed gsm >/dev/null 2>&1
   sleep 4
 }
-qa164_restore() {
+qa187_restore() {
   adb -s "$QA_SERIAL" emu network speed full >/dev/null 2>&1
   adb -s "$QA_SERIAL" emu network delay none >/dev/null 2>&1
   adb -s "$QA_SERIAL" shell svc wifi enable >/dev/null 2>&1
   sleep 3
 }
-# qa164_log_ms <log> <ERE> [last] — epoch ms of the first (or last) match.
-qa164_log_ms() {
+# qa187_log_ms <log> <ERE> [last] — epoch ms of the first (or last) match.
+qa187_log_ms() {
   local pick='NR==1'; [[ "${3:-}" == last ]] && pick='END'
   grep -E "$2" <<<"$1" | awk "$pick"' { split($1, t, "."); print t[1] * 1000 + substr(t[2] "000", 1, 3) }'
 }
 
-qa164() { # cold launch on slow mobile data: first frame never waits for push's relay attach (#665)
+qa187() { # cold launch on slow mobile data: first frame never waits for push's relay attach (#665)
   if [[ "$QA_SERIAL" != emulator-* ]]; then
-    record QA-164 SKIP "needs an emulator: the link is shaped through its console"; return
+    record QA-187 SKIP "needs an emulator: the link is shaped through its console"; return
   fi
-  local budget="${QA164_BUDGET_MS:-4000}" runs="${QA164_RUNS:-3}"
+  local budget="${QA187_BUDGET_MS:-4000}" runs="${QA187_RUNS:-3}"
   local i t0 log total start end shown waited raced=0 slow=0 detail=""
-  qa164_shape
+  qa187_shape
   for ((i = 1; i <= runs; i++)); do
     adb -s "$QA_SERIAL" shell am force-stop chat.bitchat.sonar >/dev/null 2>&1
     sleep 2
@@ -880,8 +880,8 @@ qa164() { # cold launch on slow mobile data: first frame never waits for push's 
     # An emulator that dropped off adb answers nothing; `logcat -T .000`
     # would then wait forever. Stop here and say so.
     if [[ ! "$t0" =~ ^[0-9]+$ ]]; then
-      qa164_restore
-      record QA-164 FAIL "inconclusive: $QA_SERIAL did not answer (offline?) before run $i:$detail"
+      qa187_restore
+      record QA-187 FAIL "inconclusive: $QA_SERIAL did not answer (offline?) before run $i:$detail"
       return
     fi
     # TotalTime = launch → first frame. MainActivity defers that frame until
@@ -895,11 +895,11 @@ qa164() { # cold launch on slow mobile data: first frame never waits for push's 
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
       sleep 2
       log="$(adb -s "$QA_SERIAL" logcat -d -v epoch -T "$t0.000" 2>/dev/null)"
-      end="$(qa164_log_ms "$log" 'SonarPush.*Transponder:? (MIP-05 push token registered|registration attempt 1/)')"
+      end="$(qa187_log_ms "$log" 'SonarPush.*Transponder:? (MIP-05 push token registered|registration attempt 1/)')"
       [[ -n "$end" ]] && break
     done
-    start="$(qa164_log_ms "$log" 'SonarPush.*FCM token collected')"
-    shown="$(qa164_log_ms "$log" 'Displayed chat\.bitchat\.sonar/\.MainActivity')"
+    start="$(qa187_log_ms "$log" 'SonarPush.*FCM token collected')"
+    shown="$(qa187_log_ms "$log" 'Displayed chat\.bitchat\.sonar/\.MainActivity')"
     waited="$(grep -oE 'start: waited [0-9]+ ms' <<<"$log" | head -1)"
     detail+=" run$i=${total:-?}ms"
     [[ -n "$waited" ]] && detail+="($waited)"
@@ -914,13 +914,13 @@ qa164() { # cold launch on slow mobile data: first frame never waits for push's 
       detail+="[no race]"
     fi
   done
-  qa164_restore
+  qa187_restore
   if (( raced == 0 )); then
-    record QA-164 FAIL "inconclusive: push's relay attach never overlapped a launch on the shaped link (FCM token not cached? shaping off?):$detail"
+    record QA-187 FAIL "inconclusive: push's relay attach never overlapped a launch on the shaped link (FCM token not cached? shaping off?):$detail"
   elif (( slow > 0 )); then
-    record QA-164 FAIL "$slow/$raced launches waited for push's relay attach (budget ${budget}ms):$detail"
+    record QA-187 FAIL "$slow/$raced launches waited for push's relay attach (budget ${budget}ms):$detail"
   else
-    record QA-164 PASS "first frame within ${budget}ms in $raced/$runs launches while push's relay attach was timing out:$detail"
+    record QA-187 PASS "first frame within ${budget}ms in $raced/$runs launches while push's relay attach was timing out:$detail"
   fi
 }
 
@@ -938,11 +938,11 @@ sleep 3
 # Order matters: QA-002 and the reaction scenarios (QA-100..102, QA-106)
 # reuse QA-001's chat, QA-135 needs QA-004's chat as the newest one, QA-005
 # opens QA-004's, and QA-040 inspects the chat
-# QA-005 left open. QA-164 force-stops the app and shapes the emulator's link,
+# QA-005 left open. QA-187 force-stops the app and shapes the emulator's link,
 # so it runs after the UI scenarios and restores Wi-Fi before QA-050 measures
 # idle CPU. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa164 qa050 qa118; do
+for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa187 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

@@ -83,7 +83,7 @@ struct MarmotStoreLockTests {
         #endif
     }
 
-    /// QA-164 (#665): the app's blocking acquire must ask whoever holds the
+    /// QA-187 (#665): the app's blocking acquire must ask whoever holds the
     /// store to yield BEFORE it parks on `flock`. The holder here is a hold in
     /// this process that lets go only when that Darwin notification arrives,
     /// which is exactly what the NSE's observer does with its latch. Without
@@ -93,7 +93,7 @@ struct MarmotStoreLockTests {
     /// Other tests' acquires post the same notification and may release this
     /// hold early; that cannot make this test pass without the fix, because
     /// without it nothing posts at all.
-    @Test("acquireExclusive asks the store holder to yield (QA-164)")
+    @Test("acquireExclusive asks the store holder to yield (QA-187)")
     func acquireExclusiveAsksHolderToYield() throws {
         #if os(iOS)
         let group = IsolatedAppGroup()

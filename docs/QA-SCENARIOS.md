@@ -1020,7 +1020,7 @@ share a zone with the app and report the zone the app shared with it.
   ANRs and 23–26 % idle CPU on Home, the same on a `main` build. With one
   advertiser, main-thread time went 68 → 32 ticks/60 s after the fix.
 
-### QA-164 — Cold launch on cellular while a push wake is in flight
+### QA-187 — Cold launch on cellular while a push wake is in flight
 - **Platforms:** both, both scripted. The real iOS extension only runs on a
   device (`simctl push` never starts it), so a device pass stays the final
   check for the extension's own observer wiring.
@@ -1034,14 +1034,14 @@ share a zone with the app and report the zone the app shared with it.
   paint past 10 s, which proves the lock sits on the paint path; otherwise it
   FAILs as inconclusive. Reboot the simulator after `ios-setup.sh`: its own
   launch leaves a notification-permission alert that keeps the app inactive.
-- **How (Android):** `android-smoke.sh` QA-164 (emulator only). It turns the
+- **How (Android):** `android-smoke.sh` QA-187 (emulator only). It turns the
   emulator's Wi-Fi off and sets the console link to GSM bandwidth, then
   cold-starts the app three times and reads `am start -W` TotalTime (launch
   to first frame, which `MainActivity` defers until `boot()`'s
   `SonarCore.start()` returns). A launch counts only when push
   registration's relay attach began before the first frame and took 4 s or
   more on the shaped link; if none does, the step FAILs as inconclusive
-  rather than passing. Budget 4000 ms (`QA164_BUDGET_MS`). The console's
+  rather than passing. Budget 4000 ms (`QA187_BUDGET_MS`). The console's
   latency setting is a no-op on current images and shaping never applies
   to the emulated Wi-Fi, which is why the step uses bandwidth on mobile data.
 - **Steps:** account with a few active chats. Put the phone on cellular
@@ -1053,9 +1053,13 @@ share a zone with the app and report the zone the app shared with it.
   on the launch surface (iOS black "sonar" screen, Android starting window)
   for the length of the wake's relay timeouts.
   - iOS log: the NSE diagnostics stamp `yield:hostWantsStore` followed by
-    `yield:abandonedHydrate`, and the app's `marmot workQueue op=connectLocal`
-    line shows `ran_ms` well under 1000 — the open no longer waits for the
-    NSE's 5 s relay quorum + 8 s drain. The banner that wake was decorating
+    `yield:abandonedHydrate`, and the app logs no slow
+    `marmot workQueue op=connectLocal` line (it is printed only past the
+    slow-op threshold) — the open no longer waits for the NSE's 5 s relay
+    quorum + 8 s drain. The NSE writes to the unified log only, so on a
+    device its stamps need `sudo log collect --device-udid`; the app's
+    `sonar-ios.log` in the app container carries the bench markers and
+    `pathIsExpensive -> true` on cellular. The banner that wake was decorating
     stays generic and silent; the app paints the message itself.
   - Android logcat: no `Core: start: waited N ms for the core lock` line
     with N in the thousands. `boot()`'s `SonarCore.start()` answers from the
@@ -1103,6 +1107,26 @@ share a zone with the app and report the zone the app shared with it.
   Earlier, before the package was restored, the yield test's logic ran as a
   plain process on the simulator: with `signalHostWantsStore()` removed the
   acquire stayed parked until its 3 s limit.
+- **Last device run (2026-10-27, iPhone 14 Pro Max, real account, 399
+  groups):** signed Debug build of this branch installed in place over
+  1.15.4 (49), data kept. Bench markers from the app container's
+  `sonar-ios.log`, seconds after `t0_launch`:
+
+  | Network | Launch | t1 local paint | t4 first drain |
+  |---|---|---|---|
+  | Wi-Fi | cold, first after install | 1.62 | 3.87 |
+  | Wi-Fi | cold ×3 | 1.26, 1.50, 0.60 | 2.20, 3.34, 2.02 |
+  | Cellular | cold ×3 | 2.29, 0.52, 1.00 | 4.08, 2.17, 2.78 |
+  | Cellular | resume | 0.53 after became-active | — |
+
+  Relay connect began after local paint on every launch. The slowest
+  cellular launch opened the store 0.3 s after `t0` (no lock wait); the rest
+  was the local load plus a 757 ms main-thread stall from the chat-list row
+  rebuild that 1.15.4 shows too. No push wake overlapped these launches, so
+  the extension's yield on a real device is still unobserved. The 1.15.4
+  log on the same phone held 21 foregrounds (12 on cellular) over a week,
+  all painting within 0.8 s of becoming active: the bug needs a wake in
+  flight at the moment of launch.
 - **Origin:** 2026-10-13 tester report "quando non sono in Wi-Fi non si
   apre". Both hosts gate first paint on the local store open, and both let a
   push-driven relay attach hold the store lock across its network timeouts:
