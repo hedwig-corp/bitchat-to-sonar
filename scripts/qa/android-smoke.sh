@@ -213,24 +213,39 @@ qa002() { # reply arrives in the open chat
 
 # text_start <substring> — "x y" just inside the top-left corner of the first
 # node containing it, i.e. a bubble's first glyphs. `find` returns the node's
-# centre, which on a wrapped bubble can land past the link.
+# centre, which on a wrapped bubble can land past the link. Retries like
+# `wait`: right after the app returns to the front a dump can come back empty.
 text_start() {
-  "$UI" boundst "$1" 2>/dev/null | awk '{print $1 + 40, $2 + 30}'
+  local i b
+  for i in 1 2 3 4 5; do
+    b="$("$UI" boundst "$1" 2>/dev/null)"
+    [[ -n "$b" ]] && { awk '{print $1 + 40, $2 + 30}' <<<"$b"; return 0; }
+    sleep 1
+  done
+  return 1
 }
 
 device_now() { adb -s "$QA_SERIAL" shell 'date "+%m-%d %H:%M:%S.000"' | tr -d '\r'; }
 
-# view_started <host> <since> — something launched a VIEW of https://<host>
-# after device time <since>. Android logs the host and redacts the path, so
-# each run uses a host of its own.
-view_started() {
+# view_handler <host> <since> — the package that took a VIEW of https://<host>
+# after device time <since>; empty when nothing did. Android logs the host and
+# redacts the path, so each run uses a host of its own.
+view_handler() {
   adb -s "$QA_SERIAL" logcat -d -T "$2" 2>/dev/null |
-    grep -q "act=android.intent.action.VIEW dat=https://$1/"
+    grep -m1 "act=android.intent.action.VIEW dat=https://$1/" |
+    sed -nE 's#.* cmp=([^/ ]+)/.*#\1#p'
+}
+
+# close_browser <package> — a browser left running starves the 2 GB QA
+# emulator: uiautomator dumps get killed and every later scenario misses.
+close_browser() {
+  [[ -n "$1" && "$1" != chat.bitchat.sonar ]] && adb -s "$QA_SERIAL" shell am force-stop "$1"
+  adb -s "$QA_SERIAL" shell am start -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
 }
 
 qa189() { # a tapped link opens in the browser; a long press opens the menu instead (#672)
   [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-189 SKIP "needs QA-001"; return; }
-  local host="qa189-$RUN.example.com" www="www.qa189-$RUN.example.org" since link target xy
+  local host="qa189-$RUN.example.com" www="www.qa189-$RUN.example.org" since link target xy pkg
   link="https://$host/a"
   "$PEERS" send "a-$RUN" "$APP_NPUB" "$link" >/dev/null
   "$PEERS" send "a-$RUN" "$APP_NPUB" "$www" >/dev/null
@@ -242,7 +257,9 @@ qa189() { # a tapped link opens in the browser; a long press opens the menu inst
   ui longpress $xy
   "$UI" wait "Reply" 5 >/dev/null || { record QA-189 FAIL "long-press on a link opened no menu"; return; }
   ui key 4; sleep 1
-  if view_started "$host" "$since"; then
+  pkg="$(view_handler "$host" "$since")"
+  if [[ -n "$pkg" ]]; then
+    close_browser "$pkg"
     record QA-189 FAIL "a long press opened the link as well as the menu"; return
   fi
   for target in "$link|$host" "$www|$www"; do
@@ -251,10 +268,10 @@ qa189() { # a tapped link opens in the browser; a long press opens the menu inst
     [[ -n "$xy" ]] || { record QA-189 FAIL "no bubble holds ${target%%|*}"; return; }
     ui tap $xy
     sleep 3
-    view_started "${target##*|}" "$since" ||
-      { record QA-189 FAIL "tapping ${target%%|*} opened nothing (#672)"; go_home >/dev/null; return; }
+    pkg="$(view_handler "${target##*|}" "$since")"
+    [[ -n "$pkg" ]] || { record QA-189 FAIL "tapping ${target%%|*} opened nothing (#672)"; return; }
     # Back to the same chat for the scenarios after this one.
-    adb -s "$QA_SERIAL" shell am start -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
+    close_browser "$pkg"
     "$UI" wait "$www" 10 >/dev/null || { record QA-189 FAIL "the chat was gone after returning from the browser"; return; }
   done
   record QA-189 PASS "both links opened a VIEW (https:// and www. as https://); long press opened the menu only"
