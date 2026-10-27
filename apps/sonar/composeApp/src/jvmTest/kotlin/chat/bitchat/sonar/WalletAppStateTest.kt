@@ -170,7 +170,7 @@ class WalletAppStateTest {
     /**
      * An invoice with no amount is paid with the amount typed on the sheet:
      * the Cashu wallet quotes it as an amountless melt. The fee line prices
-     * that same amount, and `Max` works on it too (QA-165's Max step). Only
+     * that same amount, and `Max` works on it too (QA-178's Max step). Only
      * the old wallet refuses one — Breez cannot set an invoice's amount.
      */
     @Test
@@ -258,7 +258,7 @@ class WalletAppStateTest {
     }
 
     /**
-     * QA-165 on the status screen: 500 sats plus a 40-sat fee on a 520-sat
+     * QA-178 on the status screen: 500 sats plus a 40-sat fee on a 520-sat
      * balance is refused before anything is sent, and the screen states the
      * shortfall with its figures, not "No route", which blames the payee.
      */

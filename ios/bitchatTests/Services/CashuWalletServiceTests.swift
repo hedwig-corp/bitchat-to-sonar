@@ -576,7 +576,7 @@ final class CashuWalletServiceTests: XCTestCase {
         await service.releaseQuietly()
     }
 
-    /// QA-165 on the status screen, through the REAL store call sites: 500
+    /// QA-178 on the status screen, through the REAL store call sites: 500
     /// sats plus a 40-sat fee on a 520-sat balance is refused before anything
     /// is sent, and the screen states the shortfall with its figures, not "No
     /// route", which blames the payee (Compose
@@ -639,7 +639,7 @@ final class CashuWalletServiceTests: XCTestCase {
 
     /// An invoice with no amount is paid with the amount typed on the sheet:
     /// the Cashu wallet quotes it as an amountless melt, and `Max` works on
-    /// it too (QA-165's Max step). Only the old wallet refuses one — Breez
+    /// it too (QA-178's Max step). Only the old wallet refuses one — Breez
     /// cannot set an invoice's amount. Mirrors Compose
     /// `WalletAppStateTest.anAmountlessInvoiceIsPaidWithTheTypedAmount`.
     func testAnAmountlessInvoiceIsPaidWithTheTypedAmount() async throws {
