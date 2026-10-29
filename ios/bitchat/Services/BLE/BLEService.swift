@@ -65,7 +65,9 @@ final class BLEService: NSObject {
     
     // 2. BLE Centrals (when acting as peripheral)
     private var subscribedCentrals: [CBCentral] = []
-    private var centralToPeerID: [String: PeerID] = [:]  // Central UUID -> Peer ID mapping
+    // Central UUID -> the identities that central's link speaks for (more than
+    // one when two mesh apps share the remote device's radio).
+    private var centralLinks: [String: MeshLinkIdentities] = [:]
 
     // BCH-01-004: Rate-limiting for subscription-triggered announces
     // Tracks subscription attempts per central to prevent enumeration attacks
@@ -539,7 +541,7 @@ final class BLEService: NSObject {
         peripherals.removeAll()
         peerToPeripheralUUID.removeAll()
         subscribedCentrals.removeAll()
-        centralToPeerID.removeAll()
+        centralLinks.removeAll()
         pendingWriteBuffers.removeAll()
 
         for state in states {
@@ -554,8 +556,11 @@ final class BLEService: NSObject {
                let state = self.peripherals.removeValue(forKey: peripheralUUID) {
                 self.centralManager?.cancelPeripheralConnection(state.peripheral)
             }
-            for (centralUUID, boundPeerID) in self.centralToPeerID where boundPeerID == peerID {
-                self.centralToPeerID.removeValue(forKey: centralUUID)
+            // Dropping the whole central also cuts any other app sharing that
+            // device's radio; the restricted-discovery gate that calls this
+            // judges the primary identity, which owns the link.
+            for (centralUUID, link) in self.centralLinks where link.carries(peerID) {
+                self.centralLinks.removeValue(forKey: centralUUID)
                 self.pendingWriteBuffers.removeValue(forKey: centralUUID)
                 self.subscribedCentrals.removeAll { $0.identifier.uuidString == centralUUID }
             }
@@ -848,7 +853,7 @@ final class BLEService: NSObject {
             peripherals.removeAll()
             peerToPeripheralUUID.removeAll()
             subscribedCentrals.removeAll()
-            centralToPeerID.removeAll()
+            centralLinks.removeAll()
             centralSubscriptionRateLimits.removeAll()
         }
         meshTopology.reset()
@@ -1287,7 +1292,7 @@ final class BLEService: NSObject {
         var centralMaxLen: Int?
         do {
             let (centrals, mapping) = snapshotSubscribedCentrals()
-            if let central = centrals.first(where: { mapping[$0.identifier.uuidString] == recipientPeerID }) {
+            if let central = centrals.first(where: { mapping[$0.identifier.uuidString]?.contains(recipientPeerID) == true }) {
                 centralMaxLen = central.maximumUpdateValueLength
             }
         }
@@ -1316,7 +1321,7 @@ final class BLEService: NSObject {
         // Notify via central link (dual-role)
         if let characteristic = characteristic, !sentEncrypted {
             let (centrals, mapping) = snapshotSubscribedCentrals()
-            for central in centrals where mapping[central.identifier.uuidString] == recipientPeerID {
+            for central in centrals where mapping[central.identifier.uuidString]?.contains(recipientPeerID) == true {
                 let success = peripheralManager?.updateValue(data, for: characteristic, onSubscribedCentrals: [central]) ?? false
                 if success { sentEncrypted = true; break }
                 enqueuePendingNotification(data: data, centrals: [central], context: "encrypted")
@@ -2748,6 +2753,25 @@ extension BLEService {
         bleQueue.sync { handleCentralState(state, central: nil) }
     }
 
+    /// Deliver `packet` as if central `centralUUID` had written it to our
+    /// characteristic: the real link-binding path of `didReceiveWrite`, minus
+    /// the `CBATTRequest` reassembly. `receivedAt` ages the link's record.
+    func _test_receiveCentralPacket(_ packet: BitchatPacket, fromCentralUUID centralUUID: String, receivedAt: Date = Date()) {
+        bleQueue.sync { receiveCentralPacket(packet, centralUUID: centralUUID, central: nil, receivedAt: receivedAt) }
+    }
+
+    /// Whether some central's link currently vouches for `peerID`.
+    func _test_hasCentralLink(to peerID: PeerID) -> Bool {
+        linkState(for: peerID).hasCentral
+    }
+
+    /// The peers central `centralUUID`'s link currently vouches for.
+    func _test_centralLinkPeers(_ centralUUID: String) -> Set<PeerID> {
+        bleQueue.sync {
+            centralLinks[centralUUID]?.vouchedPeers(now: Date(), window: TransportConfig.bleSharedLinkIdentityTimeoutSeconds) ?? []
+        }
+    }
+
     /// When the last announce was actually sent (post-throttle). Lets tests
     /// observe the announce-back scheduled by `handleSonarAnnounce` without a
     /// live radio: `sendAnnounce` stamps this under `announceStateLock`, so
@@ -2998,7 +3022,17 @@ extension BLEService: CBPeripheralDelegate {
         
         // Check if our service was invalidated (peer app quit)
         let hasOurService = peripheral.services?.contains { $0.uuid == BLEService.serviceUUID } ?? false
-        
+
+        // The instance we subscribed to went away while another stayed: one of
+        // two mesh apps on that device quit (Sonar beside stock bitchat), and
+        // the radio link lives on. Release the identity bound through it, or
+        // linkState keeps reporting a live link and the quit app stays online.
+        let peripheralID = peripheral.identifier.uuidString
+        if let subscribed = peripherals[peripheralID]?.characteristic,
+           subscribed.service.map({ service in invalidatedServices.contains { $0 === service } }) ?? true {
+            releasePeripheralIdentity(peripheralID)
+        }
+
         if !hasOurService {
             // Service is gone - disconnect
             SecureLogger.warning("❌ BitChat service removed - disconnecting from \(peripheral.name ?? peripheral.identifier.uuidString)", category: .session)
@@ -3006,6 +3040,37 @@ extension BLEService: CBPeripheralDelegate {
         } else {
             // Try to rediscover
             peripheral.discoverServices([BLEService.serviceUUID])
+        }
+    }
+
+    /// Forget which peer a still-connected peripheral speaks for, so the next
+    /// full-TTL announce on it binds afresh. Runs on bleQueue.
+    private func releasePeripheralIdentity(_ peripheralID: String) {
+        guard var state = peripherals[peripheralID], let peerID = state.peerID else { return }
+        state.peerID = nil
+        state.characteristic = nil
+        state.assembler = NotificationStreamAssembler()
+        peripherals[peripheralID] = state
+        if peerToPeripheralUUID[peerID] == peripheralID {
+            peerToPeripheralUUID.removeValue(forKey: peerID)
+        }
+        SecureLogger.info("🔓 Peripheral \(peripheralID.prefix(8))… no longer serves \(peerID.id.prefix(8))… (its mesh service went away)", category: .session)
+
+        let stillLinked = linkState(for: peerID)
+        guard !stillLinked.hasPeripheral, !stillLinked.hasCentral else { return }
+        collectionsQueue.sync(flags: .barrier) {
+            if var info = peers[peerID] {
+                info.isConnected = false
+                peers[peerID] = info
+            }
+        }
+        refreshLocalTopology()
+        notifyUI { [weak self] in
+            guard let self = self else { return }
+            let currentPeerIDs = self.collectionsQueue.sync { self.currentPeerIDs }
+            self.notifyPeerDisconnectedDebounced(peerID)
+            self.requestPeerDataPublish()
+            self.delegate?.didUpdatePeerList(currentPeerIDs)
         }
     }
     
@@ -3062,7 +3127,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             peripheral.stopAdvertising()
             // Clear subscribed centrals (they are now invalid)
             subscribedCentrals.removeAll()
-            centralToPeerID.removeAll()
+            centralLinks.removeAll()
             centralSubscriptionRateLimits.removeAll()
             characteristic = nil
             invalidateMeshLinks(reason: "Bluetooth powered off")
@@ -3072,7 +3137,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             SecureLogger.warning("🚫 Bluetooth unauthorized for peripheral role", category: .session)
             peripheral.stopAdvertising()
             subscribedCentrals.removeAll()
-            centralToPeerID.removeAll()
+            centralLinks.removeAll()
             centralSubscriptionRateLimits.removeAll()
             characteristic = nil
             invalidateMeshLinks(reason: "Bluetooth unauthorized")
@@ -3084,7 +3149,7 @@ extension BLEService: CBPeripheralManagerDelegate {
         case .resetting:
             // Bluetooth stack is resetting - the OS invalidates every connection
             // here without didUnsubscribeFrom callbacks, so clear the subscription
-            // maps too: a stale centralToPeerID entry makes linkState(for:) report
+            // maps too: a stale centralLinks entry makes linkState(for:) report
             // a live central link, which re-marks the peer connected off a relayed
             // announce and disables the checkPeerConnectivity safety net. No
             // CoreBluetooth calls here (no stopAdvertising) — the manager is
@@ -3092,7 +3157,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             // re-adds the service.
             SecureLogger.info("🔄 Bluetooth peripheral stack resetting...", category: .session)
             subscribedCentrals.removeAll()
-            centralToPeerID.removeAll()
+            centralLinks.removeAll()
             centralSubscriptionRateLimits.removeAll()
             characteristic = nil
             invalidateMeshLinks(reason: "Bluetooth resetting")
@@ -3236,29 +3301,31 @@ extension BLEService: CBPeripheralManagerDelegate {
             peripheral.startAdvertising(buildAdvertisementData())
         }
         
-        // Find and disconnect the peer associated with this central
+        // Find and disconnect every peer this central's link spoke for
         let centralUUID = central.identifier.uuidString
-        if let peerID = centralToPeerID[centralUUID] {
-            // Mark peer as not connected; retain for reachability
+        if let link = centralLinks.removeValue(forKey: centralUUID) {
+            let linkPeers = Array(link.lastDirectAnnounce.keys)
+            // Mark peers as not connected; retain for reachability
             collectionsQueue.sync(flags: .barrier) {
-                if var info = peers[peerID] {
-                    info.isConnected = false
-                    peers[peerID] = info
+                for peerID in linkPeers {
+                    if var info = peers[peerID] {
+                        info.isConnected = false
+                        peers[peerID] = info
+                    }
                 }
             }
-            
-            // Clean up mappings
-            centralToPeerID.removeValue(forKey: centralUUID)
             refreshLocalTopology()
-            
+
             // Update UI immediately
             notifyUI { [weak self] in
                 guard let self = self else { return }
-                
+
                 // Get current peer list (after removal)
                 let currentPeerIDs = self.collectionsQueue.sync { self.currentPeerIDs }
-                
-                self.notifyPeerDisconnectedDebounced(peerID)
+
+                for peerID in linkPeers {
+                    self.notifyPeerDisconnectedDebounced(peerID)
+                }
                 // Publish snapshots so UnifiedPeerService can refresh icons promptly
                 self.requestPeerDataPublish()
                 self.delegate?.didUpdatePeerList(currentPeerIDs)
@@ -3368,58 +3435,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             if let packet = BinaryProtocol.decode(combined) {
                 // Clear buffer on success
                 pendingWriteBuffers.removeValue(forKey: centralUUID)
-
-                let claimedSenderID = PeerID(hexData: packet.senderID)
-
-                if MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: claimedSenderID == myPeerID, ttl: packet.ttl) {
-                    continue
-                }
-
-                let trustedSenderID: PeerID?
-                if let knownPeerID = centralToPeerID[centralUUID] {
-                    if knownPeerID != claimedSenderID {
-                        if MeshLinkSenderPolicy.allowsRelayedIdentityPacket(type: packet.type, ttl: packet.ttl) {
-                            trustedSenderID = nil
-                        } else {
-                            SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Central \(centralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
-                            continue
-                        }
-                    } else {
-                        trustedSenderID = knownPeerID
-                    }
-                } else {
-                    trustedSenderID = nil
-                }
-
-                if !validatePacket(packet, from: trustedSenderID ?? claimedSenderID, connectionSource: .central(centralUUID)) {
-                    continue
-                }
-
-                if packet.type != MessageType.announce.rawValue {
-                    SecureLogger.debug("📦 Decoded (combined) packet type: \(packet.type) from sender: \(claimedSenderID)", category: .session)
-                }
-                if !subscribedCentrals.contains(sorted[0].central) {
-                    subscribedCentrals.append(sorted[0].central)
-                }
-                if packet.type == MessageType.announce.rawValue {
-                    if packet.ttl == messageTTL {
-                        centralToPeerID[centralUUID] = claimedSenderID
-                        refreshLocalTopology()
-                    }
-                    // Record ingress link for last-hop suppression then process
-                    let msgID = makeMessageID(for: packet)
-                    collectionsQueue.async(flags: .barrier) { [weak self] in
-                        self?.ingressByMessageID[msgID] = (.central(centralUUID), Date())
-                    }
-                    handleReceivedPacket(packet, from: claimedSenderID)
-                } else {
-                    // Record ingress link for last-hop suppression then process
-                    let msgID = makeMessageID(for: packet)
-                    collectionsQueue.async(flags: .barrier) { [weak self] in
-                        self?.ingressByMessageID[msgID] = (.central(centralUUID), Date())
-                    }
-                    handleReceivedPacket(packet, from: claimedSenderID)
-                }
+                receiveCentralPacket(packet, centralUUID: centralUUID, central: sorted[0].central)
             } else {
                 // If buffer grows suspiciously large, reset to avoid memory leak
                 if combined.count > TransportConfig.blePendingWriteBufferCapBytes { // cap for safety
@@ -3433,6 +3449,83 @@ extension BLEService: CBPeripheralManagerDelegate {
                 }
             }
         }
+    }
+
+    /// One decoded packet written by a central. Runs on bleQueue. `central` is
+    /// nil only from the test seam, which has no `CBCentral` to subscribe and
+    /// also sets `receivedAt` to age the link's announce record.
+    private func receiveCentralPacket(_ packet: BitchatPacket, centralUUID: String, central: CBCentral?, receivedAt: Date = Date()) {
+        let claimedSenderID = PeerID(hexData: packet.senderID)
+
+        if MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: claimedSenderID == myPeerID, ttl: packet.ttl) {
+            return
+        }
+
+        let isDirectAnnounce = packet.type == MessageType.announce.rawValue && packet.ttl == messageTTL
+        let trustedSenderID: PeerID?
+        if let link = centralLinks[centralUUID] {
+            switch MeshLinkSenderPolicy.ingress(claimed: claimedSenderID, link: link, type: packet.type, ttl: packet.ttl) {
+            case .trusted:
+                trustedSenderID = claimedSenderID
+            case .relayedIdentity:
+                trustedSenderID = nil
+            case .candidateDirectIdentity:
+                // A second app on the same device (Sonar beside stock bitchat)
+                // writes through the same central. It joins the link only on
+                // its own verified announce; the primary binding never moves.
+                guard verifiesDirectAnnounce(packet, from: claimedSenderID) else {
+                    SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Central \(centralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(link.primary.id.prefix(8))…", category: .security)
+                    return
+                }
+                SecureLogger.info("🔗 Central \(centralUUID.prefix(8))… also carries \(claimedSenderID.id.prefix(8))… (another mesh app on that device)", category: .session)
+                trustedSenderID = claimedSenderID
+            case .reject:
+                SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Central \(centralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(link.primary.id.prefix(8))…", category: .security)
+                return
+            }
+        } else {
+            trustedSenderID = nil
+        }
+
+        if !validatePacket(packet, from: trustedSenderID ?? claimedSenderID, connectionSource: .central(centralUUID)) {
+            return
+        }
+
+        if packet.type != MessageType.announce.rawValue {
+            SecureLogger.debug("📦 Decoded (combined) packet type: \(packet.type) from sender: \(claimedSenderID)", category: .session)
+        }
+        if let central, !subscribedCentrals.contains(central) {
+            subscribedCentrals.append(central)
+        }
+        if isDirectAnnounce {
+            if centralLinks[centralUUID] == nil {
+                centralLinks[centralUUID] = MeshLinkIdentities(primary: claimedSenderID, at: receivedAt)
+                refreshLocalTopology()
+            } else if trustedSenderID == claimedSenderID {
+                centralLinks[centralUUID]?.noteDirectAnnounce(from: claimedSenderID, at: receivedAt)
+            }
+        }
+        // Record ingress link for last-hop suppression then process
+        let msgID = makeMessageID(for: packet)
+        collectionsQueue.async(flags: .barrier) { [weak self] in
+            self?.ingressByMessageID[msgID] = (.central(centralUUID), Date())
+        }
+        handleReceivedPacket(packet, from: claimedSenderID)
+    }
+
+    /// Whether a full-TTL announce proves its sender: it decodes, its Noise key
+    /// derives the claimed peer ID, its signature checks out under the signing
+    /// key it announces, and that key is the one already pinned for the peer.
+    /// The pin matters: a neighbour can pair an existing peer's public Noise
+    /// key with its own signing key and get a valid signature.
+    private func verifiesDirectAnnounce(_ packet: BitchatPacket, from claimedSenderID: PeerID) -> Bool {
+        guard let announcement = AnnouncementPacket.decode(from: packet.payload),
+              PeerID(publicKey: announcement.noisePublicKey) == claimedSenderID,
+              noiseService.verifyPacketSignature(packet, publicKey: announcement.signingPublicKey) else {
+            return false
+        }
+        let pinned = collectionsQueue.sync { peers[claimedSenderID]?.signingPublicKey }
+        return MeshLinkSenderPolicy.preservesSigningIdentity(existing: pinned, announced: announcement.signingPublicKey)
     }
 }
 
@@ -3612,7 +3705,10 @@ extension BLEService {
         let computeState = { () -> (Bool, Bool) in
             let peripheralUUID = self.peerToPeripheralUUID[peerID]
             let hasPeripheral = peripheralUUID.flatMap { self.peripherals[$0]?.isConnected } ?? false
-            let hasCentral = self.centralToPeerID.values.contains(peerID)
+            let now = Date()
+            let hasCentral = self.centralLinks.values.contains {
+                $0.vouches(for: peerID, now: now, window: TransportConfig.bleSharedLinkIdentityTimeoutSeconds)
+            }
             return (hasPeripheral, hasCentral)
         }
 
@@ -3696,11 +3792,18 @@ extension BLEService {
             return bleQueue.sync { Array(peripherals.values) }
         }
     }
-    private func snapshotSubscribedCentrals() -> ([CBCentral], [String: PeerID]) {
+    /// Subscribed centrals plus, per central UUID, the peers its link still
+    /// vouches for (more than one when two apps share the remote radio).
+    private func snapshotSubscribedCentrals() -> ([CBCentral], [String: Set<PeerID>]) {
+        let snapshot = { () -> ([CBCentral], [String: Set<PeerID>]) in
+            let now = Date()
+            let window = TransportConfig.bleSharedLinkIdentityTimeoutSeconds
+            return (self.subscribedCentrals, self.centralLinks.mapValues { $0.vouchedPeers(now: now, window: window) })
+        }
         if DispatchQueue.getSpecific(key: bleQueueKey) != nil {
-            return (self.subscribedCentrals, self.centralToPeerID)
+            return snapshot()
         } else {
-            return bleQueue.sync { (self.subscribedCentrals, self.centralToPeerID) }
+            return bleQueue.sync { snapshot() }
         }
     }
     

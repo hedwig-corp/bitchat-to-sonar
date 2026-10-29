@@ -113,6 +113,12 @@ enum TransportConfig {
     // (core/sonar-core/src/mesh_engine.rs) that Android relies on.
     static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 135.0    // >= 3x(30+8+5+1)
     static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 135.0  // >= 3x(30+8+5+1)
+    // How long a link shared by two mesh apps on one device (Sonar beside
+    // stock bitchat) keeps vouching for one of them after its last full-TTL
+    // announce. The radio link outlives an app that quit, so its own announces
+    // are the only liveness signal. A co-located app may be an Apple build on
+    // the dense cadence above, so this clears the same two-lost-announces bar.
+    static let bleSharedLinkIdentityTimeoutSeconds: TimeInterval = bleReachabilityRetentionVerifiedSeconds
     // Window for DM TRANSPORT SELECTION, tighter than the radar windows above
     // but NOT tighter than one announce cycle. `MessageRouter` is built as
     // `[meshService, nostrTransport]` and picks the first transport whose
