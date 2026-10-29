@@ -1,10 +1,19 @@
 [package]
 name = "bitchat-protocol"
 description = "The bitchat BLE mesh wire protocol: packet framing, TLVs, Noise transport framing, signing — byte-compatible with permissionlesstech/bitchat and bitchat-android"
-version.workspace = true
+# Versioned on its own, not with the workspace: it is published to crates.io
+# for other bitchat implementations, and 0.0.x says the API may still move.
+version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository = "https://github.com/hedwig-corp/bitchat-to-sonar"
+readme = "README.md"
+keywords = ["bitchat", "mesh", "bluetooth", "noise", "p2p"]
+categories = ["network-programming", "encoding", "cryptography"]
+# The drop-in replay tests for the upstream repositories run inside those
+# repositories, so they are no use in the package.
+exclude = ["upstream/"]
 
 [lib]
 name = "bitchat_protocol"
