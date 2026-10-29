@@ -1026,6 +1026,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var batterySaving by mutableStateOf(BatterySaver.enabled())
         private set
+    /** Other mesh apps installed beside Sonar. They share the radio and the
+     *  mesh service UUID, so nearby devices may reach only one of the two.
+     *  Read on mesh start and on foreground (a cross-process lookup), never
+     *  in the constructor. */
+    var otherMeshApps by mutableStateOf<List<OtherMeshApp>>(emptyList())
+        private set
 
     var callOverlay = false
 
@@ -4175,6 +4181,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun startMesh() {
         refreshMeshIdentity()
         refreshBatterySaving()
+        refreshOtherMeshApps()
         updateBleDiscoveryPolicy()
         MeshRadio.start()
         meshPeerRefreshQueue.request()
@@ -5832,6 +5839,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         updateNearbyScanning()
     }
 
+    private fun refreshOtherMeshApps() {
+        val found = OtherMeshApps.installed()
+        if (found == otherMeshApps) return
+        otherMeshApps = found
+        if (found.isNotEmpty()) {
+            sonarLog("SonarMesh", "other mesh app installed: ${found.joinToString { it.packageName }}")
+        }
+    }
+
+    fun openOtherMeshAppSettings(app: OtherMeshApp) = OtherMeshApps.openSettings(app)
+
     private fun knownBlePeerIds(): Set<String> =
         knownBlePeerIdsForPolicy(
             meshChatPeerIds = meshChats.keys,
@@ -5952,6 +5970,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             // The zone can change while backgrounded without a broadcast
             // reaching a stopped activity; re-read it on every return.
             systemTimeZoneId = currentSystemTimeZoneId()
+            // The user may have just force-stopped or removed bitchat in Settings.
+            if (started) refreshOtherMeshApps()
             if (started) {
                 startRelayConnection()
                 scope.launch {
