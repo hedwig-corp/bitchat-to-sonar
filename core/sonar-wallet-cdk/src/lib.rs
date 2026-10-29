@@ -896,6 +896,18 @@ impl CdkWallet {
                 }
                 Err(_) => (MeltQuoteState::Unknown, None),
             };
+            // A paid melt reports what it cost, as history does, from the
+            // row CDK finalized; the reserve is only the quote's ceiling.
+            let fees_sats = match state {
+                MeltQuoteState::Paid => settled_melt_fee(&wallet, quote_id)
+                    .await
+                    .or(prepared.fees_sats),
+                _ => prepared.fees_sats,
+            };
+            let prepared = PreparedSend {
+                fees_sats,
+                ..prepared.clone()
+            };
             Ok(Some(resolved_melt_payment(
                 quote_id, &prepared, state, preimage, None,
             )))
@@ -1380,7 +1392,7 @@ impl CdkWallet {
                     .and_then(|rows| {
                         rows.into_iter()
                             .find(|tx| tx.saga_id == Some(saga_id))
-                            .map(|tx| u64::from(tx.fee))
+                            .map(|tx| melt_fee_paid(&tx))
                     })
                     .unwrap_or(u64::from(quote.fee_reserve)),
                 _ => 0,
@@ -1454,6 +1466,34 @@ fn quote_agrees(quoted: u64, confirmed: u64, invoice_msat: Option<u64>) -> bool 
 /// restart erases notes.
 fn tx_note(memo: Option<&String>, metadata: &HashMap<String, String>) -> Option<String> {
     memo.cloned().or_else(|| metadata.get("memo").cloned())
+}
+
+/// Melt metadata key for the fee of the swap that ran before the melt.
+///
+/// A melt whose proofs cannot pay it exactly swaps them first, and so pays
+/// two NUT-02 input fees: the swap's, on the proofs it splits, and the
+/// melt's own. CDK 0.18.1 prices the melt's transaction from the melt's
+/// inputs alone (inputs − amount − change), and the swap writes no
+/// transaction, so the swap fee was missing from every figure. Against a
+/// real cdk-mintd 0.18.1 at 1000 ppk (#666 QA) a 1300-sat send cost 42 sats
+/// over its amount and history said 6. [`record_swap_fee`] puts the fee in
+/// the melt saga's metadata before the confirm. CDK copies that metadata
+/// onto every row it writes for the melt: the Pending one, the finalized
+/// one, and the ones saga recovery writes after a relaunch.
+const SWAP_FEE_KEY: &str = "sonar.swap_fee";
+
+/// The pre-melt swap fee a melt's row carries; 0 when it did not swap.
+fn recorded_swap_fee(metadata: &HashMap<String, String>) -> u64 {
+    metadata
+        .get(SWAP_FEE_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// What a settled melt cost on top of its amount: CDK's fee for the melt
+/// itself plus the fee of the swap before it.
+fn melt_fee_paid(tx: &cdk::wallet::types::Transaction) -> u64 {
+    u64::from(tx.fee).saturating_add(recorded_swap_fee(&tx.metadata))
 }
 
 fn now_secs() -> u64 {
@@ -2402,6 +2442,15 @@ impl MeltJob {
             }
             return Err(refusal);
         }
+        // CDK leaves the swap's fee out of the melt's own; see SWAP_FEE_KEY.
+        let swap_fee = if price.swap { price.swap_fee } else { 0 };
+        if swap_fee > 0 {
+            if let Err(e) = record_swap_fee(wallet, operation_id, swap_fee).await {
+                tracing::warn!(
+                    "melt {tag}: swap fee {swap_fee} not recorded, history will leave it out: {e}"
+                );
+            }
+        }
         drop(prepare);
         let _ = confirm_started.send(());
         // From here on the payment is reported with what it can really cost.
@@ -2423,7 +2472,7 @@ impl MeltJob {
             // The mint itself said the payment failed; CDK has compensated
             // the proofs.
             Err(cdk::Error::PaymentFailed) if !request_lost => {
-                melt_outcome_payment(quote_id, &prepared, outcome, note)
+                melt_outcome_payment(quote_id, &prepared, outcome, note, swap_fee)
             }
             // Anything else may be a request the mint has, or will have,
             // applied. A Failed here that the melt later contradicts invites
@@ -2448,7 +2497,7 @@ impl MeltJob {
                 )
                 .await
             }
-            outcome => melt_outcome_payment(quote_id, &prepared, outcome, note),
+            outcome => melt_outcome_payment(quote_id, &prepared, outcome, note, swap_fee),
         };
         tracing::info!("melt {tag}: confirm ended {:?}", payment.status);
         Ok(payment)
@@ -2475,12 +2524,14 @@ fn pending_payment(quote_id: &str, prepared: &PreparedSend, note: Option<String>
 /// melt may have reached the mint — so it is Pending, for the watcher (or
 /// saga recovery) to settle, never an error that invites a second payment.
 /// A mint that accepted the melt asynchronously is Pending as well; the
-/// watcher's `finalize_pending_melts` emits its outcome.
+/// watcher's `finalize_pending_melts` emits its outcome. `swap_fee` is what
+/// the swap before the melt paid, which CDK's fee for the melt leaves out.
 fn melt_outcome_payment(
     quote_id: &str,
     prepared: &PreparedSend,
     outcome: std::result::Result<cdk::wallet::MeltOutcome<'_>, cdk::Error>,
     note: Option<String>,
+    swap_fee: u64,
 ) -> Payment {
     let finalized = match outcome {
         Ok(cdk::wallet::MeltOutcome::Paid(finalized)) => finalized,
@@ -2501,21 +2552,62 @@ fn melt_outcome_payment(
             return pending_payment(quote_id, prepared, note);
         }
     };
+    let status = match finalized.state() {
+        MeltQuoteState::Paid => PaymentStatus::Complete,
+        MeltQuoteState::Failed => PaymentStatus::Failed,
+        MeltQuoteState::Pending | MeltQuoteState::Unpaid | MeltQuoteState::Unknown => {
+            PaymentStatus::Pending
+        }
+    };
+    let fee_paid = u64::from(finalized.fee_paid());
     Payment {
         id: quote_id.to_string(),
         amount_sats: u64::from(finalized.amount()),
-        fees_sats: Some(u64::from(finalized.fee_paid())),
+        // Settled, like history's Completed rows (`melt_fee_paid`).
+        fees_sats: Some(if status == PaymentStatus::Complete {
+            fee_paid.saturating_add(swap_fee)
+        } else {
+            fee_paid
+        }),
         incoming: false,
         timestamp_secs: now_secs(),
-        status: match finalized.state() {
-            MeltQuoteState::Paid => PaymentStatus::Complete,
-            MeltQuoteState::Failed => PaymentStatus::Failed,
-            MeltQuoteState::Pending | MeltQuoteState::Unpaid | MeltQuoteState::Unknown => {
-                PaymentStatus::Pending
-            }
-        },
+        status,
         preimage: finalized.payment_proof().map(str::to_string),
         note,
+    }
+}
+
+/// Record a melt's pre-melt swap fee in its saga, before the confirm (see
+/// [`SWAP_FEE_KEY`]). The confirm re-reads the saga from the store and
+/// takes the melt's metadata from it, so the fee reaches the melt's rows
+/// whichever path finalizes it. Callers hold the reconciler's `prepare`
+/// lock, between the melt's preparation and its confirm. A failure only
+/// leaves history without the swap fee, as before; it never stops the
+/// payment.
+async fn record_swap_fee(
+    wallet: &Wallet,
+    operation_id: uuid::Uuid,
+    swap_fee: u64,
+) -> std::result::Result<(), String> {
+    let mut saga = wallet
+        .localstore
+        .get_saga(&operation_id)
+        .await
+        .map_err(|e| format!("read saga: {e}"))?
+        .ok_or("no saga")?;
+    let cdk::wallet::types::OperationData::Melt(data) = &mut saga.data else {
+        return Err("not a melt saga".into());
+    };
+    data.metadata
+        .insert(SWAP_FEE_KEY.to_string(), swap_fee.to_string());
+    // Optimistic locking: the store takes the update only over the version
+    // it holds, one below this one.
+    saga.version += 1;
+    saga.updated_at = now_secs();
+    match wallet.localstore.update_saga(saga).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("the saga changed meanwhile".into()),
+        Err(e) => Err(format!("write saga: {e}")),
     }
 }
 
@@ -2542,6 +2634,21 @@ fn resolved_melt_payment(
         preimage,
         ..pending_payment(quote_id, prepared, note)
     }
+}
+
+/// The fee of the melt of `quote_id` as finalized in history (see
+/// [`melt_fee_paid`]); `None` before CDK has finalized it.
+async fn settled_melt_fee(wallet: &Wallet, quote_id: &str) -> Option<u64> {
+    let rows = wallet
+        .list_transactions(Some(TransactionDirection::Outgoing))
+        .await
+        .map_err(|e| tracing::warn!("melt {}: read history: {e}", quote_tag(quote_id)))
+        .ok()?;
+    rows.iter()
+        .find(|tx| {
+            tx.quote_id.as_deref() == Some(quote_id) && tx.status == TransactionStatus::Completed
+        })
+        .map(melt_fee_paid)
 }
 
 /// The issue saga a mint quote is reserved by, when one is still open.
@@ -3683,10 +3790,17 @@ impl WalletBackend for CdkWallet {
                         (Some(quote_id), false) => quote_id.clone(),
                         (None, _) => proof_id.to_string(),
                     };
+                    // A settled send counts its swap's fee too; any other
+                    // row keeps CDK's figure.
+                    let fees_sats = if !incoming && status == PaymentStatus::Complete {
+                        melt_fee_paid(&tx)
+                    } else {
+                        u64::from(tx.fee)
+                    };
                     Payment {
                         id,
                         amount_sats: u64::from(tx.amount),
-                        fees_sats: Some(u64::from(tx.fee)),
+                        fees_sats: Some(fees_sats),
                         incoming,
                         timestamp_secs: tx.timestamp,
                         status,
@@ -5563,6 +5677,154 @@ mod tests {
             .block_on(wallet.localstore.get_incomplete_sagas())
             .unwrap();
         assert!(sagas.is_empty(), "{} open sagas", sagas.len());
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wallet on a mint whose ACTIVE keyset charges 1000 ppk, funded with
+    /// `receives` × 255 sats (8 proofs each).
+    fn wallet_on_fee_keyset(
+        dir: &Path,
+        receives: usize,
+    ) -> (CdkWallet, Arc<test_mint::FakeMint>, Arc<Recorder>) {
+        let mint = Arc::new(test_mint::FakeMint::with_input_fee(1_000));
+        let w = reopen(dir, &mint);
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        for _ in 0..receives {
+            receive_paid_bolt11(&w, &mint, 255);
+        }
+        (w, mint, recorder)
+    }
+
+    fn outgoing_row(w: &CdkWallet, id: &str) -> Payment {
+        w.list_recent_payments(50)
+            .unwrap()
+            .into_iter()
+            .find(|p| !p.incoming && p.id == id)
+            .expect("the send is in history")
+    }
+
+    /// A melt that swaps first pays two NUT-02 input fees: the swap's, on
+    /// the proofs it splits, and the melt's own, on the proofs the swap
+    /// made. CDK 0.18.1 prices the melt's transaction from the melt's inputs
+    /// alone, so the swap fee dropped out of the send result, its event and
+    /// history. Against a real cdk-mintd 0.18.1 at 1000 ppk (#666 QA) a
+    /// 1300-sat send cost 42 sats over its amount and history said 6. Every
+    /// figure must be what left the balance, less the amount.
+    #[test]
+    fn a_send_that_swaps_first_reports_the_swap_fee_too() {
+        let dir = scratch("swap-fee-reported");
+        let (w, mint, recorder) = wallet_on_fee_keyset(&dir, 5);
+        let before = w.balance().unwrap().confirmed_sats;
+        let prepared = prepare(&w, &test_invoice(Some(1_000_000)), None).unwrap();
+        let quoted = prepared.fees_sats.unwrap();
+        assert!(prepared.amount_sats + quoted <= before, "fee {quoted}");
+        let swaps = mint.calls("post_swap");
+
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete, "{payment:?}");
+        assert_eq!(mint.calls("post_swap"), swaps + 1, "the melt swapped first");
+        let cost = before - w.balance().unwrap().confirmed_sats - 1_000;
+        assert!(cost <= quoted, "cost {cost} over the quoted {quoted}");
+        assert_eq!(payment.fees_sats, Some(cost), "the send result");
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id).is_some()));
+        assert_eq!(
+            sent_outcome(&recorder, &payment.id).unwrap().fees_sats,
+            Some(cost),
+            "the PaymentSent event"
+        );
+        assert_eq!(
+            outgoing_row(&w, &payment.id).fees_sats,
+            Some(cost),
+            "history"
+        );
+
+        // History is rebuilt from the store: the figure survives a relaunch.
+        drop(w);
+        let w = reopen(&dir, &mint);
+        w.connect().unwrap();
+        assert_eq!(
+            outgoing_row(&w, &payment.id).fees_sats,
+            Some(cost),
+            "history after a relaunch"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same send, answered Pending and settled later by the watcher:
+    /// the swap ran inside the confirm, but the row the fee is read from is
+    /// finalized when the mint settles.
+    #[test]
+    fn a_swapped_melt_settled_later_reports_the_swap_fee_too() {
+        let dir = scratch("swap-fee-settled-later");
+        let (w, mint, recorder) = wallet_on_fee_keyset(&dir, 5);
+        let before = w.balance().unwrap().confirmed_sats;
+        mint.set_melt_outcome(test_mint::MeltOutcome::Pending);
+        let prepared = prepare(&w, &test_invoice(Some(1_000_000)), None).unwrap();
+        let swaps = mint.calls("post_swap");
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Pending, "{payment:?}");
+        assert_eq!(mint.calls("post_swap"), swaps + 1, "the melt swapped first");
+
+        mint.resolve_melt(
+            &payment.id,
+            test_mint::MeltOutcome::Paid {
+                preimage: Some(PREIMAGE.into()),
+            },
+        );
+        w.sync_wallet().unwrap();
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id).is_some()));
+        let cost = before - w.balance().unwrap().confirmed_sats - 1_000;
+        let settled = sent_outcome(&recorder, &payment.id).unwrap();
+        assert_eq!(settled.status, PaymentStatus::Complete);
+        assert_eq!(settled.fees_sats, Some(cost), "the settling event");
+        assert_eq!(
+            outgoing_row(&w, &payment.id).fees_sats,
+            Some(cost),
+            "history"
+        );
+        assert_eq!(
+            w.outgoing_payment_outcome(&payment.id)
+                .unwrap()
+                .expect("the quote is known")
+                .fees_sats,
+            Some(cost),
+            "a host's lookup of the row"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A melt that spends its proofs as they are, with no swap, was already
+    /// reported right; counting swap fees must not change it. With a fee on
+    /// the keyset CDK always swaps, so this is the other way a melt runs:
+    /// retired-keyset proofs that cannot pay for their own swap, topped up
+    /// and melted directly ([`prepare_funded_melt`]).
+    #[test]
+    fn a_send_with_no_swap_reports_the_melt_fee_alone() {
+        let dir = scratch("no-swap-fee");
+        let (w, mint) = wallet_with_retired_fee_proofs(&dir, 1_000, 5);
+        // One more receive, on the new free keyset, to top the selection up.
+        receive_paid_bolt11(&w, &mint, 255);
+        let before = w.balance().unwrap().confirmed_sats;
+        // The 40 retired proofs (1,275 sats) cover 1,250 + reserve 2 but
+        // not their own 40-sat swap fee as well.
+        let amount = 1_250;
+        let prepared = prepare(&w, &test_invoice(Some(amount * 1_000)), None).unwrap();
+        let swaps = mint.calls("post_swap");
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete, "{payment:?}");
+        assert_eq!(mint.calls("post_swap"), swaps, "melted directly, no swap");
+        let cost = before - w.balance().unwrap().confirmed_sats - amount;
+        assert_eq!(payment.fees_sats, Some(cost), "the send result");
+        assert_eq!(
+            outgoing_row(&w, &payment.id).fees_sats,
+            Some(cost),
+            "history"
+        );
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
