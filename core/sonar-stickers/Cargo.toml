@@ -3,7 +3,9 @@ name = "sonar-stickers"
 description = "Nostr sticker pack models and validation for Sonar"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# The repository's own license (LICENSE), not the workspace's MIT: this crate
+# ships to crates.io, where the license field is what users go by.
+license = "Unlicense"
 rust-version.workspace = true
 repository = "https://github.com/hedwig-corp/bitchat-to-sonar"
 readme = "README.md"
