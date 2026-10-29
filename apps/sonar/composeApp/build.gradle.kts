@@ -122,6 +122,40 @@ val desktopMainDir = layout.projectDirectory.dir("src/jvmMain")
 val desktopBindingsFile = desktopMainDir.file("kotlin/uniffi/sonar_ffi/sonar_ffi.kt")
 val desktopResourcesDir = desktopMainDir.dir("resources")
 
+// A `path = "…"` entry in a Cargo manifest: a path dependency, a [patch] or
+// [workspace.dependencies] path, or a [lib]/[[bin]] source file.
+val cargoPathEntry = Regex("""\bpath\s*=\s*"([^"]+)"""")
+
+fun cargoPathDeps(manifest: File): List<File> =
+    cargoPathEntry.findAll(manifest.readText())
+        .map { manifest.parentFile.resolve(it.groupValues[1]).canonicalFile }
+        // Drops the [lib]/[[bin]] source files: only a crate has a manifest.
+        .filter { it.resolve("Cargo.toml").isFile }
+        .toList()
+
+// Every file of every local crate a Rust core build compiles: the root crates
+// plus whatever their manifests (and the workspace manifest) reach through
+// `path` entries. Walking the manifests is a few small file reads, no cargo
+// call, and tracks a new path dependency without editing this file. The
+// hand-kept list it replaces missed bitchat-protocol, so 0.1-alpha.15.5's
+// release build reported buildAndroidRustCore UP-TO-DATE and packaged a stale
+// .so. Over-matching (a commented-out path, a dev-dependency, a crate a
+// feature leaves out) only costs a cargo no-op run.
+fun rustCoreSources(vararg roots: File): FileCollection {
+    val crates = linkedSetOf<File>()
+    val pending = ArrayDeque(roots.map { it.canonicalFile })
+    pending.addAll(cargoPathDeps(repoRootDir.resolve("core/Cargo.toml")))
+    while (pending.isNotEmpty()) {
+        val crate = pending.removeFirst()
+        if (crates.add(crate)) pending.addAll(cargoPathDeps(crate.resolve("Cargo.toml")))
+    }
+    // The whole crate, so its manifest, a build script or include_str! data
+    // count too. Test, bench and example targets never link into the library.
+    return files(crates.map { crate ->
+        fileTree(crate) { exclude("target/**", "tests/**", "benches/**", "examples/**") }
+    })
+}
+
 val buildAndroidRustCore = tasks.register<Exec>("buildAndroidRustCore") {
     description = "Builds the Android Rust core and UniFFI Android bindings."
     group = "build"
@@ -129,14 +163,8 @@ val buildAndroidRustCore = tasks.register<Exec>("buildAndroidRustCore") {
     inputs.file(repoRootDir.resolve("core/build-android.sh"))
     inputs.file(repoRootDir.resolve("core/Cargo.toml"))
     inputs.file(repoRootDir.resolve("core/Cargo.lock"))
-    inputs.dir(repoRootDir.resolve("core/sonar-core/src"))
-    inputs.dir(repoRootDir.resolve("core/sonar-ffi/src"))
-    // sonar-ffi's wallet crates: a change there must rebuild the .so, or an
-    // UP-TO-DATE task ships the previous wallet (and its bindings).
-    inputs.dir(repoRootDir.resolve("core/sonar-wallet/src"))
-    inputs.dir(repoRootDir.resolve("core/sonar-wallet-cdk/src"))
-    inputs.dir(repoRootDir.resolve("core/sonar-stickers/src"))
-    inputs.dir(repoRootDir.resolve("core/vendor/nostr-blossom/src"))
+    inputs.files(rustCoreSources(repoRootDir.resolve("core/sonar-ffi")))
+        .withPropertyName("rustSources")
     inputs.property(
         "sonarAbis",
         providers.environmentVariable("SONAR_ABIS")
@@ -160,13 +188,10 @@ val buildDesktopRustCore = tasks.register<Exec>("buildDesktopRustCore") {
     inputs.file(repoRootDir.resolve("core/build-desktop.sh"))
     inputs.file(repoRootDir.resolve("core/Cargo.toml"))
     inputs.file(repoRootDir.resolve("core/Cargo.lock"))
-    inputs.file(repoRootDir.resolve("core/sonar-ble/Cargo.toml"))
-    inputs.dir(repoRootDir.resolve("core/sonar-core/src"))
-    inputs.dir(repoRootDir.resolve("core/sonar-ffi/src"))
-    inputs.dir(repoRootDir.resolve("core/sonar-wallet/src"))
-    inputs.dir(repoRootDir.resolve("core/sonar-wallet-cdk/src"))
-    inputs.dir(repoRootDir.resolve("core/sonar-stickers/src"))
-    inputs.dir(repoRootDir.resolve("core/sonar-ble/src"))
+    // sonar-ble is its own workspace; its tree carries its own Cargo.lock.
+    inputs.files(
+        rustCoreSources(repoRootDir.resolve("core/sonar-ffi"), repoRootDir.resolve("core/sonar-ble")),
+    ).withPropertyName("rustSources")
     inputs.file(rootProject.file("gradle/libs.versions.toml"))
     outputs.file(desktopBindingsFile)
     outputs.dir(desktopResourcesDir)
