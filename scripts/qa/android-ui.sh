@@ -24,6 +24,8 @@
 #   android-ui.sh longpress <x> <y>
 #   android-ui.sh ime                prints "shown" / "hidden" (soft keyboard)
 #   android-ui.sh bounds <exact>     "x1 y1 x2 y2" of first EXACT match
+#   android-ui.sh boundst <substr>   "x1 y1 x2 y2" of first CONTAINS match (bubble text
+#                                    ends in inline-content glyphs, so EXACT misses it)
 #
 # Coordinates are device pixels, straight from `dump` — never read them off a
 # downscaled screenshot (the ÷2.667 conversion error cost hours in QA runs).
@@ -58,7 +60,7 @@ _dump_xml() {
   return 1
 }
 
-_query() { # mode(dump|find|findx|bounds) [needle] [nth]
+_query() { # mode(dump|find|findx|bounds|boundst) [needle] [nth]
   python3 - "$XML" "$1" "${2:-}" "${3:-1}" <<'PY'
 import html, re, sys
 xml, mode, needle, nth = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
@@ -80,6 +82,8 @@ for m in node.finditer(data):
         hits.append(f"{cx} {cy}")
     elif mode == "find" and (needle.lower() in t.lower() or needle.lower() in d.lower()):
         print(cx, cy); break
+    elif mode == "boundst" and (needle.lower() in t.lower() or needle.lower() in d.lower()):
+        print(x1, y1, x2, y2); break
     elif mode in ("findx", "bounds") and (t == needle or d == needle):
         hits.append(f"{cx} {cy}" if mode == "findx" else f"{x1} {y1} {x2} {y2}")
 if mode == "naf":
@@ -111,6 +115,7 @@ case "$cmd" in
   find)   _dump_xml; _query find "${1:?find <substr>}" ;;
   findx)  _dump_xml; _query findx "${1:?findx <exact>}" "${2:-1}" ;;
   bounds) _dump_xml; _query bounds "${1:?bounds <exact>}" ;;
+  boundst) _dump_xml; _query boundst "${1:?boundst <substr>}" ;;
   tapt|tapx)
     needle="${1:?$cmd <text>}"
     _dump_xml

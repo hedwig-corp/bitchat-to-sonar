@@ -211,6 +211,72 @@ qa002() { # reply arrives in the open chat
   fi
 }
 
+# text_start <substring> — "x y" just inside the top-left corner of the first
+# node containing it, i.e. a bubble's first glyphs. `find` returns the node's
+# centre, which on a wrapped bubble can land past the link. Retries like
+# `wait`: right after the app returns to the front a dump can come back empty.
+text_start() {
+  local i b
+  for i in 1 2 3 4 5; do
+    b="$("$UI" boundst "$1" 2>/dev/null)"
+    [[ -n "$b" ]] && { awk '{print $1 + 40, $2 + 30}' <<<"$b"; return 0; }
+    sleep 1
+  done
+  return 1
+}
+
+device_now() { adb -s "$QA_SERIAL" shell 'date "+%m-%d %H:%M:%S.000"' | tr -d '\r'; }
+
+# view_handler <host> <since> — the package that took a VIEW of https://<host>
+# after device time <since>; empty when nothing did. Android logs the host and
+# redacts the path, so each run uses a host of its own.
+view_handler() {
+  adb -s "$QA_SERIAL" logcat -d -T "$2" 2>/dev/null |
+    grep -m1 "act=android.intent.action.VIEW dat=https://$1/" |
+    sed -nE 's#.* cmp=([^/ ]+)/.*#\1#p'
+}
+
+# close_browser <package> — a browser left running starves the 2 GB QA
+# emulator: uiautomator dumps get killed and every later scenario misses.
+close_browser() {
+  [[ -n "$1" && "$1" != chat.bitchat.sonar ]] && adb -s "$QA_SERIAL" shell am force-stop "$1"
+  adb -s "$QA_SERIAL" shell am start -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
+}
+
+qa189() { # a tapped link opens in the browser; a long press opens the menu instead (#672)
+  [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-189 SKIP "needs QA-001"; return; }
+  local host="qa189-$RUN.example.com" www="www.qa189-$RUN.example.org" since link target xy pkg
+  link="https://$host/a"
+  "$PEERS" send "a-$RUN" "$APP_NPUB" "$link" >/dev/null
+  "$PEERS" send "a-$RUN" "$APP_NPUB" "$www" >/dev/null
+  "$UI" wait "$www" 30 >/dev/null || { record QA-189 FAIL "the peer's links never arrived"; return; }
+  sleep 1
+  since="$(device_now)"
+  xy="$(text_start "$link")"
+  [[ -n "$xy" ]] || { record QA-189 FAIL "no bubble holds $link"; return; }
+  ui longpress $xy
+  "$UI" wait "Reply" 5 >/dev/null || { record QA-189 FAIL "long-press on a link opened no menu"; return; }
+  ui key 4; sleep 1
+  pkg="$(view_handler "$host" "$since")"
+  if [[ -n "$pkg" ]]; then
+    close_browser "$pkg"
+    record QA-189 FAIL "a long press opened the link as well as the menu"; return
+  fi
+  for target in "$link|$host" "$www|$www"; do
+    since="$(device_now)"
+    xy="$(text_start "${target%%|*}")"
+    [[ -n "$xy" ]] || { record QA-189 FAIL "no bubble holds ${target%%|*}"; return; }
+    ui tap $xy
+    sleep 3
+    pkg="$(view_handler "${target##*|}" "$since")"
+    [[ -n "$pkg" ]] || { record QA-189 FAIL "tapping ${target%%|*} opened nothing (#672)"; return; }
+    # Back to the same chat for the scenarios after this one.
+    close_browser "$pkg"
+    "$UI" wait "$www" 10 >/dev/null || { record QA-189 FAIL "the chat was gone after returning from the browser"; return; }
+  done
+  record QA-189 PASS "both links opened a VIEW (https:// and www. as https://); long press opened the menu only"
+}
+
 # Reaction scenarios run in QA-001's chat, which QA-002 left open.
 reaction_chip_below() { # <message text> <emoji> — the chip sits under that bubble
   local my cy
@@ -844,6 +910,86 @@ qa093() { # turning sharing off withdraws your time; a peer's revoke clears the 
   fi
 }
 
+# qa187 helpers: emulator console link shaping, always undone.
+qa187_shape() {
+  # Console shaping applies to the emulated mobile-data link only, and its
+  # latency setting is a no-op on current images, so: Wi-Fi off (traffic
+  # moves to mobile data, which is the report) and GSM bandwidth. A TLS +
+  # WebSocket handshake then cannot finish inside RELAY_CONNECT_TIMEOUT.
+  adb -s "$QA_SERIAL" shell svc wifi disable >/dev/null 2>&1
+  adb -s "$QA_SERIAL" emu network speed gsm >/dev/null 2>&1
+  sleep 4
+}
+qa187_restore() {
+  adb -s "$QA_SERIAL" emu network speed full >/dev/null 2>&1
+  adb -s "$QA_SERIAL" emu network delay none >/dev/null 2>&1
+  adb -s "$QA_SERIAL" shell svc wifi enable >/dev/null 2>&1
+  sleep 3
+}
+# qa187_log_ms <log> <ERE> [last] — epoch ms of the first (or last) match.
+qa187_log_ms() {
+  local pick='NR==1'; [[ "${3:-}" == last ]] && pick='END'
+  grep -E "$2" <<<"$1" | awk "$pick"' { split($1, t, "."); print t[1] * 1000 + substr(t[2] "000", 1, 3) }'
+}
+
+qa187() { # cold launch on slow mobile data: first frame never waits for push's relay attach (#665)
+  if [[ "$QA_SERIAL" != emulator-* ]]; then
+    record QA-187 SKIP "needs an emulator: the link is shaped through its console"; return
+  fi
+  local budget="${QA187_BUDGET_MS:-4000}" runs="${QA187_RUNS:-3}"
+  local i t0 log total start end shown waited raced=0 slow=0 detail=""
+  qa187_shape
+  for ((i = 1; i <= runs; i++)); do
+    adb -s "$QA_SERIAL" shell am force-stop chat.bitchat.sonar >/dev/null 2>&1
+    sleep 2
+    t0="$(adb -s "$QA_SERIAL" shell date +%s 2>/dev/null | tr -d '\r')"
+    # An emulator that dropped off adb answers nothing; `logcat -T .000`
+    # would then wait forever. Stop here and say so.
+    if [[ ! "$t0" =~ ^[0-9]+$ ]]; then
+      qa187_restore
+      record QA-187 FAIL "inconclusive: $QA_SERIAL did not answer (offline?) before run $i:$detail"
+      return
+    fi
+    # TotalTime = launch → first frame. MainActivity defers that frame until
+    # boot()'s SonarCore.start() returns, so a start() queued behind the
+    # push attach shows up here directly.
+    total="$(adb -s "$QA_SERIAL" shell am start -W -n chat.bitchat.sonar/.MainActivity 2>/dev/null |
+      awk '/TotalTime/ {print $2}' | tr -d '\r')"
+    # Wait for the push attach to end (registered, or its first attempt
+    # timing out). On the GSM link that took ~12 s, well past the 5 s
+    # quorum timeout, so poll rather than sleep a fixed time.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      sleep 2
+      log="$(adb -s "$QA_SERIAL" logcat -d -v epoch -T "$t0.000" 2>/dev/null)"
+      end="$(qa187_log_ms "$log" 'SonarPush.*Transponder:? (MIP-05 push token registered|registration attempt 1/)')"
+      [[ -n "$end" ]] && break
+    done
+    start="$(qa187_log_ms "$log" 'SonarPush.*FCM token collected')"
+    shown="$(qa187_log_ms "$log" 'Displayed chat\.bitchat\.sonar/\.MainActivity')"
+    waited="$(grep -oE 'start: waited [0-9]+ ms' <<<"$log" | head -1)"
+    detail+=" run$i=${total:-?}ms"
+    [[ -n "$waited" ]] && detail+="($waited)"
+    # The run only counts when push registration's attach began before the
+    # first frame and the shaped link made it slow — otherwise nothing held
+    # the core lock and a fast launch proves nothing (the QA-142 trap).
+    if [[ -n "$start" && -n "$end" && -n "$shown" && -n "$total" ]] &&
+       (( start < shown && end - start >= 4000 )); then
+      raced=$((raced + 1))
+      (( total > budget )) && slow=$((slow + 1))
+    else
+      detail+="[no race]"
+    fi
+  done
+  qa187_restore
+  if (( raced == 0 )); then
+    record QA-187 FAIL "inconclusive: push's relay attach never overlapped a launch on the shaped link (FCM token not cached? shaping off?):$detail"
+  elif (( slow > 0 )); then
+    record QA-187 FAIL "$slow/$raced launches waited for push's relay attach (budget ${budget}ms):$detail"
+  else
+    record QA-187 PASS "first frame within ${budget}ms in $raced/$runs launches while push's relay attach was timing out:$detail"
+  fi
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -855,12 +1001,14 @@ echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 # drops input injected into its first screens.
 go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
-# Order matters: QA-002 and the reaction scenarios (QA-100..102, QA-106)
-# reuse QA-001's chat, QA-135 needs QA-004's chat as the newest one, QA-005
+# Order matters: QA-002, QA-189 and the reaction scenarios (QA-100..102,
+# QA-106) reuse QA-001's chat, QA-135 needs QA-004's chat as the newest one, QA-005
 # opens QA-004's, and QA-040 inspects the chat
-# QA-005 left open. QA-118 runs last: it clears the app's data (only with
+# QA-005 left open. QA-187 force-stops the app and shapes the emulator's link,
+# so it runs after the UI scenarios and restores Wi-Fi before QA-050 measures
+# idle CPU. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
+for s in qa001 qa002 qa189 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa187 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

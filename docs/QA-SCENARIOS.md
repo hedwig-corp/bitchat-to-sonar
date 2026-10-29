@@ -140,6 +140,29 @@ is the build under test on a dedicated QA emulator/simulator.
   to equal its own counter, so one lost frame rejected every later message
   until a re-handshake; the reference clients use a 1024-entry sliding window.
 
+### QA-189 — Links and mentions in a bubble open on tap
+- **Platforms:** both (Android automated; iOS driven by `ios-drive.sh` steps.
+  iOS has its own tap path, `SNTextBubbleCell.handleBodyTap`, so the Compose
+  fix does not cover it)
+- **Steps:** in any chat, receive `https://example.com` and `www.example.com`;
+  long-press one, then tap each. In a group, tap an `@mention` of a member.
+- **Expect:** each tap opens the browser on that address (Android opens the
+  `www.` one as `https://`); the mention opens that member's profile; the long
+  press opens the message menu and does not open the link.
+- **How:** `android-smoke.sh` QA-189 (asserts the `VIEW` intent in logcat;
+  use a host per run, Android logs only the host) · Guard:
+  `MessageLinkTapUiTest` (jvm UI test at the real `ReplyDecorated` +
+  `MessageBubble` call site; also covers the mention). iOS: a peer sends both
+  links, then `ios-drive.sh` `longpressxy` / `tapxy` on the link's first line
+  (points from the `tree` dump) and check
+  `simctl spawn <udid> launchctl list | grep mobilesafari` before and after.
+  Mentions on a device are manual: they need a group whose members have
+  display names, which the scripted peers do not set up.
+- **Origin:** 2026-10-27. Since #587 no tap on Android resolved: the bubble's
+  tap handler checked `down.isConsumed` after the up, by which time the row's
+  `combinedClickable` had consumed the down. It also kept a stale text layout
+  after a reflow.
+
 ## Cross-client Bluetooth mesh (#671)
 
 The codec half of mesh interop is proved in CI: `scripts/bitchat-vectors/cross-replay.sh`
@@ -1020,6 +1043,121 @@ share a zone with the app and report the zone the app shared with it.
   ANRs and 23–26 % idle CPU on Home, the same on a `main` build. With one
   advertiser, main-thread time went 68 → 32 ticks/60 s after the fix.
 
+### QA-187 — Cold launch on cellular while a push wake is in flight
+- **Platforms:** both, both scripted. The real iOS extension only runs on a
+  device (`simctl push` never starts it), so a device pass stays the final
+  check for the extension's own observer wiring.
+- **How (iOS):** `scripts/qa/ios-launch-store-yield.sh` against a signed
+  Debug build from `ios-setup.sh` and a throwaway `SONAR_BENCH_NSEC`. A
+  stand-in process takes the SAME App Group store `flock` the extension takes
+  and either yields on the app's signal (the fixed extension) or holds it 13 s
+  (the old one); the real app is cold-launched each time and
+  `t0_launch → t1_local_paint` is read from its bench markers. PASS needs the
+  no-holder and yielding launches within 3000 ms AND the 13 s holder to delay
+  paint past 10 s, which proves the lock sits on the paint path; otherwise it
+  FAILs as inconclusive. Reboot the simulator after `ios-setup.sh`: its own
+  launch leaves a notification-permission alert that keeps the app inactive.
+- **How (Android):** `android-smoke.sh` QA-187 (emulator only). It turns the
+  emulator's Wi-Fi off and sets the console link to GSM bandwidth, then
+  cold-starts the app three times and reads `am start -W` TotalTime (launch
+  to first frame, which `MainActivity` defers until `boot()`'s
+  `SonarCore.start()` returns). A launch counts only when push
+  registration's relay attach began before the first frame and took 4 s or
+  more on the shaped link; if none does, the step FAILs as inconclusive
+  rather than passing. Budget 4000 ms (`QA187_BUDGET_MS`). The console's
+  latency setting is a no-op on current images and shaping never applies
+  to the emulated Wi-Fi, which is why the step uses bandwidth on mobile data.
+- **Steps:** account with a few active chats. Put the phone on cellular
+  (Wi-Fi off), kill the app, have a `sonar-cli` peer send 3–5 messages so
+  the push wakes fire, then tap the app icon while the banners are still
+  arriving. Repeat on Wi-Fi as the control.
+- **Expect:** the chat list paints within the normal cold-start budget on
+  both networks (`docs/PERFORMANCE.md`, `t0→t1_local_paint`). It must not sit
+  on the launch surface (iOS black "sonar" screen, Android starting window)
+  for the length of the wake's relay timeouts.
+  - iOS log: the NSE diagnostics stamp `yield:hostWantsStore` followed by
+    `yield:abandonedHydrate`, and the app logs no slow
+    `marmot workQueue op=connectLocal` line (it is printed only past the
+    slow-op threshold) — the open no longer waits for the NSE's 5 s relay
+    quorum + 8 s drain. The NSE writes to the unified log only, so on a
+    device its stamps need `sudo log collect --device-udid`; the app's
+    `sonar-ios.log` in the app container carries the bench markers and
+    `pathIsExpensive -> true` on cellular. The banner that wake was decorating
+    stays generic and silent; the app paints the message itself.
+  - Android logcat: no `Core: start: waited N ms for the core lock` line
+    with N in the thousands. `boot()`'s `SonarCore.start()` answers from the
+    node push registration already opened instead of queueing behind its
+    `connectRelays()` attach.
+- **Guarding tests:**
+  - `latched_collect_after_wake_refuses_instead_of_syncing` (`core/sonar-ffi`):
+    a latched node refuses the wake drain at once.
+  - `dropping_a_node_does_not_wait_for_blocking_tasks` and
+    `aborted_connect_returns_without_waiting_for_blocking_tasks`
+    (`core/sonar-ffi`): releasing a node, or a connect the host aborted,
+    waits at most 2 s for tokio's blocking pool instead of indefinitely. The
+    relay dial resolves hostnames there, so on a stalled cellular resolver
+    the NSE's yield used to release the store lock only after the resolver
+    timed out. The first test fails in 20 s with tokio's own drop (measured).
+  - `MarmotStoreLockTests.acquireExclusiveAsksHolderToYield` (iOS): the app's
+    blocking acquire posts the yield notification before it parks, and a
+    holder that releases on it lets the acquire through.
+  - Not unit-pinned: the NSE's observer wiring and the Android `start()` fast
+    path. The two scripted steps above check them end to end; the real
+    extension process still needs a device pass.
+- **Last run (2026-10-13, Sonar_QA_API_36 emulator, shaped link):**
+
+  | Build | TotalTime per launch | Core lock wait logged |
+  |---|---|---|
+  | Fix (#665) | 2128, 2095, 2064 ms: PASS | none |
+  | Fast path removed | 6812, 6936, 6862 ms: FAIL | 4722, 4641, 4622 ms |
+
+  Rerun on the final code (2026-10-24, same emulator): 2189, 2009, 2064 ms,
+  PASS.
+
+- **Last iOS run (2026-10-24, iPhone 17 Pro simulator, iOS 26.5):** built
+  with #669's Breez 0.12.4 package from a local copy of its binary (the
+  release asset it pins did not exist yet). CI's exact build command: BUILD
+  SUCCEEDED, the notification extension included. `bitchatTests_iOS`, serial
+  as in CI: 1016 tests in 133 suites passed, the new yield test among them.
+  `ios-launch-store-yield.sh`:
+
+  | Store lock holder | t0 → t1 local paint |
+  |---|---|
+  | none | 263 ms |
+  | yields on the signal (fixed extension) | 375 ms |
+  | holds 13 s, ignores it (old extension) | 10066 ms |
+
+  Earlier, before the package was restored, the yield test's logic ran as a
+  plain process on the simulator: with `signalHostWantsStore()` removed the
+  acquire stayed parked until its 3 s limit.
+- **Last device run (2026-10-27, iPhone 14 Pro Max, real account, 399
+  groups):** signed Debug build of this branch installed in place over
+  1.15.4 (49), data kept. Bench markers from the app container's
+  `sonar-ios.log`, seconds after `t0_launch`:
+
+  | Network | Launch | t1 local paint | t4 first drain |
+  |---|---|---|---|
+  | Wi-Fi | cold, first after install | 1.62 | 3.87 |
+  | Wi-Fi | cold ×3 | 1.26, 1.50, 0.60 | 2.20, 3.34, 2.02 |
+  | Cellular | cold ×3 | 2.29, 0.52, 1.00 | 4.08, 2.17, 2.78 |
+  | Cellular | resume | 0.53 after became-active | — |
+
+  Relay connect began after local paint on every launch. The slowest
+  cellular launch opened the store 0.3 s after `t0` (no lock wait); the rest
+  was the local load plus a 757 ms main-thread stall from the chat-list row
+  rebuild that 1.15.4 shows too. No push wake overlapped these launches, so
+  the extension's yield on a real device is still unobserved. The 1.15.4
+  log on the same phone held 21 foregrounds (12 on cellular) over a week,
+  all painting within 0.8 s of becoming active: the bug needs a wake in
+  flight at the moment of launch.
+- **Origin:** 2026-10-13 tester report "quando non sono in Wi-Fi non si
+  apre". Both hosts gate first paint on the local store open, and both let a
+  push-driven relay attach hold the store lock across its network timeouts:
+  Android's `SonarPushRegistration` holds the `SonarCore` mutex across
+  `connectRelays()`, iOS's NSE holds the App Group `flock` across
+  `SonarNode.connect` + `collectNotificationsAfterWake`. On Wi-Fi the attach
+  finishes in about a second, so only cellular users saw it.
+
 ## Wallet (Cashu)
 
 Money scenarios never need real sats: point a DEBUG iOS build at a local
@@ -1605,6 +1743,28 @@ real mint and need the maintainer's approval of the amounts.
   wallet can't set it"), and the fee line priced it at no amount. That rule
   came from Breez, which cannot set an invoice's amount. The Cashu core and
   mint could pay it all along. Now only the old wallet refuses it.
+
+### QA-175 — A legacy Breez wallet store written by 0.12.4 still opens on iOS
+- **Platforms:** iOS (automated). Android/desktop stay on the 0.12.4 KMP
+  package, so the engine never moved there.
+- **Steps:** Run `LegacyBreezStoreOpenTests`: the committed store
+  `ios/bitchatTests/Fixtures/breez-0.12.4-storage.sql` (schema `user_version`
+  46, written by Breez's own 0.12.4 engine) is copied under
+  `<tmp>/mainnet/73c5da0a/` and opened with `connect` against unreachable
+  explorers; no network, no API key.
+- **Expect:** `connect` succeeds, `getInfo()` reports fingerprint `73c5da0a`
+  and balance 0, the same `storage.sql` inode is still there and no second
+  wallet directory was created. Manually: an install that had the legacy Breez
+  wallet before 1.15.4 still shows its balance after updating, instead of
+  "wallet unavailable".
+- **How:** unit test at the real call site (`BreezSDKLiquid.connect`).
+- **Guard:** `LegacyBreezStoreOpenTests.testStoreWrittenByThe0124EngineOpens`
+- **Origin:** #667 review round 5. The first vendored replacement for the
+  deleted `breez-sdk-liquid-swift` package carried the 0.11.13 engine (the only
+  mirrored Swift release); its persister refuses a store a 0.12.4 build had
+  migrated (`DatabaseTooFarAhead`), so every existing legacy wallet showed as
+  unavailable on iOS. The package is 0.12.4 again
+  (`ios/localPackages/BreezSDKLiquid/MIRROR.md`).
 
 ### QA-188 — A send that swaps first reports all it cost as its fee
 - **Platforms:** both (one Rust core; headless with `sonar-cashu-cli`
