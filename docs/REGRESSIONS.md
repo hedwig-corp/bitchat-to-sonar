@@ -3324,8 +3324,74 @@ with the wire value.* snow caps messages at 65 535 bytes while bitchat
 encrypts whole 1 MiB private files in one message, so the crate derives the
 split keys and owns the cipher state instead.
 
+## R-060 — A BLE link can speak for every mesh app on the remote device
+
+**Invariant:** On iOS, a central's link speaks for each identity whose own
+full-TTL announce verified on it, not only the first one that bound it. A
+further identity joins only when the announce decodes, its Noise key derives
+the claimed peer ID, its signature checks out, and its signing key matches the
+one already pinned for that peer. The first binding never moves. On a link
+shared by several identities, each one stays linked only while it keeps
+announcing (`bleSharedLinkIdentityTimeoutSeconds`). On the peripheral side, an
+invalidated mesh service releases the identity bound through it.
+
+**Breaks as:** a phone running Sonar beside stock bitchat (one radio, one
+central as seen from the iPhone) is seen by the iPhone as only one of the two
+apps. The other's packets, its own announce included, are dropped as "Sender ID
+spoofing" ("Android sees the iPhone, the iPhone does not see Android"). Which app
+wins depends on which announces first after a reconnect, so it comes and goes.
+After the losing app quits, the shared link stays up (the other app holds it),
+and the quit app shows as online indefinitely.
+
+**Call sites:** iOS `BLEService.swift::receiveCentralPacket` (ingress,
+`MeshLinkSenderPolicy.ingress`), `verifiesDirectAnnounce`, `linkState(for:)`,
+`snapshotSubscribedCentrals` (directed sends), `peripheral(_:didModifyServices:)`
+→ `releasePeripheralIdentity`; `RelayController.swift::MeshLinkIdentities`.
+Compose/core: not applicable as written. The Rust engine has no per-link
+sender gate, so Android sees both apps already. Its server role does keep one
+Noise session and one routing binding per connection, which is tracked under
+Unguarded.
+
+**Guarded by:** `BLEServiceSharedLinkTests.secondAppOnTheSameCentralIsSeen` (real write path; fails before the fix: the second announce is rejected), `BLEServiceSharedLinkTests.anAppThatStoppedAnnouncingDropsOffASharedLink`
+
+**Also guarded by:** `BLEServiceSharedLinkTests.aForgedSecondIdentityStaysOut`, `BLEServiceSharedLinkTests.aLinkWithOneAppVouchesWhileItIsUp`, `RelayControllerTests.linkSenderPolicy_letsASecondAppOnTheDeviceAskToJoinTheLink`, `RelayControllerTests.linkIdentities_vouchForEachAppOnlyWhileItAnnounces`
+
+**Not guarded:** `releasePeripheralIdentity` (needs a `CBPeripheral` and a
+service-invalidation callback; no seam), and the CoreBluetooth reassembly in
+`didReceiveWrite` ahead of `receiveCentralPacket`. The over-the-air case is
+QA-190.
+
+**History:** #244 (2026-07-14) let relayed announces through a bound link and
+kept the binding immutable. Live debugging on 2026-10-29 (Pixel 10 Pro running
+Sonar 0.1-alpha.15.5 beside `com.bitchat.droid`, iPhone 1.15.5) showed 4,011
+"spoofing" drops in a day, including the Pixel's own Sonar announces bound
+against stock bitchat's ID.
+
+**Rejected:**
+- *Rebinding the link to the latest verified announcer* (upstream bitchat iOS
+  does this for peer-ID rotation). With two live apps the binding flips on
+  every announce, so each app is alternately offline and directed sends go to
+  the wrong one. It also breaks #244's immutable binding.
+- *Accepting every relayed packet type through a bound link, as upstream does
+  (only REQUEST_SYNC is pinned).* This would fix the multi-app case only by
+  accident, and it widens what a neighbour can inject far beyond this bug. It
+  is a separate interop divergence, recorded in SPEC.md §12.
+- *Gating liveness on fresh announces for every link.* A single-app link would
+  then flip offline whenever announces are lost, which the 135 s retention bar
+  exists to prevent. The gate applies only once a link is shared.
+
 ## Unguarded
 
+- **Android's server role keeps one Noise session per connection (R-060's
+  mirror).** `core/sonar-core/src/mesh_engine.rs` `ServerConn` holds one
+  `noise` state and one `bind`, and a direct announce rebinds `bind` to the
+  latest announcer (`origin_bind` in the announce handler). A remote device
+  running two mesh apps that both connect to Android over one connection (an
+  iPhone with Sonar and stock bitchat) is seen as both apps. Their handshakes
+  share one Noise state, though, and directed sends go to whichever announced
+  last. The follow-up is per-identity Noise and binding state on server
+  connections, with an engine test that drives two identities through one
+  `conn`. iOS's centrals are fixed by R-060.
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
   #498 made core stop filtering `member_count <= 2` out of
   `pending_group_invites` so a rate-limited first-contact DM parks visibly
