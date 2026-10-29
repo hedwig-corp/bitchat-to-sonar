@@ -1,12 +1,52 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.15.4 (49)** · **v0.1-alpha.15.4** (Android 0.1-alpha.15.4, code 27)
+Build: **Sonar 1.15.5 (50)** · **v0.1-alpha.15.5** (Android 0.1-alpha.15.5, code 28)
 
-Point release on alpha.15. **Headline: going from offline to online no
-longer freezes the app (#656, #657, #659).** The effect is biggest on
-accounts with hundreds of chats.
+Point release on alpha.15. **Headline: Sonar opens straight away on
+cellular (#665), and Cashu sends count every fee the mint charges (#666).**
 
-## 0. Offline → online without freezing (headline, iOS)
+## 0. Opening on cellular (headline, iOS)
+
+A push that arrived just before you opened the app could hold the local
+store while it reached the relays, so first paint waited on a slow cellular
+connection.
+
+- On cellular (Wi-Fi off), have someone message you, then open Sonar from
+  the notification. Your chats should show within a couple of seconds.
+- Do it again with Sonar fully closed. It should not sit on an empty home.
+
+## 0a. Cashu sends and fees (#666, #662, iOS + Android)
+
+- Send from a wallet that has had ecash for a while. The fee you see before
+  paying should match what leaves your balance afterwards.
+- **Max** should send everything that can be sent, fee included, and not
+  fail with "insufficient funds".
+- Pay a Lightning invoice that has **no amount**: type the amount and pay.
+- Wait on the confirm screen for a minute before paying. The app gets a fresh
+  quote quietly instead of failing.
+- A send that is refused now says why, with the shortfall, on the status
+  screen.
+- Paying a contact whose only payment address is from the old Breez wallet
+  is refused with a clear reason instead of failing later.
+- Android: the pay sheet's **Send** button stays whole with the keyboard up.
+
+## 0b. Bluetooth mesh with stock bitchat (#671, iOS + Android)
+
+The mesh wire format now lives in one library checked byte for byte against
+both bitchat apps. Not yet tested on real phones, so this needs you:
+
+- With a friend on the stock **bitchat** app (iOS or Android) in range, send
+  a short and a long public message each way. Both should arrive whole.
+- Send a private message each way.
+- Anything that arrives garbled or not at all: **Settings → Diagnostics →
+  Share** from Sonar, and note the other app and its version.
+
+## 0c. Links in messages (#672, Android)
+
+- Tap a link (`https://…` or `www.…`) in a chat bubble: it opens the
+  browser. A long-press still opens the message menu.
+
+## 0d. Offline → online without freezing (from 1.15.4)
 
 Three things blocked the screen or the catch-up when the app came back:
 - recomputing every chat's local-time setting on the way into the
@@ -23,7 +63,7 @@ Three things blocked the screen or the catch-up when the app came back:
   seconds, even with many chats.
 - If it still stutters: **Settings → Diagnostics → Share** right away.
 
-## 0a. Fewer background messages to your contacts (#657, iOS + Android)
+## 0e. Fewer background messages to your contacts (from 1.15.4, #657)
 
 Sonar tells the people you chat with how to wake your phone for new
 messages. It used to resend that to everyone on every sync, which on a big
@@ -33,14 +73,14 @@ once, in small batches, and again only when your notification token changes.
 - Nothing to tap. Check that a message from someone you have not talked to in
   a while still produces a notification while Sonar is closed.
 
-## 0b. Messages missed while you were away (from 1.15.3, #649)
+## 0f. Messages missed while you were away (from 1.15.3, #649)
 
 - Send a message in a chat, then leave Sonar in the background (or switch off
   data) for more than 30 minutes while the other person replies.
 - Open Sonar for about 15 seconds **without** opening that chat. The reply
   should already be in the chat row and in the transcript.
 
-## 0c. Local time in chats (from 1.15.2, #644)
+## 0g. Local time in chats (from 1.15.2, #644)
 
 - With **Settings → Privacy & safety → Share local time** on, ask a contact
   on 1.15.2+ (or Android 0.1-alpha.15.3+) to open your chat. Their header
@@ -49,7 +89,7 @@ once, in small batches, and again only when your notification token changes.
 - If a header still shows "Via internet" / "Nearby · Bluetooth" after a
   minute, send **Settings → Diagnostics → Share** from **both** phones.
 
-## 0d. Launch speed (from 1.15.1, #629)
+## 0h. Launch speed (from 1.15.1, #629)
 
 - Kill the app, reopen it. Home should show your chats within a couple of
   seconds, not sit empty while the network thrashes.
