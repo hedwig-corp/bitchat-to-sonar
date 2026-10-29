@@ -8,17 +8,37 @@ struct RelayDecision {
 }
 
 /// Keeps physical-link authentication separate from identities carried through
-/// that link by the mesh. Announce and Sonar profile packets authenticate their
-/// claimed sender at the protocol layer, so a decremented-TTL copy is a valid
-/// relay candidate rather than an attempt to impersonate the direct neighbour.
+/// that link by the mesh. Every packet type authenticates its claimed sender at
+/// the protocol layer, not by the link it arrived on: announces, Sonar profiles,
+/// public messages and files are signed and checked against the pinned key, a
+/// Noise handshake must match the sender's static key, Noise ciphertext only
+/// opens with that sender's session, and a leave is verified before it evicts.
+/// So a relayed packet from another sender is a relay candidate rather than an
+/// attempt to impersonate the direct neighbour, as in upstream bitchat
+/// (`BLEIngressLinkRegistry`).
 struct MeshLinkSenderPolicy {
     static func preservesSigningIdentity(existing: Data?, announced: Data) -> Bool {
         existing == nil || existing == announced
     }
 
-    static func allowsRelayedIdentityPacket(type: UInt8, ttl: UInt8) -> Bool {
-        guard ttl > 0, ttl < TransportConfig.messageTTLDefault else { return false }
-        return type == MessageType.announce.rawValue || type == SonarAnnouncePacket.packetType
+    /// Whether a packet from someone other than the link peer can have come
+    /// through the link peer as a relay.
+    ///
+    /// - REQUEST_SYNC is never relayed: it asks the link peer to replay its
+    ///   store to whoever the sender claims to be.
+    /// - A relay decrements the TTL before forwarding, so a full-TTL packet
+    ///   from someone else is not a relay.
+    /// - TTL 0 is a sync reply. A flagged one (RSR) is checked against the link
+    ///   peer's request (`RequestSyncManager`), not against its original
+    ///   author; stock bitchat-android sends its replies unflagged (SPEC §12.1),
+    ///   and those get the ordinary timestamp check.
+    /// - Our own packet comes back only as a flagged reply. `isSelfEcho` drops
+    ///   the TTL > 0 copies, and an unflagged TTL-0 copy would be shown as sent
+    ///   by us without a signature check (`handleMessage`).
+    static func allowsRelayedPacket(type: UInt8, ttl: UInt8, isRSR: Bool, senderIsSelf: Bool) -> Bool {
+        guard type != MessageType.requestSync.rawValue,
+              ttl < TransportConfig.messageTTLDefault else { return false }
+        return !senderIsSelf || (ttl == 0 && isRSR)
     }
 
     static func isSelfEcho(senderIsSelf: Bool, ttl: UInt8) -> Bool {
@@ -29,8 +49,9 @@ struct MeshLinkSenderPolicy {
     enum Ingress: Equatable {
         /// From an identity the link already speaks for.
         case trusted
-        /// A relayed announce or Sonar profile: validated as its claimed sender.
-        case relayedIdentity
+        /// Relayed by the link peer: validated as its claimed sender, or, for
+        /// a sync reply, against the link peer's request.
+        case relayed
         /// A full-TTL announce from an identity the link does not speak for
         /// yet. Two mesh apps on one device share its radio, so this is the
         /// other app, provided its signature verifies (the caller checks).
@@ -38,12 +59,17 @@ struct MeshLinkSenderPolicy {
         case reject
     }
 
-    static func ingress(claimed: PeerID, link: MeshLinkIdentities, type: UInt8, ttl: UInt8) -> Ingress {
-        if link.carries(claimed) { return .trusted }
+    static func ingress(claimed: PeerID, link: MeshLinkIdentities, type: UInt8, ttl: UInt8, isRSR: Bool, senderIsSelf: Bool) -> Ingress {
+        ingress(carriedByLink: link.carries(claimed), type: type, ttl: ttl, isRSR: isRSR, senderIsSelf: senderIsSelf)
+    }
+
+    /// The same decision for a link bound to a single identity (a peripheral).
+    static func ingress(carriedByLink: Bool, type: UInt8, ttl: UInt8, isRSR: Bool, senderIsSelf: Bool) -> Ingress {
+        if carriedByLink { return .trusted }
         if type == MessageType.announce.rawValue, ttl == TransportConfig.messageTTLDefault {
             return .candidateDirectIdentity
         }
-        if allowsRelayedIdentityPacket(type: type, ttl: ttl) { return .relayedIdentity }
+        if allowsRelayedPacket(type: type, ttl: ttl, isRSR: isRSR, senderIsSelf: senderIsSelf) { return .relayed }
         return .reject
     }
 }
@@ -72,6 +98,11 @@ struct MeshLinkIdentities {
 
     /// More than one app has announced directly on this link.
     var isShared: Bool { lastDirectAnnounce.keys.contains { $0 != primary } }
+
+    /// Every identity that has announced directly on this link, `primary` first.
+    var identities: [PeerID] {
+        [primary] + lastDirectAnnounce.keys.filter { $0 != primary }.sorted { $0.id < $1.id }
+    }
 
     mutating func noteDirectAnnounce(from peerID: PeerID, at date: Date) {
         lastDirectAnnounce[peerID] = date

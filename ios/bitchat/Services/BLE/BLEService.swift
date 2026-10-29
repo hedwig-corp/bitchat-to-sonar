@@ -1235,6 +1235,17 @@ final class BLEService: NSObject {
         return true
     }
 
+    /// Who `packet` is validated as. A relayed sync reply carries its original
+    /// author's sender ID, but we asked the link peer for it, so the response
+    /// window to check is the link peer's. Anything else is validated as the
+    /// identity the link speaks for, or as its claimed sender.
+    private func relayValidationPeer(for packet: BitchatPacket, claimed: PeerID, trusted: PeerID?, linkPeers: [PeerID]) -> PeerID {
+        if let trusted { return trusted }
+        guard packet.isRSR, let primary = linkPeers.first else { return claimed }
+        guard linkPeers.count > 1 else { return primary }
+        return linkPeers.first { requestSyncManager.isValidResponse(from: $0, isRSR: true) } ?? primary
+    }
+
     // MARK: - Packet Broadcasting
     
     private func broadcastPacket(_ packet: BitchatPacket, transferId: String? = nil) {
@@ -2760,6 +2771,22 @@ extension BLEService {
         bleQueue.sync { receiveCentralPacket(packet, centralUUID: centralUUID, central: nil, receivedAt: receivedAt) }
     }
 
+    /// Deliver `packet` as if peripheral `peripheralUUID`, bound to
+    /// `boundPeerID`, had notified it: the real per-frame path of
+    /// `bufferNotificationChunk`, minus the stream reassembly (a test cannot
+    /// make the `CBPeripheral` that keeps the binding).
+    func _test_receivePeripheralPacket(_ packet: BitchatPacket, fromPeripheralUUID peripheralUUID: String, boundTo boundPeerID: PeerID?) {
+        bleQueue.sync {
+            var bound = boundPeerID
+            receivePeripheralPacket(packet, peripheralUUID: peripheralUUID, boundPeerID: &bound)
+        }
+    }
+
+    /// Record that we asked `peerID` to sync, opening its RSR response window.
+    func _test_registerSyncRequest(to peerID: PeerID) {
+        requestSyncManager.registerRequest(to: peerID)
+    }
+
     /// Whether some central's link currently vouches for `peerID`.
     func _test_hasCentralLink(to peerID: PeerID) -> Bool {
         linkState(for: peerID).hasCentral
@@ -2932,46 +2959,54 @@ extension BLEService: CBPeripheralDelegate {
                 SecureLogger.error("❌ Failed to decode assembled notification frame (len=\(frame.count), prefix=\(prefix))", category: .session)
                 continue
             }
-
-            let claimedSenderID = PeerID(hexData: packet.senderID)
-
-            if MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: claimedSenderID == myPeerID, ttl: packet.ttl) {
-                continue
-            }
-
-            let trustedSenderID: PeerID?
-            if let knownPeerID = boundPeerID {
-                if knownPeerID != claimedSenderID {
-                    if MeshLinkSenderPolicy.allowsRelayedIdentityPacket(type: packet.type, ttl: packet.ttl) {
-                        trustedSenderID = nil
-                    } else {
-                        SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Peripheral \(peripheralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
-                        continue
-                    }
-                } else {
-                    trustedSenderID = knownPeerID
-                }
-            } else {
-                trustedSenderID = nil
-            }
-
-            if !validatePacket(packet, from: trustedSenderID ?? claimedSenderID, connectionSource: .peripheral(peripheralUUID)) {
-                continue
-            }
-
-            // If this is a direct-link announce, bind immediately for the remainder of this batch.
-            if boundPeerID == nil,
-               packet.type == MessageType.announce.rawValue,
-               packet.ttl == messageTTL {
-                boundPeerID = claimedSenderID
-                state.peerID = claimedSenderID
-                peripherals[peripheralUUID] = state
-            }
-            processNotificationPacket(packet, from: peripheral, peripheralUUID: peripheralUUID)
+            receivePeripheralPacket(packet, peripheralUUID: peripheralUUID, boundPeerID: &boundPeerID)
         }
     }
 
-    private func processNotificationPacket(_ packet: BitchatPacket, from peripheral: CBPeripheral, peripheralUUID: String) {
+    /// One decoded notification frame from `peripheralUUID`. `boundPeerID` is
+    /// the link's binding as of this frame; a direct announce sets it for the
+    /// rest of the batch.
+    private func receivePeripheralPacket(_ packet: BitchatPacket, peripheralUUID: String, boundPeerID: inout PeerID?) {
+        let claimedSenderID = PeerID(hexData: packet.senderID)
+
+        if MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: claimedSenderID == myPeerID, ttl: packet.ttl) {
+            return
+        }
+
+        let trustedSenderID: PeerID?
+        if let knownPeerID = boundPeerID {
+            switch MeshLinkSenderPolicy.ingress(carriedByLink: knownPeerID == claimedSenderID, type: packet.type, ttl: packet.ttl, isRSR: packet.isRSR, senderIsSelf: claimedSenderID == myPeerID) {
+            case .trusted:
+                trustedSenderID = knownPeerID
+            case .relayed:
+                trustedSenderID = nil
+            case .candidateDirectIdentity, .reject:
+                SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Peripheral \(peripheralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
+                return
+            }
+        } else {
+            trustedSenderID = nil
+        }
+
+        let validationPeerID = relayValidationPeer(for: packet, claimed: claimedSenderID, trusted: trustedSenderID, linkPeers: boundPeerID.map { [$0] } ?? [])
+        if !validatePacket(packet, from: validationPeerID, connectionSource: .peripheral(peripheralUUID)) {
+            return
+        }
+
+        // If this is a direct-link announce, bind immediately for the remainder of this batch.
+        if boundPeerID == nil,
+           packet.type == MessageType.announce.rawValue,
+           packet.ttl == messageTTL {
+            boundPeerID = claimedSenderID
+            if var state = peripherals[peripheralUUID] {
+                state.peerID = claimedSenderID
+                peripherals[peripheralUUID] = state
+            }
+        }
+        processNotificationPacket(packet, peripheralUUID: peripheralUUID)
+    }
+
+    private func processNotificationPacket(_ packet: BitchatPacket, peripheralUUID: String) {
         let senderID = PeerID(hexData: packet.senderID)
 
         if packet.type != MessageType.announce.rawValue {
@@ -3463,11 +3498,13 @@ extension BLEService: CBPeripheralManagerDelegate {
 
         let isDirectAnnounce = packet.type == MessageType.announce.rawValue && packet.ttl == messageTTL
         let trustedSenderID: PeerID?
+        var linkPeers: [PeerID] = []
         if let link = centralLinks[centralUUID] {
-            switch MeshLinkSenderPolicy.ingress(claimed: claimedSenderID, link: link, type: packet.type, ttl: packet.ttl) {
+            linkPeers = link.identities
+            switch MeshLinkSenderPolicy.ingress(claimed: claimedSenderID, link: link, type: packet.type, ttl: packet.ttl, isRSR: packet.isRSR, senderIsSelf: claimedSenderID == myPeerID) {
             case .trusted:
                 trustedSenderID = claimedSenderID
-            case .relayedIdentity:
+            case .relayed:
                 trustedSenderID = nil
             case .candidateDirectIdentity:
                 // A second app on the same device (Sonar beside stock bitchat)
@@ -3487,7 +3524,8 @@ extension BLEService: CBPeripheralManagerDelegate {
             trustedSenderID = nil
         }
 
-        if !validatePacket(packet, from: trustedSenderID ?? claimedSenderID, connectionSource: .central(centralUUID)) {
+        let validationPeerID = relayValidationPeer(for: packet, claimed: claimedSenderID, trusted: trustedSenderID, linkPeers: linkPeers)
+        if !validatePacket(packet, from: validationPeerID, connectionSource: .central(centralUUID)) {
             return
         }
 

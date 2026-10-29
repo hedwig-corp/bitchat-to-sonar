@@ -317,6 +317,25 @@ shape if the codec is at fault, and extend the scenario here.
   iPhone saw Sonar only when it happened to announce first, and kept Sonar
   online after it was force-closed. SPEC §12.2, R-060.
 
+### QA-192 — Traffic relayed by a third device reaches the iPhone
+- **Platforms:** SI and SA out of direct range of each other (or SI in the
+  background, which Android's scan cannot see), with a third mesh device (SA,
+  BA or Sonar desktop) in range of both acting as the relay.
+- **Steps:**
+  1. Confirm on SI that SA shows as a mesh (not direct) peer and the relay
+     shows as direct.
+  2. From SA, send a public mesh message and a DM to SI.
+  3. From SI, send a DM to SA.
+- **Expect:** both of SA's messages appear on SI, and SI's DM reaches SA, all
+  over the mesh with no internet. On the SI side, `sonar-ios.log` shows no
+  "Sender ID spoofing" lines naming SA's ID claimed through the relay's link.
+- **How:** manual (needs three devices) · Guard:
+  `BLEServiceRelayedIngressTests.aHandshakeRelayedThroughACentralIsAnswered`,
+  `BLEServiceRelayedIngressTests.aHandshakeRelayedThroughAPeripheralIsAnswered`
+- **Origin:** device measurement for #679 on 2026-10-29. The backgrounded
+  iPhone was reachable from the Pixel only through a relay, and dropped
+  1,353 relayed packets as "spoofing" that day. SPEC §12.2, R-061.
+
 ## Media
 
 ### QA-010 — Send a photo

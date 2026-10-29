@@ -88,6 +88,91 @@ struct BLEServiceSharedLinkTests {
     }
 }
 
+/// A link peer relays other peers' traffic. Sonar iOS accepted only relayed
+/// announces through a bound link, so a DM handshake, message or sync reply
+/// from anyone beyond the link peer died as "spoofing": 1,353 drops on one
+/// iPhone on 2026-10-29, among them every packet the Pixel sent it through a
+/// relay while the iPhone was in the background. These tests drive the REAL
+/// receive paths of both roles (`receiveCentralPacket`,
+/// `receivePeripheralPacket`).
+struct BLEServiceRelayedIngressTests {
+
+    @Test
+    func aHandshakeRelayedThroughACentralIsAnswered() async throws {
+        let ble = makeService()
+        let relay = MeshApp(nickname: "relay")
+        let far = MeshApp(nickname: "far")
+        let central = "CENTRAL-RELAY"
+        ble._test_receiveCentralPacket(try relay.directAnnounce(), fromCentralUUID: central)
+        ble._test_receiveCentralPacket(try far.relayedAnnounce(), fromCentralUUID: central)
+
+        try await expectHandshakeAnswered(ble: ble, from: far) {
+            ble._test_receiveCentralPacket($0, fromCentralUUID: central)
+        }
+    }
+
+    @Test
+    func aHandshakeRelayedThroughAPeripheralIsAnswered() async throws {
+        let ble = makeService()
+        let relay = MeshApp(nickname: "relay")
+        let far = MeshApp(nickname: "far")
+        let peripheral = "PERIPHERAL-RELAY"
+        ble._test_receivePeripheralPacket(try far.relayedAnnounce(), fromPeripheralUUID: peripheral, boundTo: relay.peerID)
+
+        try await expectHandshakeAnswered(ble: ble, from: far) {
+            ble._test_receivePeripheralPacket($0, fromPeripheralUUID: peripheral, boundTo: relay.peerID)
+        }
+    }
+
+    /// A sync reply replays a stored packet under its author's sender ID at
+    /// TTL 0. We asked the link peer, so that is whose request it answers.
+    @Test
+    func aSyncReplyRelayedByTheLinkPeerWeAskedIsAccepted() async throws {
+        let ble = makeService()
+        let relay = MeshApp(nickname: "relay")
+        let far = MeshApp(nickname: "far")
+        let central = "CENTRAL-RELAY"
+        ble._test_receiveCentralPacket(try relay.directAnnounce(), fromCentralUUID: central)
+        ble._test_registerSyncRequest(to: relay.peerID)
+
+        ble._test_receiveCentralPacket(try far.relayedAnnounce(ttl: 0, isRSR: true), fromCentralUUID: central)
+
+        #expect(await TestHelpers.waitUntil({ ble.currentPeerSnapshots().contains { $0.peerID == far.peerID } }, timeout: TestConstants.defaultTimeout),
+                "the replayed announce must reach the peer list")
+    }
+
+    @Test
+    func anUnsolicitedSyncReplyStaysOut() throws {
+        let ble = makeService()
+        let relay = MeshApp(nickname: "relay")
+        let far = MeshApp(nickname: "far")
+        let central = "CENTRAL-RELAY"
+        ble._test_receiveCentralPacket(try relay.directAnnounce(), fromCentralUUID: central)
+
+        ble._test_receiveCentralPacket(try far.relayedAnnounce(ttl: 0, isRSR: true), fromCentralUUID: central)
+        ble._test_drainMessageQueue()
+
+        #expect(!ble.currentPeerSnapshots().contains { $0.peerID == far.peerID })
+    }
+
+    /// `far` opens a Noise XX handshake through the relay (`deliver`); the
+    /// service must answer with a second message `far` can complete.
+    private func expectHandshakeAnswered(ble: BLEService, from far: MeshApp, deliver: (BitchatPacket) -> Void) async throws {
+        ble._test_drainMessageQueue()
+        let outbound = OutboundSink()
+        ble._test_outboundObserver = { outbound.append($0) }
+        let me = ble.myPeerID
+
+        let m1 = try far.noise.initiateHandshake(with: me)
+        deliver(far.relayed(type: MessageType.noiseHandshake.rawValue, payload: m1, to: me))
+
+        let answered = await TestHelpers.waitUntil({ outbound.handshakes(to: far.peerID).count > 0 }, timeout: TestConstants.defaultTimeout)
+        #expect(answered, "a relayed handshake must be answered, not dropped as spoofing")
+        let m2 = try #require(outbound.handshakes(to: far.peerID).first)
+        #expect(try far.noise.processHandshakeMessage(from: me, message: m2.payload) != nil, "the answer is the XX second message")
+    }
+}
+
 // MARK: - Fixtures
 
 /// One mesh app: its own Noise static key and announce-signing key.
@@ -115,6 +200,28 @@ private struct MeshApp {
         var packet = try directAnnounce()
         packet.signature = nil
         return packet
+    }
+
+    /// Our announce as a relay forwards it (one hop down by default), or as
+    /// a sync reply (TTL 0, RSR). TTL and RSR are outside the signature.
+    func relayedAnnounce(ttl: UInt8 = TransportConfig.messageTTLDefault - 1, isRSR: Bool = false) throws -> BitchatPacket {
+        var packet = try directAnnounce()
+        packet.ttl = ttl
+        packet.isRSR = isRSR
+        return packet
+    }
+
+    /// An unsigned packet of ours, one hop down, addressed to `recipient`.
+    func relayed(type: UInt8, payload: Data, to recipient: PeerID) -> BitchatPacket {
+        BitchatPacket(
+            type: type,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: Data(hexString: recipient.id),
+            timestamp: AnnounceClock.shared.next(),
+            payload: payload,
+            signature: nil,
+            ttl: TransportConfig.messageTTLDefault - 1
+        )
     }
 
     private func signedAnnounce(noiseKey: Data, signer: MeshApp) throws -> BitchatPacket {
@@ -158,4 +265,21 @@ private func makeService() -> BLEService {
     let identityManager = MockIdentityManager(keychain)
     let idBridge = NostrIdentityBridge(keychain: MockKeychainHelper())
     return BLEService(keychain: keychain, idBridge: idBridge, identityManager: identityManager)
+}
+
+/// Thread-safe sink for `_test_outboundObserver`.
+private final class OutboundSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var packets: [BitchatPacket] = []
+
+    func append(_ packet: BitchatPacket) {
+        lock.lock(); packets.append(packet); lock.unlock()
+    }
+
+    func handshakes(to peerID: PeerID) -> [BitchatPacket] {
+        lock.lock(); defer { lock.unlock() }
+        return packets.filter {
+            $0.type == MessageType.noiseHandshake.rawValue && PeerID(hexData: $0.recipientID) == peerID
+        }
+    }
 }

@@ -348,7 +348,7 @@ crate works around; ✗ a Sonar gap that this crate closes on the Rust side.
 | Noise `0x06`/`0x07`/`0x08`/`0x12` | handled | rejected (`0x08` decoded) | decoded, dropped | decoded, dropped (this change; was rejected) |
 | private message, trailing lone byte | ignored | ignored | ignored | ignored (this change; was rejected) |
 | announce unknown TLVs on re-encode | dropped | kept | kept | kept (this change; was dropped) |
-| bound link: packets from another sender (§12.2) | accepted except `REQUEST_SYNC` (HEAD `04995f68`) | not checked | no per-link gate | relayed announces and `0x53`, plus identities that joined with a verified full-TTL announce; everything else dropped |
+| bound link: packets from another sender (§12.2) | accepted except `REQUEST_SYNC` (HEAD `04995f68`) | not checked | no per-link gate | relayed packets of every type except `REQUEST_SYNC`, with TTL below 7 (this change; was announces and `0x53` only), plus identities that joined with a verified full-TTL announce; our own packet only as a solicited sync reply |
 | mesh service instances used per remote device (§12.2) | not checked | not checked | every instance, one link each | the first instance only (gap) |
 
 ★ **bitchat iOS re‑compresses for verification.** It rebuilds the signature
@@ -461,12 +461,32 @@ binding never moves. On a shared link, each identity counts as linked only
 while it keeps announcing, because the radio link outlives an app that quits
 (`docs/REGRESSIONS.md` R-060).
 
+Relayed traffic crosses the same check. Until this change Sonar iOS accepted
+only relayed announces and `0x53` from anyone but the link peer, on both
+roles, so a message, Noise handshake, DM or sync reply relayed by a neighbour
+died as "spoofing". Measured the same day: the iPhone dropped 1,353 packets
+from one link bound to a third device, among them every packet the Pixel sent
+it through that relay while the iPhone was in the background (a backgrounded
+iPhone is invisible to Android's scan, so the relay was the only path). Sonar
+iOS now follows upstream (`BLEIngressLinkRegistry`, HEAD `04995f68`): a packet
+from another sender is a relay candidate, authenticated by its own type
+(signed announces, messages and files against the pinned key, the Noise static
+key, the session, a verified leave), not by the link. As upstream, a
+`REQUEST_SYNC` from another sender is still dropped. Sonar is stricter in two
+places:
+
+* A full-TTL packet from another sender is dropped unless it is the direct
+  announce of a second app joining the link, because a relay decrements the
+  TTL. Upstream accepts it.
+* A packet claiming to be ours is accepted back only as a solicited sync reply
+  (TTL 0, RSR), checked against the link peer we asked; an unflagged copy
+  would skip the signature check on our own messages. Other senders' TTL-0
+  packets are accepted with or without the flag, because stock bitchat-android
+  sends its replies unflagged (§12.1); a flagged one is checked against the
+  link peer's request, not its author's (`docs/REGRESSIONS.md` R-061).
+
 Still open:
 
-* Upstream bitchat iOS accepts relayed traffic of every type through a bound
-  link and pins only `REQUEST_SYNC`. Sonar iOS still drops relayed messages,
-  handshakes and Noise packets from other senders, so multi-hop traffic does
-  not cross a Sonar iPhone. Whether to follow upstream is a separate decision.
 * Sonar iOS uses only the first mesh service instance on a peripheral it dials.
   The second app is reached only through the link that app opens itself.
 * The Rust engine keeps one Noise session and one routing binding per server
