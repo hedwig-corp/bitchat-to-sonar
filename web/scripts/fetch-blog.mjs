@@ -93,7 +93,9 @@ async function main() {
 	// cannot pin the Node process the way spawnSync would.
 	try {
 		const { spawn } = await import('node:child_process');
-		await new Promise((resolve) => {
+		// `done`, not `resolve`: that name would shadow path.resolve below and
+		// spawn `node undefined`, so the translate step never ran.
+		await new Promise((done) => {
 			const child = spawn(process.execPath, [resolve(HERE, 'translate-blog.mjs')], {
 				cwd: resolve(HERE, '..'),
 				stdio: 'inherit',
@@ -108,12 +110,12 @@ async function main() {
 				if (code !== 0 && code !== null) {
 					console.error('fetch-blog: translate-blog exited non-zero — keeping prior overlays.');
 				}
-				resolve(undefined);
+				done(undefined);
 			});
 			child.on('error', (err) => {
 				clearTimeout(killTimer);
 				console.error(`fetch-blog: translate step skipped (${err?.message ?? err})`);
-				resolve(undefined);
+				done(undefined);
 			});
 		});
 	} catch (err) {
