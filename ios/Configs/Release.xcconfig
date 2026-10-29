@@ -1,4 +1,4 @@
-MARKETING_VERSION = 1.15.4
+MARKETING_VERSION = 1.15.5
 // App Store Connect rejects a second upload of a (MARKETING_VERSION,
 // CURRENT_PROJECT_VERSION) pair it has already accepted — it fails the
 // whole submission with "the state of the relationship 'buildUpload'".
@@ -13,7 +13,9 @@ MARKETING_VERSION = 1.15.4
 // v0.1-alpha.15.4 ships as 1.15.4/49 (offline→online freeze: #656, #657, #659).
 //   macOS 1.15.4/49 is archived after the tag, with the two unused sandbox
 //   entitlements removed (1.15.3/48 failed macOS beta review).
-CURRENT_PROJECT_VERSION = 49
+// v0.1-alpha.15.5 ships as 1.15.5/50 (cellular launch #665, Cashu fees #666,
+//   mesh wire crate #671, Breez 0.12.4 vendored #669).
+CURRENT_PROJECT_VERSION = 50
 
 IPHONEOS_DEPLOYMENT_TARGET = 16.0
 MACOSX_DEPLOYMENT_TARGET = 15.0
