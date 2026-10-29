@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository = "https://github.com/hedwig-corp/bitchat-to-sonar"
+readme = "README.md"
+keywords = ["nostr", "stickers", "blossom", "signal"]
+categories = ["encoding", "data-structures"]
 
 [features]
 default = ["nostr"]
