@@ -294,6 +294,48 @@ shape if the codec is at fault, and extend the scenario here.
 - **Origin:** #671. bitchat-android builds before its #826 drop a file with
   an unknown TLV (SPEC §8.3).
 
+### QA-190 — Two mesh apps on one phone are both seen, and one that quits goes offline
+- **Platforms:** SI against one Android phone running SA **and** BA at the same
+  time; also SI against a Mac running Sonar.app beside a bitchat build.
+- **Steps:**
+  1. Start BA on the Android phone, then SA. With both open, open Nearby on SI
+     and wait up to a minute.
+  2. Force-close SA and BA, and Bluetooth on SI, then reopen them in the
+     opposite order (SA first) and repeat.
+  3. With both visible on SI, force-close SA only and leave BA running. Watch
+     SI for about three minutes.
+- **Expect:** SI lists both apps (two names) after either start order, and a
+  DM from SI reaches SA. After step 3, SA goes offline on SI within about
+  135 s (`bleSharedLinkIdentityTimeoutSeconds`) while BA stays online. On the
+  SI side, `sonar-ios.log` shows "🔗 Central … also carries …" once, and no
+  steady stream of "Sender ID spoofing" lines for SA's ID.
+- **How:** manual (needs two apps on one physical phone) · Guard:
+  `BLEServiceSharedLinkTests.secondAppOnTheSameCentralIsSeen`,
+  `BLEServiceSharedLinkTests.anAppThatStoppedAnnouncingDropsOffASharedLink`
+- **Origin:** live debugging on 2026-10-29. A Pixel 10 Pro ran Sonar
+  0.1-alpha.15.5 beside `com.bitchat.droid`. The Pixel saw the iPhone, but the
+  iPhone saw Sonar only when it happened to announce first, and kept Sonar
+  online after it was force-closed. SPEC §12.2, R-060.
+
+### QA-192 — Traffic relayed by a third device reaches the iPhone
+- **Platforms:** SI and SA out of direct range of each other (or SI in the
+  background, which Android's scan cannot see), with a third mesh device (SA,
+  BA or Sonar desktop) in range of both acting as the relay.
+- **Steps:**
+  1. Confirm on SI that SA shows as a mesh (not direct) peer and the relay
+     shows as direct.
+  2. From SA, send a public mesh message and a DM to SI.
+  3. From SI, send a DM to SA.
+- **Expect:** both of SA's messages appear on SI, and SI's DM reaches SA, all
+  over the mesh with no internet. On the SI side, `sonar-ios.log` shows no
+  "Sender ID spoofing" lines naming SA's ID claimed through the relay's link.
+- **How:** manual (needs three devices) · Guard:
+  `BLEServiceRelayedIngressTests.aHandshakeRelayedThroughACentralIsAnswered`,
+  `BLEServiceRelayedIngressTests.aHandshakeRelayedThroughAPeripheralIsAnswered`
+- **Origin:** device measurement for #679 on 2026-10-29. The backgrounded
+  iPhone was reachable from the Pixel only through a relay, and dropped
+  1,353 relayed packets as "spoofing" that day. SPEC §12.2, R-061.
+
 ## Media
 
 ### QA-010 — Send a photo
