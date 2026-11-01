@@ -348,6 +348,8 @@ crate works around; ✗ a Sonar gap that this crate closes on the Rust side.
 | Noise `0x06`/`0x07`/`0x08`/`0x12` | handled | rejected (`0x08` decoded) | decoded, dropped | decoded, dropped (this change; was rejected) |
 | private message, trailing lone byte | ignored | ignored | ignored | ignored (this change; was rejected) |
 | announce unknown TLVs on re-encode | dropped | kept | kept | kept (this change; was dropped) |
+| bound link: packets from another sender (§12.2) | accepted except `REQUEST_SYNC` (HEAD `04995f68`) | not checked | no per-link gate | relayed announces and `0x53`, plus identities that joined with a verified full-TTL announce; everything else dropped |
+| mesh service instances used per remote device (§12.2) | not checked | not checked | every instance, one link each | the first instance only (gap) |
 
 ★ **bitchat iOS re‑compresses for verification.** It rebuilds the signature
 preimage with `BinaryProtocol.encode` over the decoded payload, so a signed
@@ -437,6 +439,39 @@ it receives, so Sonar's frames verify there too.
 * Sonar Android still pads nothing but Noise frames while Sonar iOS pads
   every frame; both decode either shape, so this costs airtime, not
   compatibility.
+
+### 12.2 Two mesh apps on one device
+
+Not wire format, but it decides whether two implementations see each other.
+A phone can run two bitchat-protocol apps at once (Sonar beside stock
+bitchat-android). Both use the one radio, so a remote iOS device sees **one
+CBCentral** writing both apps' packets, and a remote central finds **two
+instances** of the mesh service in that phone's GATT database.
+
+iOS binds each link to the first sender whose full-TTL announce arrives on it,
+and checks later packets against that binding. Before this change Sonar iOS
+dropped every packet from any other sender except relayed announces, the
+second app's own announce included. Measured on 2026-10-29 (Pixel 10 Pro with
+Sonar 0.1-alpha.15.5 and `com.bitchat.droid`, iPhone 1.15.5): the iPhone
+dropped 4,011 packets as "Sender ID spoofing" in a day, and saw Sonar on the
+Pixel only when Sonar happened to announce first after a reconnect. The Pixel
+saw the iPhone throughout. Sonar iOS now lets an identity join a bound link on
+its own verified full-TTL announce, with the signing key pinned, and the first
+binding never moves. On a shared link, each identity counts as linked only
+while it keeps announcing, because the radio link outlives an app that quits
+(`docs/REGRESSIONS.md` R-060).
+
+Still open:
+
+* Upstream bitchat iOS accepts relayed traffic of every type through a bound
+  link and pins only `REQUEST_SYNC`. Sonar iOS still drops relayed messages,
+  handshakes and Noise packets from other senders, so multi-hop traffic does
+  not cross a Sonar iPhone. Whether to follow upstream is a separate decision.
+* Sonar iOS uses only the first mesh service instance on a peripheral it dials.
+  The second app is reached only through the link that app opens itself.
+* The Rust engine keeps one Noise session and one routing binding per server
+  connection, so a remote device running two apps over one connection gets
+  Android's DMs on whichever announced last.
 
 ## 13. Test vectors
 
