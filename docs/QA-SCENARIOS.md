@@ -1766,6 +1766,38 @@ real mint and need the maintainer's approval of the amounts.
   unavailable on iOS. The package is 0.12.4 again
   (`ios/localPackages/BreezSDKLiquid/MIRROR.md`).
 
+### QA-188 — A send that swaps first reports all it cost as its fee
+- **Platforms:** both (one Rust core; headless with `sonar-cashu-cli`
+  against a local `cdk-mintd` 0.18.1 fakewallet mint at `input_fee_ppk =
+  1000`). Neither host recomputes the fee: iOS `CashuWalletService.map` and
+  Compose `CashuWalletEngine` pass the core's `feesSats` through, and the
+  Android activity ledger stores it as is.
+- **Steps:** fund the wallet on the 1000 ppk keyset (6 × 255 sats). Note the
+  `balance`. Pay a foreign invoice of 1300 sats; the log line `melt …:
+  prepared … swap first: true` confirms the melt swapped. Note the balance
+  again and read `payments`. Repeat with a 100-sat invoice. On a device,
+  open the payment's detail screen.
+- **Expect:** the send's `fees_sats`, its PaymentSent event and its
+  `payments` row all equal the balance drop less the amount (42 for the
+  1300-sat send in the #666 QA run, 27 for the 100-sat one), and so does the
+  fee on the detail screen. A melt that spends its proofs directly (log
+  `swap first: false`) is unchanged.
+- **Guard:** `a_send_that_swaps_first_reports_the_swap_fee_too` (paid at
+  once, and history after a relaunch),
+  `a_swapped_melt_settled_later_reports_the_swap_fee_too` (answered Pending,
+  settled by the watcher, and the outcome lookup),
+  `a_send_with_no_swap_reports_the_melt_fee_alone` (no double count).
+- **Not covered:** sends made before this fix keep the old figure: the swap
+  fee was never recorded, and CDK keeps no link from the swap to the melt.
+  A Pending or Failed row still shows CDK's figure (the reserve), as before.
+- **Origin:** #666 QA, 2026-10-15: a 1300-sat send cost 42 sats over its
+  amount, but `payments` said 6; a 100-sat send cost 27 and said 1. CDK
+  0.18.1 prices the melt's transaction from the melt's own inputs, and the
+  pre-melt swap writes no transaction, so its NUT-02 fee was in no figure.
+  Fixed by recording the swap fee in the melt saga's metadata before the
+  confirm. CDK copies that metadata onto every row of the melt, including the
+  rows saga recovery writes after a relaunch.
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs
