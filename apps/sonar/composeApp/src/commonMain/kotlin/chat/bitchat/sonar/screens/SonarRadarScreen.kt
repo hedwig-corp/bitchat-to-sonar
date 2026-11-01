@@ -45,6 +45,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.OtherMeshApp
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.ui.SNDot
@@ -113,6 +114,10 @@ fun SonarRadarScreen(state: SonarAppState) {
 
         if (state.bleDiscoveryRestricted) {
             DiscoveryNotice(state)
+        }
+
+        state.otherMeshApps.firstOrNull()?.let { app ->
+            OtherMeshAppNotice(app) { state.openOtherMeshAppSettings(app) }
         }
 
         // sn-seg segmented control: Radar | List
@@ -282,6 +287,40 @@ private fun DiscoveryNotice(state: SonarAppState) {
             Spacer(Modifier.width(10.dp))
             SNPill("Turn on", primary = true) { state.setBleDiscoverNewPeople(true) }
         }
+    }
+}
+
+/** Another mesh app on this phone competes for the radio (SPEC.md §12.2):
+ *  say so, and open its App info so the user can force-stop it. */
+@Composable
+internal fun OtherMeshAppNotice(app: OtherMeshApp, onOpenSettings: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(14.dp)).background(s.surface)
+            .border(1.dp, s.hairline, RoundedCornerShape(14.dp))
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SNIcon(SNIconName.Rings, 18.dp, s.accentDeep, weight = 2.1f)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                "${app.name} is also on this phone",
+                color = s.text,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                "It shares the Bluetooth radio with Sonar, so people nearby may see only one of the two. " +
+                    "Force-stop ${app.name} while you use Sonar nearby.",
+                color = s.text2,
+                fontSize = 12.5.sp,
+                lineHeight = 16.sp,
+            )
+        }
+        Spacer(Modifier.width(10.dp))
+        SNPill("App info", primary = true, onClick = onOpenSettings)
     }
 }
 
