@@ -51,7 +51,8 @@ internal fun pickedVideoMime(declaredMime: String, filename: String): String? {
  * Platform photo/video picker (multi-select up to [MAX_ALBUM_PHOTOS]). Raw
  * bytes are delivered with the source MIME type so the preview shows
  * full-quality data. JPEG re-encoding is deferred to send confirmation via
- * [reencodeToJpeg]; GIFs and videos are passed through unmodified. Videos over
+ * [reencodeToJpeg]; GIFs keep their frames and videos their encode, but both
+ * lose their metadata ([imageBytesForSend], [videoBytesForSend]). Videos over
  * the receiver download cap ([MAX_INTERNET_ATTACHMENT_BYTES]) are rejected at
  * pick time and reported via `rejectedTooLarge` — receivers can never fetch
  * them, so staging one would only fail later at send.
@@ -136,7 +137,8 @@ expect fun readTempMediaFile(path: String): ByteArray?
 /** Delete a temp file. Safe to call if the file doesn't exist. */
 expect fun deleteTempMediaFile(path: String)
 
-/** Re-encode raw image bytes to JPEG at quality 0.85, or null if decoding fails. */
+/** Re-encode raw image bytes to an upright JPEG at quality 0.85 with no
+ *  metadata, or null if decoding fails. */
 expect fun reencodeToJpeg(data: ByteArray): ByteArray?
 
 /** Platform share/download/open integration for media viewer actions. */
