@@ -1789,7 +1789,8 @@ final class SonarAppStore: ObservableObject {
         #if canImport(UIKit)
         return UIImage(data: data)?.jpegData(compressionQuality: 0.85)
         #else
-        return data
+        // Returning `data` here sent macOS photos with their GPS and device tags.
+        return snReencodeImageToJpeg(data)
         #endif
     }
 
@@ -2068,7 +2069,18 @@ final class SonarAppStore: ObservableObject {
                     return Self.readTempMediaFile(preview.tempURL)
                 }).value else { continue }
                 if preview.mime == "image/gif" {
-                    prepared.append((preview.peerId, raw, preview.filename, preview.mime))
+                    // Keep the frames (re-encoding would flatten them); drop the
+                    // comments and XMP that GIF extensions carry.
+                    let filename = preview.filename
+                    let mime = preview.mime
+                    switch await Task.detached(priority: .userInitiated, operation: {
+                        snImageBytesForSend(raw, filename: filename, mime: mime)
+                    }).value {
+                    case let .send(bytes, cleanName, cleanMime):
+                        prepared.append((preview.peerId, bytes, cleanName, cleanMime))
+                    case .refused:
+                        encodeFailed = true
+                    }
                 } else if let bytes = await Task.detached(priority: .userInitiated, operation: {
                     Self.reencodeToJpeg(raw)
                 }).value {
