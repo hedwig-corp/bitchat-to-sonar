@@ -133,4 +133,26 @@ class ChatFeedListItemsTest {
         assertEquals(keys.size, keys.toSet().size)
         assertEquals(listOf("m:same"), keys.filter { it.startsWith("m:") })
     }
+
+    /** QA-191: the load-older trigger must re-arm when a prepend lands while
+     *  the reader is still at the top (a slow device's anchor restore can
+     *  leave them there), and must not re-arm when nothing was prepended. A
+     *  bare at-top flag stalled paging after the first page on a loaded
+     *  emulator. */
+    @Test
+    fun topTriggerKeyChangesOnlyWhenOlderRowsArePrepended() {
+        val page = listOf<Any>(msg("c", t2), msg("d", t2 + 60))
+        val before = transcriptTopTriggerKey(buildChatFeedListItems(page, unreadAnchorIndex = -1))
+        val samePage = transcriptTopTriggerKey(buildChatFeedListItems(page, unreadAnchorIndex = -1))
+        val prepended = transcriptTopTriggerKey(
+            buildChatFeedListItems(listOf<Any>(msg("a", t0), msg("b", t1)) + page, unreadAnchorIndex = -1),
+        )
+
+        assertEquals("m:c", before)
+        assertEquals(before, samePage)
+        assertEquals("m:a", prepended)
+        // The leading Day header is not a message row: it must not be the key,
+        // or a prepend within the same day would not change it.
+        assertEquals("", transcriptTopTriggerKey(emptyList()))
+    }
 }

@@ -195,6 +195,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -1258,6 +1259,12 @@ internal fun chatFeedListIndexForFeedRow(listItems: List<ChatFeedListItem>, feed
 internal fun chatFeedListIndexForKey(listItems: List<ChatFeedListItem>, key: String): Int =
     listItems.indexOfFirst { chatFeedListKey(it) == key }
 
+/** Load-older trigger key while the reader is at the top: the oldest message
+ *  row, so each prepend re-arms paging even when the reader never left the
+ *  top. Empty (still a key) for a feed with no message row yet. */
+internal fun transcriptTopTriggerKey(listItems: List<ChatFeedListItem>): String =
+    listItems.firstOrNull { it is ChatFeedListItem.Row }?.let(::chatFeedListKey) ?: ""
+
 internal fun chatFeedListTailIndex(listItems: List<ChatFeedListItem>): Int =
     listItems.indexOfLast { it is ChatFeedListItem.Row }.coerceAtLeast(0)
 
@@ -1731,11 +1738,23 @@ private fun rememberChatTranscriptViewport(
     // Load one local cursor page when the reader reaches the top. Capture a
     // stable visible message and pixel offset, then restore it after prepend so
     // the existing content does not jump under the reader's finger.
+    //
+    // The trigger is the oldest painted row while at the top, not a bare
+    // at-top flag (QA-191). On a slow device the restore below can read the
+    // item list before the prepend recomposed: the anchor's old index (≤ 2)
+    // keeps the reader at the top, an at-top flag never turns false, and
+    // paging never fires again. A new oldest row re-arms the trigger; a load
+    // that prepended nothing leaves the key unchanged, so it cannot loop.
     LaunchedEffect(transcriptSessionKey, listState) {
         snapshotFlow {
-            didInitialScroll && listState.layoutInfo.totalItemsCount > 0 &&
+            if (didInitialScroll && listState.layoutInfo.totalItemsCount > 0 &&
                 listState.firstVisibleItemIndex <= 2
-        }.distinctUntilChanged().filter { it }.collect {
+            ) {
+                transcriptTopTriggerKey(currentListItems)
+            } else {
+                null
+            }
+        }.distinctUntilChanged().filterNotNull().collect {
             val visibleInfo = listState.layoutInfo.visibleItemsInfo
             val anchor = visibleInfo.firstOrNull { it.key.toString().startsWith("m:") }
                 ?: visibleInfo.firstOrNull()
@@ -1749,8 +1768,14 @@ private fun rememberChatTranscriptViewport(
                 isPrepending = false
                 return@collect
             }
-            withFrameNanos { }
-            val newIndex = chatFeedListIndexForKey(currentListItems, continuity.anchorId)
+            // Restore against the recomposed list. One frame is not always
+            // enough on a slow device for the prepend to reach
+            // `currentListItems`; the stale list returns the anchor's old index
+            // and pins the reader to the top.
+            val newIndex = withTimeoutOrNull(1_000) {
+                snapshotFlow { chatFeedListIndexForKey(currentListItems, continuity.anchorId) }
+                    .first { it > anchor.index }
+            } ?: chatFeedListIndexForKey(currentListItems, continuity.anchorId)
             val offset = continuity.pixelOffset ?: 0
             if (newIndex >= 0) {
                 listState.scrollToItem(newIndex, scrollOffset = -offset)
