@@ -154,7 +154,9 @@ back_down="$(printf 'swipeup;%.0s' $(seq 1 30))"
 drive open-p "activate;tapc:p v1 $RUN $SEED_N/$SEED_N;expect:p v1 $RUN $SEED_N/$SEED_N@20;${swipes}expect:p v1 $RUN 1/$SEED_N@20;expect:👍@15;${back_down}expect:p v1 $RUN $SEED_N/$SEED_N@20" \
   && pass QA-191 "the v1 history and its 👍 chip are in the chat" \
   || fail QA-191 "v1 history or the v1 👍 chip missing"
-drive wait-v1 "$(type_send "waiting $RUN");expect:waiting $RUN@20;expect:Waiting for them to update@40" \
+# No expect on the typed text: a send that cannot reach a v1 peer drops its
+# echo by design; the banner is the signal.
+drive wait-v1 "$(type_send "waiting $RUN");expect:Waiting for them to update@40" \
   && pass QA-193 "peer still on v1: 'Waiting for them to update Sonar'" \
   || fail QA-193 "no waiting banner while the peer is on v1"
 
