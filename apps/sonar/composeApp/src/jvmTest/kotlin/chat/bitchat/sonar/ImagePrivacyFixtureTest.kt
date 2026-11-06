@@ -62,10 +62,42 @@ class ImagePrivacyFixtureTest {
         assertEquals(24, image.height)
     }
 
+    /**
+     * An iPhone photo. Desktop ImageIO cannot decode HEIC, so it used to be
+     * refused; the core now cleans HEIC and AVIF in place, so it is sent as it
+     * came, minus its metadata. The iOS suite checks the pixels decode the same.
+     */
     @Test
-    fun aHeicTheDesktopCannotDecodeIsRefused() {
-        assertEquals(ImageSendDecision.Refused, imageBytesForSend(fixture("located.heic"), "a.heic", "image/heic"))
+    fun aHeicIsSentAsAHeic() {
+        val raw = fixture("located.heic")
+        val send = send("located.heic", "image/heic")
+        assertEquals("located.heic", send.filename)
+        assertEquals("image/heic", send.mime)
+        assertCleanedInPlace(raw, send.bytes)
     }
+
+    @Test
+    fun anAvifIsSentAsAnAvif() {
+        val raw = fixture("located.avif")
+        val send = send("located.avif", "image/avif")
+        assertEquals("located.avif", send.filename)
+        assertEquals("image/avif", send.mime)
+        assertCleanedInPlace(raw, send.bytes)
+    }
+
+    /** Same size, same boxes: only item data was overwritten. */
+    private fun assertCleanedInPlace(raw: ByteArray, sent: ByteArray) {
+        assertEquals(raw.size, sent.size, "a byte moved")
+        assertEquals("ftyp", sent.copyOfRange(4, 8).decodeToString())
+        assertFalse(sent.contains("xmpmeta"), "XMP survived")
+        // Top-level boxes up to mdat: ftyp and meta, with every iloc offset.
+        val mdat = generateSequence(0) { at -> at + u32(raw, at) }
+            .first { at -> raw.copyOfRange(at + 4, at + 8).decodeToString() == "mdat" }
+        assertTrue(raw.copyOfRange(0, mdat).contentEquals(sent.copyOfRange(0, mdat)), "ftyp or meta changed")
+    }
+
+    private fun u32(bytes: ByteArray, at: Int): Int =
+        (0 until 4).fold(0) { value, i -> (value shl 8) or (bytes[at + i].toInt() and 0xFF) }
 
     @Test
     fun otherFilesAreUntouched() {

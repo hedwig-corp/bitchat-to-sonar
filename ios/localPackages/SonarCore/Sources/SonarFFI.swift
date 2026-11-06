@@ -7728,10 +7728,10 @@ public enum ImageMetadataScrub: Equatable, Hashable {
     case stripped(data: Data
     )
     /**
-     * An image the core cannot rewrite in place (HEIF, AVIF, TIFF, JPEG XL)
-     * or could not parse. Decode it and send a re-encoded JPEG, rotated per
-     * [`image_exif_orientation`] when the decoder ignores EXIF orientation.
-     * Never send the original bytes.
+     * An image the core cannot rewrite in place (TIFF, JPEG XL, HEIF image
+     * sequences) or could not parse. Decode it and send a re-encoded JPEG,
+     * rotated per [`image_exif_orientation`] when the decoder ignores EXIF
+     * orientation. Never send the original bytes.
      */
     case reencode
 

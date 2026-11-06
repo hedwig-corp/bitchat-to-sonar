@@ -6,7 +6,8 @@
 // metadata, but a photo sent as a file, dropped onto the Mac window, shared
 // from Photos, or picked on macOS went out byte for byte, GPS and camera
 // serial included. `snImageBytesForSend` closes every path; these tests read
-// the sent bytes back through ImageIO, the same way a recipient would.
+// the sent bytes back through ImageIO, the same way a recipient would. HEIC
+// and AVIF are cleaned in place, so an iPhone photo arrives as a HEIC.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -65,6 +66,40 @@ struct ImageMetadataStripTests {
         try properties(data)[kCGImagePropertyGPSDictionary] != nil
     }
 
+    private func typeIdentifier(_ data: Data) throws -> String? {
+        let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+        return CGImageSourceGetType(source) as String?
+    }
+
+    /// The first image as decoded RGBA, the way a recipient's screen draws it.
+    private func pixels(_ data: Data) throws -> [UInt8] {
+        let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+        let image = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        var buffer = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let drawn = buffer.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(
+                data: bytes.baseAddress, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
+        }
+        #expect(drawn)
+        return buffer
+    }
+
+    /// A fixture of the core crate (`core/sonar-media-privacy/tests/fixtures`),
+    /// every metadata field marked `LEAK`.
+    private func coreFixture(_ name: String, file: StaticString = #filePath) throws -> Data {
+        let repository = URL(fileURLWithPath: "\(file)")
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try Data(contentsOf: repository.appendingPathComponent("core/sonar-media-privacy/tests/fixtures/\(name)"))
+    }
+
     private func contains(_ data: Data, _ text: String) -> Bool {
         data.range(of: Data(text.utf8)) != nil
     }
@@ -99,6 +134,41 @@ struct ImageMetadataStripTests {
         #expect(try !hasGPS(data))
         #expect(!contains(data, "LEAK"))
         #expect(mime == "image/png")
+    }
+
+    /// iPhone photos are HEIC. They were re-encoded to JPEG, losing quality,
+    /// HDR and depth; the core now zeroes their Exif and XMP in place.
+    @Test func aHeicStaysAHeicButLosesGPSAndDevice() throws {
+        let original = try makeImage(.heic)
+        #expect(try hasGPS(original))
+        #expect(contains(original, "LEAKMAKE"))
+
+        let (data, filename, mime) = try sent(snImageBytesForSend(original, filename: "IMG_0001.HEIC", mime: "image/heic"))
+        #expect(filename == "IMG_0001.HEIC")
+        #expect(mime == "image/heic")
+        #expect(try typeIdentifier(data) == UTType.heic.identifier)
+        #expect(try !hasGPS(data))
+        #expect(!contains(data, "LEAK"))
+        // Zeroed, not rewritten: same size, same pixels, and the orientation
+        // still comes from the `irot` property.
+        #expect(data.count == original.count)
+        #expect(try pixels(data) == pixels(original))
+        #expect(try properties(data)[kCGImagePropertyOrientation] as? Int == 6)
+    }
+
+    /// An AVIF from libavif, the encoder behind Pillow, Chrome and Android.
+    @Test func anAvifStaysAnAvifButLosesGPSAndDevice() throws {
+        let original = try coreFixture("located.avif")
+        #expect(try hasGPS(original))
+
+        let (data, filename, mime) = try sent(snImageBytesForSend(original, filename: "shot.avif", mime: "image/avif"))
+        #expect(filename == "shot.avif")
+        #expect(mime == "image/avif")
+        #expect(try typeIdentifier(data) == "public.avif")
+        #expect(try !hasGPS(data))
+        #expect(!contains(data, "LEAK"))
+        #expect(try pixels(data) == pixels(original))
+        #expect(try properties(data)[kCGImagePropertyOrientation] as? Int == 6)
     }
 
     @Test func aTiffIsReencodedToAnUprightJpeg() throws {
