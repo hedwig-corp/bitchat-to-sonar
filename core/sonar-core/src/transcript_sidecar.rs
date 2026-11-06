@@ -204,6 +204,7 @@ mod tests {
             sticker_ref: None,
             classification: MessageClassification::of(body),
             reply: None,
+            reactions: Vec::new(),
         }
     }
 

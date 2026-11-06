@@ -166,7 +166,7 @@ async fn kind7_reaction_tallies_and_is_not_a_transcript_row() {
         .expect("alice sends");
 
     bob.sync().await.expect("bob syncs");
-    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let bob_group = bob.groups().expect("bob groups")[0].id.clone();
     let parent = bob
         .messages(&bob_group)
         .expect("bob messages")
@@ -251,7 +251,7 @@ async fn kind7_reaction_does_not_notify_or_increment_unread() {
     );
 
     bob.sync().await.expect("bob syncs");
-    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let bob_group = bob.groups().expect("bob groups")[0].id.clone();
     let parent = bob
         .messages(&bob_group)
         .expect("bob messages")
@@ -344,7 +344,7 @@ async fn ensure_note_to_self_creates_solo_marked_group_once() {
     assert_eq!(second, first);
     let groups = alice.groups().expect("alice groups");
     assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].mls_group_id, first);
+    assert_eq!(groups[0].id, first);
     assert_eq!(groups[0].description, "sonar.note-to-self.v1");
     assert_eq!(groups[0].name, "Note to Self");
     let members = alice.members(&first).expect("members");
@@ -3447,10 +3447,6 @@ async fn persist_folds_empty_topic_room_live_is_not_direct() {
     );
 }
 
-fn group_hex(id: &sonar_core::GroupId) -> String {
-    hex::encode(id.as_slice())
-}
-
 /// A timezone share is a control event (R-017): it must cache the peer zone through
 /// the host allowlist + outbox path without becoming a transcript row, unread
 /// bump, or push.
@@ -3560,7 +3556,7 @@ async fn timezone_revoke_reaches_the_peer_over_the_relay() {
         .expect("alice starts dm");
     alice.send_text(&alice_group, "hello").await.expect("alice sends");
     bob.sync().await.expect("bob syncs hello");
-    let bob_hex = group_hex(&bob.groups().expect("bob groups")[0].mls_group_id);
+    let bob_hex = group_hex(&bob.groups().expect("bob groups")[0].id);
     let alice_hex = group_hex(&alice_group);
 
     alice.set_timezone_share_groups(vec![alice_hex.clone()]).await;
@@ -3591,7 +3587,7 @@ async fn timezone_revoke_reaches_the_peer_over_the_relay() {
     }
     assert!(gone, "the revoke must clear alice's zone at bob");
     assert!(notes.is_empty(), "a revoke is not a notification");
-    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let bob_group = bob.groups().expect("bob groups")[0].id.clone();
     assert_eq!(bob.messages(&bob_group).expect("messages").len(), 1, "only 'hello'");
 }
 

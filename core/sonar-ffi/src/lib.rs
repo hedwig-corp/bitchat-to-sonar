@@ -4119,13 +4119,25 @@ mod tests {
             .join("marmot.sqlite")
             .to_string_lossy()
             .into_owned();
+        // An existing account: the host latches a reopen, never the first
+        // open of a fresh install. MDK v2 creates its schema (~90 storage
+        // migrations) on that first open, synchronously, so with other tests
+        // creating stores in parallel it alone can outlast the 5 s bound
+        // below. The contract under test is the relay phase.
+        let identity = SonarIdentity::generate();
+        sonar_core::marmot::MarmotEngine::persistent(
+            identity.inner.clone(),
+            &db_path,
+            [0xab; 32],
+        )
+        .expect("create the store once");
         let latch = SonarSuspendLatch::new();
         let connecting = {
             let latch = latch.clone();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
                 let result = SonarNode::connect(
-                    SonarIdentity::generate(),
+                    identity,
                     vec!["wss://192.0.2.1:4443".into()],
                     db_path,
                     "ab".repeat(32),
@@ -4188,6 +4200,18 @@ mod tests {
             .join("marmot.sqlite")
             .to_string_lossy()
             .into_owned();
+        // An existing account: the host latches a reopen, never the first
+        // open of a fresh install. MDK v2 creates its schema (~90 storage
+        // migrations) on that first open, synchronously, so with other tests
+        // creating stores in parallel it alone can outlast the 5 s bound
+        // below. The contract under test is the relay phase.
+        let identity = SonarIdentity::generate();
+        sonar_core::marmot::MarmotEngine::persistent(
+            identity.inner.clone(),
+            &db_path,
+            [0xab; 32],
+        )
+        .expect("create the store once");
         let latch = SonarSuspendLatch::new();
         let connecting = {
             let latch = latch.clone();
@@ -4196,7 +4220,7 @@ mod tests {
                 // resolver rather than a bare IP connect.
                 let started = std::time::Instant::now();
                 let result = SonarNode::connect(
-                    SonarIdentity::generate(),
+                    identity,
                     vec!["wss://relay.invalid".into()],
                     db_path,
                     "ab".repeat(32),

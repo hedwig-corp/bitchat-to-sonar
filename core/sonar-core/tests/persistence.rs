@@ -209,7 +209,7 @@ async fn local_first_reaction_persists_pending_outbox_before_relay_publish() {
     let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
 
     let alice_identity = Identity::generate();
     let client = SonarClient::connect(alice_identity, Vec::new(), &db_path, DB_KEY)
@@ -218,12 +218,12 @@ async fn local_first_reaction_persists_pending_outbox_before_relay_publish() {
     let creation = client
         .engine()
         .create_group("alice & bob", vec![bob_kp], Vec::new())
-        .expect("create local group");
-    let group_id = creation.group.mls_group_id.clone();
+        .await.expect("create local group");
+    let group_id = creation.group.id.clone();
     client
         .engine()
         .merge_pending_commit(&group_id)
-        .expect("merge local group");
+        .await.expect("merge local group");
 
     client
         .send_text(&group_id, "react to me")
@@ -262,7 +262,7 @@ async fn terminal_failed_reaction_is_dropped_from_tallies() {
     let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
 
     let alice_identity = Identity::generate();
     let client = SonarClient::connect(alice_identity, Vec::new(), &db_path, DB_KEY)
@@ -271,12 +271,12 @@ async fn terminal_failed_reaction_is_dropped_from_tallies() {
     let creation = client
         .engine()
         .create_group("alice & bob", vec![bob_kp], Vec::new())
-        .expect("create local group");
-    let group_id = creation.group.mls_group_id.clone();
+        .await.expect("create local group");
+    let group_id = creation.group.id.clone();
     client
         .engine()
         .merge_pending_commit(&group_id)
-        .expect("merge local group");
+        .await.expect("merge local group");
 
     client
         .send_text(&group_id, "react to me")
@@ -333,19 +333,19 @@ async fn terminal_failed_reaction_is_dropped_from_tallies() {
 #[tokio::test]
 async fn later_reaction_on_older_parent_survives_beyond_newest_512_raw_rows() {
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
     let alice = MarmotEngine::in_memory(Identity::generate());
     let creation = alice
         .create_group("alice & bob", vec![bob_kp], Vec::new())
-        .expect("create local group");
-    let group_id = creation.group.mls_group_id.clone();
+        .await.expect("create local group");
+    let group_id = creation.group.id.clone();
     alice
         .merge_pending_commit(&group_id)
-        .expect("merge local group");
+        .await.expect("merge local group");
 
     let parent_event = alice
         .create_text_message(&group_id, "old parent")
-        .expect("parent event");
+        .await.expect("parent event");
     let Incoming::Message(parent) = alice
         .process_incoming(&parent_event)
         .await
@@ -358,13 +358,13 @@ async fn later_reaction_on_older_parent_survives_beyond_newest_512_raw_rows() {
     sleep(Duration::from_secs(1)).await;
     alice
         .create_and_process_reaction(&group_id, &parent_id, &parent_sender, "👍")
-        .expect("react to old parent");
+        .await.expect("react to old parent");
     sleep(Duration::from_secs(1)).await;
 
     for i in 0..520 {
         let event = alice
             .create_text_message(&group_id, &format!("newer {i}"))
-            .expect("newer event");
+            .await.expect("newer event");
         alice.process_incoming(&event).await.expect("process newer");
     }
 
@@ -412,7 +412,7 @@ async fn reaction_index_survives_engine_reopen() {
     let db_path = dir.path().join("marmot.sqlite");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
     let alice_identity = Identity::generate();
 
     let (group_id, parent_id) = {
@@ -420,14 +420,14 @@ async fn reaction_index_survives_engine_reopen() {
             .expect("open persistent engine");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], Vec::new())
-            .expect("create local group");
-        let group_id = creation.group.mls_group_id.clone();
+            .await.expect("create local group");
+        let group_id = creation.group.id.clone();
         alice
             .merge_pending_commit(&group_id)
-            .expect("merge local group");
+            .await.expect("merge local group");
         let parent_event = alice
             .create_text_message(&group_id, "old parent")
-            .expect("parent event");
+            .await.expect("parent event");
         let Incoming::Message(parent) = alice
             .process_incoming(&parent_event)
             .await
@@ -437,7 +437,7 @@ async fn reaction_index_survives_engine_reopen() {
         };
         alice
             .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
-            .expect("react");
+            .await.expect("react");
         let live = alice
             .reaction_tallies_for(&group_id, &[parent.id])
             .expect("live overlay");
@@ -476,19 +476,19 @@ async fn duplicate_reaction_does_not_leave_the_index_dirty() {
     let dirty = db_path.with_file_name("marmot.sqlite.sonar-reactions.dirty");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
     let alice = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
         .expect("open persistent engine");
     let creation = alice
         .create_group("alice & bob", vec![bob_kp], Vec::new())
-        .expect("create local group");
-    let group_id = creation.group.mls_group_id.clone();
+        .await.expect("create local group");
+    let group_id = creation.group.id.clone();
     alice
         .merge_pending_commit(&group_id)
-        .expect("merge local group");
+        .await.expect("merge local group");
     let parent_event = alice
         .create_text_message(&group_id, "parent")
-        .expect("parent event");
+        .await.expect("parent event");
     let Incoming::Message(parent) = alice
         .process_incoming(&parent_event)
         .await
@@ -499,14 +499,14 @@ async fn duplicate_reaction_does_not_leave_the_index_dirty() {
 
     alice
         .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
-        .expect("first reaction");
+        .await.expect("first reaction");
     assert!(!dirty.exists(), "a persisted reaction clears the marker");
 
     // Same (sender, emoji) under a new rumor id: MDK stores it, the index
     // ignores it, so nothing about the sidecar changed.
     let (_, incoming) = alice
         .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
-        .expect("duplicate reaction");
+        .await.expect("duplicate reaction");
     assert!(matches!(incoming, Incoming::Reaction { .. }));
     assert!(
         !dirty.exists(),
@@ -532,7 +532,7 @@ async fn delete_group_drops_reaction_index() {
     let db_path = dir.path().join("marmot.sqlite");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
     let alice_identity = Identity::generate();
 
     let (group_id, parent_id) = {
@@ -540,14 +540,14 @@ async fn delete_group_drops_reaction_index() {
             .expect("open persistent engine");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], Vec::new())
-            .expect("create local group");
-        let group_id = creation.group.mls_group_id.clone();
+            .await.expect("create local group");
+        let group_id = creation.group.id.clone();
         alice
             .merge_pending_commit(&group_id)
-            .expect("merge local group");
+            .await.expect("merge local group");
         let parent_event = alice
             .create_text_message(&group_id, "old parent")
-            .expect("parent event");
+            .await.expect("parent event");
         let Incoming::Message(parent) = alice
             .process_incoming(&parent_event)
             .await
@@ -557,8 +557,8 @@ async fn delete_group_drops_reaction_index() {
         };
         alice
             .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
-            .expect("react");
-        alice.delete_group(&group_id).expect("delete group");
+            .await.expect("react");
+        alice.delete_group(&group_id).await.expect("delete group");
         (group_id, parent.id)
     };
 
@@ -572,41 +572,48 @@ async fn delete_group_drops_reaction_index() {
     );
 }
 
+/// Alice's account with one parent message and one 👍 on it, on disk.
+async fn alice_with_one_reaction(
+    db_path: &std::path::Path,
+    alice_identity: &Identity,
+) -> (GroupId, nostr::EventId) {
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
+    let alice = MarmotEngine::persistent(alice_identity.clone(), db_path, DB_KEY)
+        .expect("open persistent engine");
+    let creation = alice
+        .create_group("alice & bob", vec![bob_kp], Vec::new())
+        .await
+        .expect("create local group");
+    let group_id = creation.group.id.clone();
+    alice
+        .merge_pending_commit(&group_id)
+        .await
+        .expect("merge local group");
+    let (_, incoming) = alice
+        .create_and_process_text_message(&group_id, "old parent")
+        .await
+        .expect("parent");
+    let Incoming::Message(parent) = incoming else {
+        panic!("parent must persist as a chat row");
+    };
+    alice
+        .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
+        .await
+        .expect("react");
+    (group_id, parent.id)
+}
+
+/// MDK v2 keeps no plaintext rows, so the sealed reaction index is the only
+/// copy of the chips: an account backup carries it, and a restore puts it
+/// back instead of a sidecar left by the outgoing install.
 #[tokio::test]
-async fn restore_rebuilds_reaction_index_and_drops_ghosts() {
+async fn restore_brings_back_the_backed_up_reaction_index_not_ghosts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("marmot.sqlite");
     let sidecar = db_path.with_file_name("marmot.sqlite.sonar-reactions.json");
-
-    let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
     let alice_identity = Identity::generate();
-
-    let (group_id, parent_id) = {
-        let alice = MarmotEngine::persistent(alice_identity.clone(), &db_path, DB_KEY)
-            .expect("open persistent engine");
-        let creation = alice
-            .create_group("alice & bob", vec![bob_kp], Vec::new())
-            .expect("create local group");
-        let group_id = creation.group.mls_group_id.clone();
-        alice
-            .merge_pending_commit(&group_id)
-            .expect("merge local group");
-        let parent_event = alice
-            .create_text_message(&group_id, "old parent")
-            .expect("parent event");
-        let Incoming::Message(parent) = alice
-            .process_incoming(&parent_event)
-            .await
-            .expect("process parent")
-        else {
-            panic!("parent must persist as a chat row");
-        };
-        alice
-            .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
-            .expect("react");
-        (group_id, parent.id)
-    };
+    let (group_id, parent_id) = alice_with_one_reaction(&db_path, &alice_identity).await;
 
     let db_key_hex = "42".repeat(32);
     let package = sonar_core::account_backup::read_account_backup_package(&db_path, &db_key_hex)
@@ -619,86 +626,41 @@ async fn restore_rebuilds_reaction_index_and_drops_ghosts() {
 
     sonar_core::account_backup::write_account_backup_package(&db_path, &package)
         .expect("restore package");
-    assert!(
-        !sidecar.exists(),
-        "restore must drop the derived sidecar so ghosts cannot survive"
-    );
 
     let alice =
         MarmotEngine::persistent(alice_identity, &db_path, DB_KEY).expect("reopen after restore");
     let overlay = alice
         .reaction_tallies_for(&group_id, &[parent_id])
         .expect("overlay after restore");
-    assert_eq!(
-        overlay[0].1.len(),
-        1,
-        "restored DB reactions must be rebuilt"
-    );
+    assert_eq!(overlay[0].1.len(), 1, "the backed-up chip must come back");
     assert_eq!(overlay[0].1[0].emoji, "👍");
     assert!(
         overlay[0].1.iter().all(|t| t.emoji != "🔥"),
-        "post-backup ghost chips must not survive restore"
+        "a sidecar planted after the backup must not survive restore"
     );
 }
 
+/// A dirty marker (a crash between a record and its persist) used to mean
+/// "rebuild from SQLCipher". MDK v2 has nothing to rebuild from, so the
+/// sealed index must still load, and the reopen settles the marker.
 #[tokio::test]
-async fn dirty_stale_sidecar_rebuilds_from_db() {
+async fn a_dirty_marker_keeps_the_sealed_reaction_index() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("marmot.sqlite");
-    let sidecar = db_path.with_file_name("marmot.sqlite.sonar-reactions.json");
     let dirty = db_path.with_file_name("marmot.sqlite.sonar-reactions.dirty");
-
-    let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
     let alice_identity = Identity::generate();
+    let (group_id, parent_id) = alice_with_one_reaction(&db_path, &alice_identity).await;
 
-    let (group_id, parent_id, stale_sidecar) = {
-        let alice = MarmotEngine::persistent(alice_identity.clone(), &db_path, DB_KEY)
-            .expect("open persistent engine");
-        // A valid sealed sidecar from before the reaction: what a crash between
-        // the MDK commit and the sidecar replace leaves on disk.
-        let stale_sidecar = std::fs::read(&sidecar).expect("first open seals an empty index");
-        let creation = alice
-            .create_group("alice & bob", vec![bob_kp], Vec::new())
-            .expect("create local group");
-        let group_id = creation.group.mls_group_id.clone();
-        alice
-            .merge_pending_commit(&group_id)
-            .expect("merge local group");
-        let parent_event = alice
-            .create_text_message(&group_id, "old parent")
-            .expect("parent event");
-        let Incoming::Message(parent) = alice
-            .process_incoming(&parent_event)
-            .await
-            .expect("process parent")
-        else {
-            panic!("parent must persist as a chat row");
-        };
-        alice
-            .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
-            .expect("react");
-        (group_id, parent.id, stale_sidecar)
-    };
-
-    std::fs::write(&sidecar, stale_sidecar).expect("stale valid sidecar");
     std::fs::write(&dirty, b"").expect("dirty marker");
 
     let alice = MarmotEngine::persistent(alice_identity, &db_path, DB_KEY)
         .expect("reopen after crash window");
     let overlay = alice
         .reaction_tallies_for(&group_id, &[parent_id])
-        .expect("overlay after dirty rebuild");
-    assert_eq!(
-        overlay[0].1.len(),
-        1,
-        "a valid-but-stale sidecar with a dirty marker must rebuild from SQLCipher"
-    );
+        .expect("overlay after dirty reopen");
+    assert_eq!(overlay[0].1.len(), 1, "a dirty marker must not discard the chips");
     assert_eq!(overlay[0].1[0].emoji, "👍");
-    assert!(
-        !dirty.exists(),
-        "successful rebuild persist must clear the dirty marker"
-    );
+    assert!(!dirty.exists(), "the reopen must settle the dirty marker");
 }
 
 #[tokio::test]

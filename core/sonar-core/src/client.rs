@@ -34,7 +34,7 @@ use crate::conversation_index::{
 use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
 use crate::marmot::{
-    gift_wrap_with_current_timestamp_async, ChatMessage, DeliveryState, GroupCreation, GroupInvite,
+    ChatMessage, DeliveryState, GroupCreation, GroupInvite,
     GroupMembershipUpdate, HistoricalGroup, Incoming, MarmotEngine, RecentMessagePage,
     KEY_PACKAGE_KIND, SONAR_DIRECT_DM_DESCRIPTION, SYNC_STATE_FILE_SUFFIX,
 };
@@ -2327,7 +2327,7 @@ pub struct SonarClient {
     /// Serializes `ensure_note_to_self`'s find-then-create: both apps ensure
     /// from refresh paths that can overlap on a cold start, and two unlocked
     /// callers would each find nothing and create a second solo group.
-    note_to_self_lock: Arc<Mutex<()>>,
+    note_to_self_lock: Arc<tokio::sync::Mutex<()>>,
     /// Persistent Marmot DB path for auto-backup dirty marks (None in-memory).
     marmot_db_path: Option<PathBuf>,
     /// Atomic throttle + single-flight gate for the per-group catch-up pass;
@@ -2884,7 +2884,7 @@ impl SonarClient {
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
             profile_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
-            note_to_self_lock: Arc::new(Mutex::new(())),
+            note_to_self_lock: Arc::new(tokio::sync::Mutex::new(())),
             marmot_db_path: None,
             group_catchup_gate: Arc::new(Mutex::new(GroupCatchupGate::default())),
         };
@@ -3679,19 +3679,23 @@ impl SonarClient {
     ///
     /// Idempotent and serialized: concurrent callers get the same group.
     pub async fn ensure_note_to_self(&self) -> Result<GroupId> {
-        let _ensure = self.note_to_self_lock.lock().unwrap();
+        let _ensure = self.note_to_self_lock.lock().await;
         if let Some(existing) = self.find_note_to_self_group()? {
             return Ok(existing);
         }
-        let creation = self.engine.create_group_with_description(
-            SONAR_NOTE_TO_SELF_NAME,
-            SONAR_NOTE_TO_SELF_DESCRIPTION,
-            Vec::new(),
-            self.relays.clone(),
-        )?;
-        let group_id = creation.group.mls_group_id;
-        if let Err(err) = self.engine.merge_pending_commit(&group_id) {
-            self.discard_unpublished_group_creation(&group_id);
+        let creation = self
+            .engine
+            .create_group_with_description(
+                SONAR_NOTE_TO_SELF_NAME,
+                SONAR_NOTE_TO_SELF_DESCRIPTION,
+                Vec::new(),
+                self.relays.clone(),
+                Vec::new(),
+            )
+            .await?;
+        let group_id = creation.group.id.clone();
+        if let Err(err) = self.engine.merge_pending_commit(&group_id).await {
+            self.discard_unpublished_group_creation(&group_id).await;
             return Err(err);
         }
         self.ensure_index_for_group(&group_id, SONAR_NOTE_TO_SELF_NAME);
@@ -3713,15 +3717,15 @@ impl SonarClient {
             if group.description != SONAR_NOTE_TO_SELF_DESCRIPTION {
                 continue;
             }
-            let members = self.engine.members(&group.mls_group_id)?;
+            let members = self.engine.members(&group.id)?;
             if !Self::is_note_to_self_group(&group, &members, &me) {
                 continue;
             }
             if found
                 .as_ref()
-                .is_none_or(|f| group.mls_group_id.as_slice() < f.as_slice())
+                .is_none_or(|f| group.id.as_slice() < f.as_slice())
             {
-                found = Some(group.mls_group_id);
+                found = Some(group.id.clone());
             }
         }
         Ok(found)
@@ -3734,7 +3738,7 @@ impl SonarClient {
     }
 
     fn is_note_to_self_group(
-        group: &group_types::Group,
+        group: &cgka_traits::group::Group,
         members: &[PublicKey],
         me: &PublicKey,
     ) -> bool {
@@ -4298,7 +4302,8 @@ impl SonarClient {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_reaction(group_id, target_id, target_pubkey, emoji)?
+                .create_and_process_reaction(group_id, target_id, target_pubkey, emoji)
+                .await?
         };
         match incoming {
             Incoming::Reaction { reaction_id, .. } => {
@@ -8273,6 +8278,12 @@ impl SonarClient {
         Ok(notifications)
     }
 
+    /// The Nostr `#h` id relays and logs use for `group_id`, when the group
+    /// carries a routing component.
+    pub fn nostr_group_id_hex(&self, group_id: &GroupId) -> Option<String> {
+        self.engine.nostr_h_tag_hex(group_id).ok().flatten()
+    }
+
     pub fn groups(&self) -> Result<Vec<cgka_traits::group::Group>> {
         // Hosts paint `chats()` / FFI `groups()` before summaries. A lost
         // JSON sidecar must not re-list a recovered 0.8 row as a second
@@ -9329,7 +9340,7 @@ impl SonarClient {
             let Ok(bytes) = hex::decode(&group_id_hex) else {
                 continue;
             };
-            let group_id = GroupId::from_slice(&bytes);
+            let group_id = GroupId::new(bytes);
             match self.publish_timezone_rumor(&group_id, &group_id_hex, &payload).await {
                 Ok(()) => {
                     self.timezone_shared_with.lock().unwrap().remove(&group_id_hex);
@@ -9633,11 +9644,12 @@ impl SonarClient {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_timezone_share(group_id, payload, created_at)?
+                .create_and_process_timezone_share(group_id, payload, created_at)
+                .await?
         };
         if !matches!(incoming, Incoming::TimezoneShare { .. }) {
             return Err(Error::InvalidInput(
-                "created timezone rumor did not persist as kind-449".into(),
+                "created timezone share did not echo as a timezone share".into(),
             ));
         }
         // Skip our own relay echo, as `spawn_send_bookkeeping` does for every
@@ -11332,6 +11344,7 @@ mod tests {
                 sticker_ref: None,
                 classification: crate::marmot::MessageClassification::of("old hello"),
                 reply: None,
+                reactions: Vec::new(),
             },
             Some("standup"),
         );
@@ -11374,6 +11387,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("replayed after leave"),
             reply: None,
+            reactions: Vec::new(),
         });
         client.upsert_index_for_message(
             &ChatMessage {
@@ -11388,6 +11402,7 @@ mod tests {
                 sticker_ref: None,
                 classification: crate::marmot::MessageClassification::of("replayed after leave"),
                 reply: None,
+                reactions: Vec::new(),
             },
             Some("standup"),
         );
@@ -11743,6 +11758,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("old standup"),
             reply: None,
+            reactions: Vec::new(),
         });
         assert!(
             client.engine.is_historical_group(&historical).unwrap(),
@@ -11924,6 +11940,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("old hello"),
             reply: None,
+            reactions: Vec::new(),
         });
         stage_tiny_jpeg(&client, "resume08hist", &historical);
         client
@@ -12216,15 +12233,15 @@ mod tests {
         let bob = MarmotEngine::in_memory(Identity::generate());
         let group_relays = vec![relay_url.clone()];
         for name in ["first", "second"] {
-            let kp = bob.key_package_event(group_relays.clone()).expect("bob kp");
+            let kp = bob.key_package_event(group_relays.clone()).await.expect("bob kp");
             let creation = alice
                 .engine
                 .create_group(name, vec![kp], group_relays.clone())
-                .expect("alice creates group with bob");
+                .await.expect("alice creates group with bob");
             alice
                 .engine
-                .merge_pending_commit(&creation.group.mls_group_id)
-                .expect("merge");
+                .merge_pending_commit(&creation.group.id)
+                .await.expect("merge");
         }
         alice
             .register_push_token("apns", b"device-token", &Keys::generate().public_key().to_hex())
@@ -12276,15 +12293,15 @@ mod tests {
             .map(|_| MarmotEngine::in_memory(Identity::generate()))
             .collect();
         for (i, peer) in peers.iter().enumerate() {
-            let kp = peer.key_package_event(group_relays.clone()).expect("peer kp");
+            let kp = peer.key_package_event(group_relays.clone()).await.expect("peer kp");
             let creation = alice
                 .engine
                 .create_group(&format!("dm {i}"), vec![kp], group_relays.clone())
-                .expect("alice creates group");
+                .await.expect("alice creates group");
             alice
                 .engine
-                .merge_pending_commit(&creation.group.mls_group_id)
-                .expect("merge");
+                .merge_pending_commit(&creation.group.id)
+                .await.expect("merge");
         }
         let wait_idle = || async {
             for _ in 0..400 {
@@ -12356,6 +12373,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("old hello"),
             reply: None,
+            reactions: Vec::new(),
         });
         let payload = serde_json::json!({
             "encrypted_token": "dGVzdA==",
@@ -12394,6 +12412,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("old hello"),
             reply: None,
+            reactions: Vec::new(),
         });
         client.engine.purge_fold_family(&historical);
         let payload = serde_json::json!({
@@ -12581,6 +12600,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
             reply: None,
+            reactions: Vec::new(),
         });
         let err = client
             .fetch_media(&historical, url)
@@ -12623,6 +12643,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
             reply: None,
+            reactions: Vec::new(),
         });
         client
             .engine()
@@ -12710,6 +12731,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
             reply: None,
+            reactions: Vec::new(),
         });
         client
             .engine()
@@ -13288,6 +13310,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("keep this chat"),
             reply: None,
+            reactions: Vec::new(),
         });
 
         let bob_kp = bob
@@ -13392,6 +13415,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("keep this chat"),
             reply: None,
+            reactions: Vec::new(),
         });
         bob.populate_empty_transcript_backfills_once();
         assert!(
@@ -13513,6 +13537,7 @@ mod tests {
         *bob.own_push_registration.lock().unwrap() = Some(crate::push::OwnPushRegistration {
             encrypted_token_b64: "dGVzdA==".to_owned(),
             server_pubkey: Keys::generate().public_key(),
+            fingerprint: "test-fingerprint".to_owned(),
         });
 
         let bob_kp = bob
@@ -13691,26 +13716,31 @@ mod tests {
         let mut groups = Vec::new();
         for i in 0..4 {
             let peer = MarmotEngine::in_memory(Identity::generate());
-            let kp = peer.key_package_event(relays.clone()).expect("peer kp");
+            let kp = peer.key_package_event(relays.clone()).await.expect("peer kp");
             let creation = alice
                 .engine
                 .create_group(&format!("chat {i}"), vec![kp], relays.clone())
-                .expect("alice creates group");
-            let group_id = creation.group.mls_group_id.clone();
+                .await.expect("alice creates group");
+            let group_id = creation.group.id.clone();
             alice
                 .engine
                 .merge_pending_commit(&group_id)
-                .expect("alice merges pending commit");
+                .await.expect("alice merges pending commit");
             let hello = alice
                 .engine
                 .create_text_message(&group_id, "hello")
-                .expect("alice creates hello");
+                .await.expect("alice creates hello");
             alice
                 .engine
                 .process_incoming(&hello)
                 .await
                 .expect("alice stores hello");
-            groups.push((group_id, hex::encode(creation.group.nostr_group_id)));
+            let h = alice
+                .engine
+                .nostr_h_tag_hex(&group_id)
+                .expect("h tag")
+                .expect("group has an h tag");
+            groups.push((group_id, h));
         }
         // The chat the user is active in sorts LAST by group id, so a queue
         // ordered by id cannot put it first by accident.
@@ -13723,7 +13753,7 @@ mod tests {
         let latest = alice
             .engine
             .create_text_message(&active_group, "are you there?")
-            .expect("alice creates latest");
+            .await.expect("alice creates latest");
         alice
             .engine
             .process_incoming(&latest)
@@ -14681,6 +14711,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("keep this chat"),
             reply: None,
+            reactions: Vec::new(),
         });
         assert!(
             bob.engine.historical_resume_is_direct(&historical),
@@ -14789,6 +14820,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("keep this chat"),
             reply: None,
+            reactions: Vec::new(),
         });
         let bob_kp = bob
             .engine
@@ -14878,6 +14910,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("keep this chat"),
             reply: None,
+            reactions: Vec::new(),
         });
         let hist_hex = hex::encode(historical.as_slice());
         {
@@ -14959,6 +14992,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("keep this chat"),
             reply: None,
+            reactions: Vec::new(),
         });
         let hist_hex = hex::encode(historical.as_slice());
         {
@@ -15073,6 +15107,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("old standup"),
             reply: None,
+            reactions: Vec::new(),
         });
         bob.engine.seed_historical_metadata(
             historical.clone(),
@@ -15166,6 +15201,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("old standup"),
             reply: None,
+            reactions: Vec::new(),
         });
         bob.engine.seed_historical_metadata(
             historical.clone(),
@@ -15246,6 +15282,7 @@ mod tests {
                 sticker_ref: None,
                 classification: crate::marmot::MessageClassification::of(name),
                 reply: None,
+                reactions: Vec::new(),
             });
             bob.engine.seed_historical_metadata(
                 id,
@@ -15318,6 +15355,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("standup from 0.8"),
             reply: None,
+            reactions: Vec::new(),
         });
         bob.engine.seed_historical_metadata(
             historical.clone(),
@@ -15423,6 +15461,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("standup from 0.8"),
             reply: None,
+            reactions: Vec::new(),
         });
         bob.engine.seed_historical_metadata(
             historical.clone(),
@@ -15487,6 +15526,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("standup from 0.8"),
             reply: None,
+            reactions: Vec::new(),
         });
         bob.engine.seed_historical_metadata(
             historical.clone(),
@@ -15565,6 +15605,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("standup from 0.8"),
             reply: None,
+            reactions: Vec::new(),
         });
         bob.engine.seed_historical_metadata(
             historical.clone(),
@@ -15674,6 +15715,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("old standup"),
             reply: None,
+            reactions: Vec::new(),
         });
         bob.engine.seed_historical_metadata(
             historical.clone(),
@@ -15988,15 +16030,15 @@ mod tests {
             .engine
             .create_group(
                 "alice & bob",
-                vec![bob.key_package_event(relays.clone()).unwrap()],
+                vec![bob.key_package_event(relays.clone()).await.unwrap()],
                 relays,
             )
-            .unwrap();
+            .await.unwrap();
         alice
             .engine
-            .merge_pending_commit(&creation.group.mls_group_id)
-            .unwrap();
-        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            .merge_pending_commit(&creation.group.id)
+            .await.unwrap();
+        let group_hex = hex::encode(creation.group.id.as_slice());
         alice
             .set_timezone_share_groups(vec![group_hex.clone()])
             .await;
@@ -16107,7 +16149,7 @@ mod tests {
                 if bob
                     .groups()
                     .ok()
-                    .and_then(|groups| groups.first().map(|g| g.mls_group_id.clone()))
+                    .and_then(|groups| groups.first().map(|g| g.id.clone()))
                     .is_some_and(|g| bob.messages(&g).map(|m| m.len()).unwrap_or(0) == 1)
                 {
                     break;
@@ -16116,7 +16158,7 @@ mod tests {
             }
             hex::encode(group.as_slice())
         };
-        let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_group = bob.groups().expect("bob groups")[0].id.clone();
         assert_eq!(
             bob.messages(&bob_group).expect("messages").len(),
             1,
@@ -16276,15 +16318,15 @@ mod tests {
                 .engine
                 .create_group(
                     "alice & bob",
-                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    vec![bob.key_package_event(relays.clone()).await.unwrap()],
                     relays,
                 )
-                .unwrap();
+                .await.unwrap();
             alice
                 .engine
-                .merge_pending_commit(&creation.group.mls_group_id)
-                .unwrap();
-            let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+                .merge_pending_commit(&creation.group.id)
+                .await.unwrap();
+            let group_hex = hex::encode(creation.group.id.as_slice());
             alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
             alice.update_local_timezone("Europe/Zurich").await.unwrap();
             assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 1);
@@ -16317,11 +16359,11 @@ mod tests {
             .engine
             .create_group(
                 "alice & bob",
-                vec![bob.key_package_event(relays.clone()).unwrap()],
+                vec![bob.key_package_event(relays.clone()).await.unwrap()],
                 relays,
             )
-            .unwrap();
-        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            .await.unwrap();
+        let group_hex = hex::encode(creation.group.id.as_slice());
 
         alice.set_timezone_share_groups(vec![group_hex]).await;
         alice.update_local_timezone("Europe/Zurich").await.unwrap();
@@ -16355,19 +16397,19 @@ mod tests {
             .engine
             .create_group(
                 "alice & bob",
-                vec![bob.key_package_event(relays.clone()).unwrap()],
+                vec![bob.key_package_event(relays.clone()).await.unwrap()],
                 relays,
             )
-            .unwrap();
+            .await.unwrap();
         alice
             .engine
-            .merge_pending_commit(&creation.group.mls_group_id)
-            .unwrap();
-        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            .merge_pending_commit(&creation.group.id)
+            .await.unwrap();
+        let group_hex = hex::encode(creation.group.id.as_slice());
         let (event, _) = alice
             .engine
-            .create_and_process_text_message(&creation.group.mls_group_id, "hi")
-            .unwrap();
+            .create_and_process_text_message(&creation.group.id, "hi")
+            .await.unwrap();
         alice
             .outbox_state
             .lock()
@@ -16411,19 +16453,19 @@ mod tests {
             .engine
             .create_group(
                 "alice & bob",
-                vec![bob.key_package_event(relays.clone()).unwrap()],
+                vec![bob.key_package_event(relays.clone()).await.unwrap()],
                 relays,
             )
-            .unwrap();
-        let gid = creation.group.mls_group_id;
-        alice.engine.merge_pending_commit(&gid).unwrap();
+            .await.unwrap();
+        let gid = creation.group.id;
+        alice.engine.merge_pending_commit(&gid).await.unwrap();
         let group_hex = hex::encode(gid.as_slice());
         let now = Timestamp::now().as_secs();
         for i in 0..3 {
             let (event, _) = alice
                 .engine
                 .create_and_process_text_message(&gid, &format!("hi {i}"))
-                .unwrap();
+                .await.unwrap();
             alice
                 .outbox_state
                 .lock()
@@ -16442,7 +16484,7 @@ mod tests {
             let (event, _) = alice
                 .engine
                 .create_and_process_timezone_share(&gid, &payload, Timestamp::from(now + offset))
-                .unwrap();
+                .await.unwrap();
             alice
                 .outbox_state
                 .lock()
@@ -16520,15 +16562,15 @@ mod tests {
                 .engine
                 .create_group(
                     "chat",
-                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    vec![bob.key_package_event(relays.clone()).await.unwrap()],
                     relays.clone(),
                 )
-                .unwrap();
+                .await.unwrap();
             alice
                 .engine
-                .merge_pending_commit(&creation.group.mls_group_id)
-                .unwrap();
-            let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+                .merge_pending_commit(&creation.group.id)
+                .await.unwrap();
+            let group_hex = hex::encode(creation.group.id.as_slice());
             alice
                 .conversation_index
                 .as_ref()
@@ -16615,7 +16657,7 @@ mod tests {
         assert!(!shared_hexes(&alice).contains(&oldest));
         let before = alice.outbox_state.lock().unwrap().recorded_count();
 
-        let gid = GroupId::from_slice(&hex::decode(&oldest).unwrap());
+        let gid = GroupId::new(hex::decode(&oldest).unwrap());
         alice.send_text(&gid, "hello").await.unwrap();
         assert_eq!(
             alice.outbox_state.lock().unwrap().recorded_count(),
@@ -16770,8 +16812,11 @@ mod tests {
         assert!(!reloaded.failed_event_passes.contains_key("poison"));
     }
 
-    /// Our own wrapper, created at the engine level so nothing marks it, fed
-    /// back as a relay echo: MDK answers Failed on every delivery.
+    /// A kind-445 for one of Alice's groups that no epoch can decrypt (our
+    /// own share with its ciphertext corrupted and re-signed, as a relay could
+    /// deliver a losing-epoch or damaged message): MDK answers Failed on every
+    /// delivery. MDK 0.8 also failed on a client's own echo; MDK v2 recognises
+    /// its own echo (`OwnEcho`), so the echo alone no longer exercises this.
     async fn alice_with_an_unmarked_own_echo() -> (SonarClient, nostr::Event) {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
@@ -16782,18 +16827,28 @@ mod tests {
             .engine
             .create_group(
                 "alice & bob",
-                vec![bob.key_package_event(relays.clone()).unwrap()],
+                vec![bob.key_package_event(relays.clone()).await.unwrap()],
                 relays,
             )
-            .unwrap();
-        let gid = creation.group.mls_group_id;
-        alice.engine.merge_pending_commit(&gid).unwrap();
+            .await.unwrap();
+        let gid = creation.group.id;
+        alice.engine.merge_pending_commit(&gid).await.unwrap();
         let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
         let (echo, _) = alice
             .engine
             .create_and_process_timezone_share(&gid, &payload, Timestamp::now())
-            .unwrap();
-        (alice, echo)
+            .await.unwrap();
+        let mut content: Vec<char> = echo.content.chars().collect();
+        let mid = content.len() / 2;
+        for c in content.iter_mut().skip(mid).take(8) {
+            *c = if *c == 'A' { 'B' } else { 'A' };
+        }
+        let corrupted = EventBuilder::new(Kind::MlsGroupMessage, content.into_iter().collect::<String>())
+            .tags(echo.tags.clone())
+            .custom_created_at(echo.created_at)
+            .sign_with_keys(&Keys::generate())
+            .expect("sign corrupted 445");
+        (alice, corrupted)
     }
 
     #[tokio::test]
@@ -16863,15 +16918,15 @@ mod tests {
                 .engine
                 .create_group(
                     "chat",
-                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    vec![bob.key_package_event(relays.clone()).await.unwrap()],
                     relays.clone(),
                 )
-                .unwrap();
+                .await.unwrap();
             alice
                 .engine
-                .merge_pending_commit(&creation.group.mls_group_id)
-                .unwrap();
-            group_hexes.push(hex::encode(creation.group.mls_group_id.as_slice()));
+                .merge_pending_commit(&creation.group.id)
+                .await.unwrap();
+            group_hexes.push(hex::encode(creation.group.id.as_slice()));
         }
         let before = alice.outbox_state.lock().unwrap().save_count();
         alice.set_timezone_share_groups(group_hexes).await;
@@ -16898,15 +16953,15 @@ mod tests {
             .engine
             .create_group(
                 "alice & bob",
-                vec![bob.key_package_event(relays.clone()).unwrap()],
+                vec![bob.key_package_event(relays.clone()).await.unwrap()],
                 relays,
             )
-            .unwrap();
+            .await.unwrap();
         alice
             .engine
-            .merge_pending_commit(&creation.group.mls_group_id)
-            .unwrap();
-        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            .merge_pending_commit(&creation.group.id)
+            .await.unwrap();
+        let group_hex = hex::encode(creation.group.id.as_slice());
 
         alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
         alice.update_local_timezone("Europe/Zurich").await.unwrap();
@@ -16914,8 +16969,13 @@ mod tests {
             .outbox_state
             .lock()
             .unwrap()
-            .retryable_events(Timestamp::now().as_secs(), &HashSet::from([group_hex]))
-            .unwrap();
+            .retryable_events(
+                Timestamp::now().as_secs(),
+                &HashSet::from([group_hex.clone()]),
+                &HashSet::from([group_hex]),
+            )
+            .unwrap()
+            .0;
         assert_eq!(queued.len(), 1);
         let (_, _, share, silent) = &queued[0];
         assert!(silent, "a share is a control row: its retry and ack stay silent");
@@ -17024,18 +17084,19 @@ mod tests {
             .expect("bob starts");
         let mut groups = Vec::new();
         for name in ["dm", "group"] {
-            let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
-            let creation = alice.create_group(name, vec![bob_kp], relays.clone()).unwrap();
-            let group_id = creation.group.mls_group_id;
+            let bob_kp = bob.engine.key_package_event(relays.clone()).await.unwrap();
+            let creation = alice.create_group(name, vec![bob_kp], relays.clone()).await.unwrap();
+            let group_id = creation.group.id;
             let (bob_pubkey, welcome) = creation
                 .welcomes
                 .into_iter()
                 .find(|(member, _)| *member == bob.identity().public_key())
                 .unwrap();
-            let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
+            // v2 creation hands back welcomes already gift-wrapped.
+            let _ = bob_pubkey;
             bob.process_marmot_events([welcome], "timezone revoke welcome")
                 .await;
-            alice.merge_pending_commit(&group_id).unwrap();
+            alice.merge_pending_commit(&group_id).await.unwrap();
             groups.push(group_id);
         }
         let hexes: Vec<String> = groups.iter().map(|g| hex::encode(g.as_slice())).collect();
@@ -17044,7 +17105,7 @@ mod tests {
         for group_id in &groups {
             let (event, _) = alice
                 .create_and_process_timezone_share(group_id, &share, Timestamp::from(1_000))
-                .unwrap();
+                .await.unwrap();
             bob.process_marmot_events([event], "timezone share").await;
         }
         assert_eq!(bob.peer_timezones(&hexes).len(), 2);
@@ -17052,7 +17113,7 @@ mod tests {
         let revoke = crate::timezone::encode_timezone_revoke_payload();
         let (event, _) = alice
             .create_and_process_timezone_share(&groups[0], &revoke, Timestamp::from(1_000))
-            .unwrap();
+            .await.unwrap();
         let (report, notifications) = bob.process_marmot_events([event], "timezone revoke").await;
 
         assert_eq!(report.processed, 1);
@@ -17073,14 +17134,14 @@ mod tests {
         let bob = MarmotEngine::in_memory(Identity::generate());
         let shared = alice
             .engine
-            .create_group("shared", vec![bob.key_package_event(relays.clone()).unwrap()], relays.clone())
-            .unwrap();
+            .create_group("shared", vec![bob.key_package_event(relays.clone()).await.unwrap()], relays.clone())
+            .await.unwrap();
         let never = alice
             .engine
-            .create_group("never", vec![bob.key_package_event(relays.clone()).unwrap()], relays)
-            .unwrap();
-        let shared_hex = hex::encode(shared.group.mls_group_id.as_slice());
-        let never_hex = hex::encode(never.group.mls_group_id.as_slice());
+            .create_group("never", vec![bob.key_package_event(relays.clone()).await.unwrap()], relays)
+            .await.unwrap();
+        let shared_hex = hex::encode(shared.group.id.as_slice());
+        let never_hex = hex::encode(never.group.id.as_slice());
 
         alice.set_timezone_share_groups(vec![shared_hex.clone()]).await;
         alice.update_local_timezone("Asia/Tokyo").await.unwrap();

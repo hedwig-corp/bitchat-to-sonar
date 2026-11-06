@@ -13,7 +13,6 @@ use std::sync::Mutex;
 use ::hkdf::Hkdf;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use mdk_storage_traits::messages::types::Message as StoredMessage;
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -99,19 +98,26 @@ where
     last
 }
 
-pub fn parse_stored(message: &StoredMessage) -> Option<ParsedReaction> {
-    if !is_reaction_kind(message.kind) {
+/// A kind-7 reaction inside a decrypted Marmot app event, attributed to its
+/// MLS sender. `None` for every other kind, an empty or over-long emoji, or a
+/// missing target. MDK v2 keeps no plaintext message rows, so this is the one
+/// place an incoming (or locally echoed) reaction is recognised.
+pub fn parse_app_event(
+    id: EventId,
+    sender: PublicKey,
+    kind: u64,
+    content: &str,
+    tags: &Tags,
+) -> Option<ParsedReaction> {
+    if kind != u64::from(REACTION_RUMOR_KIND) {
         return None;
     }
-    if message.state == mdk_storage_traits::messages::types::MessageState::Deleted {
-        return None;
-    }
-    let emoji = normalize_emoji(&message.content).ok()?;
-    let target_id = parse_target_id(message.tags.iter())?;
+    let emoji = normalize_emoji(content).ok()?;
+    let target_id = parse_target_id(tags.iter())?;
     Some(ParsedReaction {
-        id: message.id,
+        id,
         target_id,
-        sender: message.pubkey,
+        sender,
         emoji,
     })
 }
@@ -278,7 +284,7 @@ struct ReactionStoreDiskEntry {
     emoji: String,
 }
 
-fn group_key(group_id: &mdk_core::GroupId) -> Vec<u8> {
+fn group_key(group_id: &crate::GroupId) -> Vec<u8> {
     group_id.as_slice().to_vec()
 }
 
@@ -397,7 +403,7 @@ impl ReactionStore {
             let Ok(sender) = PublicKey::parse(&entry.sender) else {
                 continue;
             };
-            let group = mdk_core::GroupId::from_slice(&group_bytes);
+            let group = crate::GroupId::new(group_bytes.to_vec());
             store.record(
                 &group,
                 ParsedReaction {
@@ -458,7 +464,7 @@ impl ReactionStore {
     /// Tallies are unique `(sender, emoji)` per target, so a flood of distinct
     /// kind-7 ids for the same chip is stored once. First event wins; a later
     /// distinct id is ignored unless [`Self::remove_id`] dropped the first.
-    pub fn record(&mut self, group_id: &mdk_core::GroupId, reaction: ParsedReaction) -> bool {
+    pub fn record(&mut self, group_id: &crate::GroupId, reaction: ParsedReaction) -> bool {
         let key = (group_key(group_id), reaction.target_id);
         let entries = self.by_target.entry(key).or_default();
         if entries.iter().any(|e| e.id == reaction.id) {
@@ -487,7 +493,7 @@ impl ReactionStore {
     }
 
     /// Drop every reaction belonging to a locally deleted group.
-    pub fn remove_group(&mut self, group_id: &mdk_core::GroupId) -> bool {
+    pub fn remove_group(&mut self, group_id: &crate::GroupId) -> bool {
         let gk = group_key(group_id);
         let before = self.by_target.len();
         self.by_target.retain(|(g, _), _| g != &gk);
@@ -496,7 +502,7 @@ impl ReactionStore {
 
     pub fn for_targets(
         &self,
-        group_id: &mdk_core::GroupId,
+        group_id: &crate::GroupId,
         targets: &HashSet<EventId>,
     ) -> Vec<ParsedReaction> {
         let gk = group_key(group_id);
@@ -544,16 +550,16 @@ impl ReactionIndex {
         }
     }
 
-    /// Load the sealed sidecar beside `db_path`. The bool is true when it must
-    /// be rebuilt from SQLCipher (missing, dirty, plaintext v1, wrong key).
+    /// Load the sealed sidecar beside `db_path`. The bool is true when it was
+    /// missing, dirty or unreadable: the caller re-persists the loaded store so
+    /// the marker clears ([`Self::settle_after_open`]).
     pub(crate) fn open(db_path: &Path, db_key: &[u8; 32]) -> (Self, bool) {
         let key = ReactionStoreKey::derive(db_key);
         let needs_rebuild = reaction_store_needs_rebuild(db_path, &key);
-        let store = if needs_rebuild {
-            ReactionStore::default()
-        } else {
-            ReactionStore::load(&reaction_store_path_for_db(db_path), &key)
-        };
+        // MDK v2 keeps no plaintext rows to rebuild from: the sealed sidecar
+        // is the only copy of the tallies, so a dirty marker (a crash between
+        // a record and its persist) still loads what the sidecar holds.
+        let store = ReactionStore::load(&reaction_store_path_for_db(db_path), &key);
         let index = Self {
             store: Mutex::new(store),
             suppressed: Mutex::new(HashSet::new()),
@@ -564,6 +570,12 @@ impl ReactionIndex {
             rebuild_pending: std::sync::atomic::AtomicBool::new(false),
         };
         (index, needs_rebuild)
+    }
+
+    /// Rewrite the sidecar from the loaded store and clear a stale dirty
+    /// marker. MDK v2 has no plaintext rows to rebuild from.
+    pub(crate) fn settle_after_open(&self) {
+        self.persist();
     }
 
     /// Install a store rebuilt from SQLCipher and persist it.
@@ -612,7 +624,7 @@ impl ReactionIndex {
 
     /// Insert without persisting. False for a duplicate `(sender, emoji)`, a
     /// known rumor id, or a suppressed (terminally failed) rumor.
-    pub(crate) fn record(&self, group_id: &mdk_core::GroupId, reaction: ParsedReaction) -> bool {
+    pub(crate) fn record(&self, group_id: &crate::GroupId, reaction: ParsedReaction) -> bool {
         if self.is_suppressed(&reaction.id) {
             return false;
         }
@@ -621,7 +633,7 @@ impl ReactionIndex {
 
     /// Record rows found by a read of already-committed MDK rows, persisting
     /// once if any was new.
-    pub(crate) fn record_all<I>(&self, group_id: &mdk_core::GroupId, reactions: I)
+    pub(crate) fn record_all<I>(&self, group_id: &crate::GroupId, reactions: I)
     where
         I: IntoIterator<Item = ParsedReaction>,
     {
@@ -659,19 +671,24 @@ impl ReactionIndex {
     }
 
     /// Drop a locally deleted group's rows. Returns whether anything changed.
-    pub(crate) fn remove_group(&self, group_id: &mdk_core::GroupId) -> bool {
+    pub(crate) fn remove_group(&self, group_id: &crate::GroupId) -> bool {
         self.store.lock().unwrap().remove_group(group_id)
     }
 
     /// Reactions on `targets`, minus suppressed rumors.
     pub(crate) fn for_targets(
         &self,
-        group_id: &mdk_core::GroupId,
+        group_id: &crate::GroupId,
         targets: &HashSet<EventId>,
     ) -> Vec<ParsedReaction> {
         let mut out = self.store.lock().unwrap().for_targets(group_id, targets);
         out.retain(|r| !self.is_suppressed(&r.id));
         out
+    }
+
+    /// Persist after a [`Self::record`] that inserted a row.
+    pub(crate) fn persist_now(&self) {
+        self.persist();
     }
 
     /// Replace the sidecar with the in-memory store. True when the sidecar now
@@ -709,6 +726,9 @@ pub(crate) struct ReactionWriteGuard<'a> {
     keep_dirty: bool,
 }
 
+// MDK v2 keeps no plaintext rows, so nothing commits a kind-7 outside the
+// index any more; the guard is kept for its tests and a later MDK store.
+#[cfg_attr(not(test), allow(dead_code))]
 impl ReactionWriteGuard<'_> {
     /// The write changed the in-memory store: replace the sidecar. When that
     /// fails the marker stays, so the next open rebuilds from SQLCipher.
@@ -834,7 +854,7 @@ mod tests {
         let (parent, other, me, _) = ids();
         let mut messages = vec![ChatMessage {
             id: parent,
-            group_id: mdk_core::GroupId::from_slice(&[0u8; 32]),
+            group_id: crate::GroupId::new([0u8; 32].to_vec()),
             sender: me,
             classification: crate::marmot::MessageClassification::Text,
             content: "hi".into(),
@@ -855,7 +875,7 @@ mod tests {
     #[test]
     fn store_lookup_is_target_keyed() {
         let (parent, other, me, _) = ids();
-        let group = mdk_core::GroupId::from_slice(&[0u8; 32]);
+        let group = crate::GroupId::new([0u8; 32].to_vec());
         let mut store = ReactionStore::default();
         store.record(&group, rx(1, parent, me, "👍"));
         store.record(&group, rx(2, other, me, "🔥"));
@@ -869,7 +889,7 @@ mod tests {
     #[test]
     fn store_compacts_duplicate_sender_emoji() {
         let (parent, _, me, _) = ids();
-        let group = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
+        let group = crate::GroupId::new([0xABu8; 16].to_vec());
         let mut store = ReactionStore::default();
         assert!(store.record(&group, rx(1, parent, me, "👍")));
         assert!(!store.record(&group, rx(2, parent, me, "👍")));
@@ -883,7 +903,7 @@ mod tests {
     #[test]
     fn store_remove_id_allows_retry_after_terminal_failure() {
         let (parent, _, me, _) = ids();
-        let group = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
+        let group = crate::GroupId::new([0xABu8; 16].to_vec());
         let mut store = ReactionStore::default();
         store.record(&group, rx(1, parent, me, "👍"));
         assert!(store.remove_id(rx(1, parent, me, "👍").id));
@@ -898,8 +918,8 @@ mod tests {
     #[test]
     fn store_remove_group_drops_that_group_only() {
         let (parent, other, me, _) = ids();
-        let group_a = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
-        let group_b = mdk_core::GroupId::from_slice(&[0xCDu8; 16]);
+        let group_a = crate::GroupId::new([0xABu8; 16].to_vec());
+        let group_b = crate::GroupId::new([0xCDu8; 16].to_vec());
         let mut store = ReactionStore::default();
         store.record(&group_a, rx(1, parent, me, "👍"));
         store.record(&group_b, rx(2, other, me, "🔥"));
@@ -916,7 +936,7 @@ mod tests {
         let (parent, _, me, _) = ids();
         // MLS GroupId is 16 bytes. Filtering `len() != 32` on load would pass a
         // 32-byte fixture here and drop every real group on reopen.
-        let group = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
+        let group = crate::GroupId::new([0xABu8; 16].to_vec());
         let mut store = ReactionStore::default();
         store.record(&group, rx(1, parent, me, "👍"));
         let dir = tempfile::tempdir().expect("tempdir");
@@ -959,7 +979,7 @@ mod tests {
     #[test]
     fn sidecar_is_sealed_not_plaintext() {
         let (parent, _, me, _) = ids();
-        let group = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
+        let group = crate::GroupId::new([0xABu8; 16].to_vec());
         let mut store = ReactionStore::default();
         store.record(&group, rx(1, parent, me, "👍"));
         let dir = tempfile::tempdir().expect("tempdir");

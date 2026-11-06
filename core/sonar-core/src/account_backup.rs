@@ -1046,6 +1046,9 @@ fn backup_sidecar_suffixes() -> &'static [&'static str] {
         crate::marmot::DROPPED_GROUPS_FILE_SUFFIX,
         crate::outbox::OUTBOX_STATE_FILE_SUFFIX,
         crate::marmot::SYNC_STATE_FILE_SUFFIX,
+        // MDK v2 keeps no plaintext app events, so the sealed reaction index
+        // is the only copy of the chips; MDK 0.8 could rebuild it from rows.
+        crate::reaction::REACTION_STORE_FILE_SUFFIX,
         crate::mdk08_migrate::MDK08_BACKUP_SUFFIX,
         "-wal.mdk08.bak",
         "-shm.mdk08.bak",
@@ -3438,6 +3441,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("keep this chat"),
             reply: None,
+            reactions: Vec::new(),
         };
         let mut transcript = HashMap::new();
         transcript.insert(hex_id.clone(), vec![msg]);
@@ -3636,6 +3640,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("keep this chat"),
             reply: None,
+            reactions: Vec::new(),
         };
         let live_msg = crate::marmot::ChatMessage {
             id: EventId::from_slice(&[0xCDu8; 32]).unwrap(),
@@ -3649,6 +3654,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("new 0.9"),
             reply: None,
+            reactions: Vec::new(),
         };
         let mut transcript = HashMap::new();
         transcript.insert(hist_hex.clone(), vec![hist_msg]);
@@ -3702,6 +3708,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("still here"),
             reply: None,
+            reactions: Vec::new(),
         };
         let mut transcript = HashMap::new();
         transcript.insert(kept_hex.clone(), vec![msg]);

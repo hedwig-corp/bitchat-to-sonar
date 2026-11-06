@@ -71,9 +71,16 @@ pub struct CachedPeerTimezone {
 
 /// The unsigned app event carrying `payload` (from
 /// [`encode_timezone_share_payload`]).
-pub(crate) fn timezone_share_rumor(payload: &str, author: PublicKey) -> UnsignedEvent {
+/// `created_at` orders shares and revokes at the receiver, so callers pass a
+/// per-sender monotonic second rather than the wall clock.
+pub(crate) fn timezone_share_rumor(
+    payload: &str,
+    author: PublicKey,
+    created_at: nostr::Timestamp,
+) -> UnsignedEvent {
     EventBuilder::new(Kind::Custom(KIND_TIMEZONE_SHARE), payload)
         .tag(Tag::identifier(TIMEZONE_SHARE_D_TAG))
+        .custom_created_at(created_at)
         .build(author)
 }
 
@@ -214,7 +221,7 @@ mod tests {
     fn a_timezone_share_needs_our_kind_and_our_d_tag() {
         let author = nostr::Keys::generate().public_key();
         let payload = encode_timezone_share_payload("Europe/Zurich").unwrap();
-        let rumor = timezone_share_rumor(&payload, author);
+        let rumor = timezone_share_rumor(&payload, author, nostr::Timestamp::now());
         let tags: Vec<Vec<String>> = rumor.tags.iter().map(|t| t.as_slice().to_vec()).collect();
         assert!(is_timezone_share(u64::from(rumor.kind.as_u16()), &tags));
 

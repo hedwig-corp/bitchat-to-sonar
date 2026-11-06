@@ -361,6 +361,9 @@ pub struct ChatMessage {
     /// NIP-C7 reply pointer. `content` is already the display body (nevent stripped).
     pub reply: Option<ReplyRef>,
     /// Aggregated kind-7 chips for this row. Empty when nobody has reacted.
+    /// Derived at read time from the reaction index, so never sealed into the
+    /// transcript.
+    #[serde(default, skip)]
     pub reactions: Vec<ReactionTally>,
 }
 
@@ -898,6 +901,18 @@ pub struct MarmotEngine {
     /// ingest returns an `Incoming`; queueing here means a share decrypted
     /// anywhere reaches the host's cache ([`Self::take_timezone_shares`]).
     timezone_shares: Mutex<Vec<TimezoneShareIn>>,
+    /// Kind-7 index keyed by target, plus the rumor ids whose outbox publish
+    /// exhausted auto-retries (hydrate skips those so a locally echoed `mine`
+    /// chip cannot look sent forever). MDK v2 stores no plaintext app events,
+    /// so this sealed index is the only copy of the tallies. `Arc` so the
+    /// outbox publish task can suppress on terminal failure.
+    reactions: Arc<crate::reaction::ReactionIndex>,
+    /// Our recent sends: kind-445 wrapper id → (group, message id). Rows are
+    /// keyed by the inner app-event id (what peers and White Noise see), so
+    /// the wrapper an own echo or a send result carries needs this to find
+    /// its row without scanning every transcript. Bounded; a miss after a
+    /// restart only loses the echo's row lookup.
+    own_sends: Mutex<OwnSendIds>,
     /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
     historical_group_names: Mutex<HashMap<GroupId, String>>,
     /// 0.8 `groups.description` / welcome `group_description`. Needed so a
@@ -1096,6 +1111,7 @@ impl MarmotEngine {
         let pending_mdk08 =
             crate::mdk08_migrate::pending_remainder(db_path, key, identity.public_key());
         let historical_media_secrets = crate::mdk08_migrate::load_historical_media_secrets(db_path);
+        let (reactions, reactions_unsettled) = crate::reaction::ReactionIndex::open(db_path, &key);
         let engine = Self {
             session: Mutex::new(Some(session)),
             identity,
@@ -1112,6 +1128,8 @@ impl MarmotEngine {
             transcript_writable: std::sync::atomic::AtomicBool::new(loaded.writable),
             pending_convergence: Mutex::new(HashMap::new()),
             timezone_shares: Mutex::new(Vec::new()),
+            reactions: Arc::new(reactions),
+            own_sends: Mutex::new(OwnSendIds::default()),
             historical_group_names: Mutex::new(historical_group_names),
             historical_group_descriptions: Mutex::new(
                 crate::mdk08_migrate::load_historical_group_descriptions(db_path),
@@ -1127,6 +1145,9 @@ impl MarmotEngine {
         };
         if transcript_healed {
             engine.persist_transcript();
+        }
+        if reactions_unsettled {
+            engine.reactions.settle_after_open();
         }
         Ok(engine)
     }
@@ -2460,6 +2481,7 @@ impl MarmotEngine {
     ) -> Result<Event> {
         let rumor = self.kind9_rumor(text, extra_tags, reply)?;
         let payload = marmot_app_event_from_rumor(&rumor)?;
+        let message_id = app_event_id_of(&payload)?;
         let mut lease = self.lease_session().await;
         let _ = lease.get_mut().ensure_group_hydrated(group_id);
         let effects = lease
@@ -2472,7 +2494,8 @@ impl MarmotEngine {
             .await?;
         drop(lease);
         let event = event_from_app_publish(&effects)?;
-        if let Some(mut msg) = self.chat_from_app_rumor(group_id, &rumor, &event, true) {
+        self.remember_own_send(event.id, group_id, message_id);
+        if let Some(mut msg) = self.chat_from_app_rumor(group_id, &rumor, message_id, true) {
             self.attach_media_file_keys(group_id, &mut msg, None);
             self.store_chat(msg);
         }
@@ -2538,7 +2561,7 @@ impl MarmotEngine {
     ) -> Result<(Event, Incoming)> {
         let event = self.create_text_message(group_id, text).await?;
         let incoming = self
-            .lookup_chat(&event.id)
+            .lookup_own_send(&event.id)
             .map(Incoming::Message)
             .unwrap_or(Incoming::None);
         Ok((event, incoming))
@@ -2554,7 +2577,7 @@ impl MarmotEngine {
             .create_text_message_with_reply(group_id, text, reply)
             .await?;
         let incoming = overlay_reply_preview(
-            self.lookup_chat(&event.id)
+            self.lookup_own_send(&event.id)
                 .map(Incoming::Message)
                 .unwrap_or(Incoming::None),
             reply,
@@ -2572,7 +2595,8 @@ impl MarmotEngine {
         payload: &str,
         created_at: Timestamp,
     ) -> Result<(Event, Incoming)> {
-        let rumor = crate::timezone::timezone_share_rumor(payload, self.identity.public_key());
+        let rumor =
+            crate::timezone::timezone_share_rumor(payload, self.identity.public_key(), created_at);
         let app_payload = marmot_app_event_from_rumor(&rumor)?;
         let mut lease = self.lease_session().await;
         let _ = lease.get_mut().ensure_group_hydrated(group_id);
@@ -2593,6 +2617,54 @@ impl MarmotEngine {
                 sender: rumor.pubkey,
                 content: rumor.content,
                 created_at: rumor.created_at,
+            },
+        ))
+    }
+
+    /// Encrypt a NIP-25 kind-7 reaction into a signed kind-445 and record the
+    /// local echo in the reaction index (MDK v2 keeps no plaintext rows).
+    pub async fn create_and_process_reaction(
+        &self,
+        group_id: &GroupId,
+        target_id: &EventId,
+        target_pubkey: &PublicKey,
+        emoji: &str,
+    ) -> Result<(Event, Incoming)> {
+        let content = crate::reaction::normalize_emoji(emoji)?;
+        let rumor = EventBuilder::new(Kind::Reaction, content.clone())
+            .tags(crate::reaction::reaction_tags(target_id, target_pubkey))
+            .build(self.identity.public_key());
+        let app_payload = marmot_app_event_from_rumor(&rumor)?;
+        // The inner app-event id is the id every receiver records for this
+        // reaction, and the outbox key, like a chat send.
+        let reaction_id = app_event_id_of(&app_payload)?;
+        let mut lease = self.lease_session().await;
+        let _ = lease.get_mut().ensure_group_hydrated(group_id);
+        let effects = lease
+            .get_mut()
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload,
+                expected_epoch: None,
+            })
+            .await?;
+        drop(lease);
+        let event = event_from_app_publish(&effects)?;
+        let reaction = crate::reaction::ParsedReaction {
+            id: reaction_id,
+            target_id: *target_id,
+            sender: self.identity.public_key(),
+            emoji: content,
+        };
+        if self.reactions.record(group_id, reaction) {
+            self.reactions.persist_now();
+        }
+        Ok((
+            event,
+            Incoming::Reaction {
+                group_id: group_id.clone(),
+                target_id: *target_id,
+                reaction_id,
             },
         ))
     }
@@ -2624,7 +2696,7 @@ impl MarmotEngine {
     ) -> Result<(Event, Incoming)> {
         let event = self.create_sticker_message(group_id, sticker_ref).await?;
         let incoming = self
-            .lookup_chat(&event.id)
+            .lookup_own_send(&event.id)
             .map(Incoming::Message)
             .unwrap_or(Incoming::None);
         Ok((event, incoming))
@@ -2640,7 +2712,7 @@ impl MarmotEngine {
             .create_sticker_message_with_reply(group_id, sticker_ref, reply)
             .await?;
         let incoming = overlay_reply_preview(
-            self.lookup_chat(&event.id)
+            self.lookup_own_send(&event.id)
                 .map(Incoming::Message)
                 .unwrap_or(Incoming::None),
             reply,
@@ -2729,7 +2801,7 @@ impl MarmotEngine {
             .create_media_event_multi(group_id, uploads, caption)
             .await?;
         let incoming = self
-            .lookup_chat(&event.id)
+            .lookup_own_send(&event.id)
             .map(Incoming::Message)
             .unwrap_or(Incoming::None);
         Ok((event, incoming))
@@ -2746,7 +2818,7 @@ impl MarmotEngine {
             .create_media_event_multi_with_reply(group_id, uploads, caption, reply)
             .await?;
         let incoming = overlay_reply_preview(
-            self.lookup_chat(&event.id)
+            self.lookup_own_send(&event.id)
                 .map(Incoming::Message)
                 .unwrap_or(Incoming::None),
             reply,
@@ -3022,7 +3094,7 @@ impl MarmotEngine {
             IngestOutcome::Ignored { category } => {
                 match category {
                     InputRejectionCategory::OwnEcho | InputRejectionCategory::Duplicate => {
-                        if let Some(msg) = self.lookup_chat(&event.id) {
+                        if let Some(msg) = self.lookup_own_send(&event.id) {
                             return Ok(Incoming::Message(msg));
                         }
                         // MDK 0.9 collapsed 0.8 PreviouslyFailed into Duplicate
@@ -3108,6 +3180,17 @@ impl MarmotEngine {
                     // of an old kind-445 must not rewrite the transcript or
                     // surface Incoming::Message (hosts upsert + notify from that).
                     if self.is_dropped(&group_id) {
+                        continue;
+                    }
+                    if let Some(reaction) = reaction_from_payload(&message_id, &sender, &payload) {
+                        if self.reactions.record(&group_id, reaction.clone()) {
+                            self.reactions.persist_now();
+                        }
+                        last = Incoming::Reaction {
+                            group_id: group_id.clone(),
+                            target_id: reaction.target_id,
+                            reaction_id: reaction.id,
+                        };
                         continue;
                     }
                     if let Some(share) = timezone_share_from_payload(&group_id, &sender, &payload) {
@@ -3395,7 +3478,9 @@ impl MarmotEngine {
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
         self.drain_mdk08_remainder()?;
-        self.mapped_transcript(group_id)
+        let mut mapped = self.mapped_transcript(group_id)?;
+        self.attach_reaction_tallies(&mut mapped);
+        Ok(mapped)
     }
 
     fn mapped_transcript(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
@@ -3406,6 +3491,7 @@ impl MarmotEngine {
                 .then_with(|| a.id.cmp(&b.id))
         });
         hydrate_page_reply_previews(self, &mut mapped);
+        // Tally-free: `messages_page` is the chat-list read.
         Ok(mapped)
     }
 
@@ -3458,6 +3544,7 @@ impl MarmotEngine {
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
         hydrate_page_reply_previews(self, &mut candidates);
+        self.attach_reaction_tallies(&mut candidates);
         Ok(candidates)
     }
 
@@ -3638,6 +3725,13 @@ impl MarmotEngine {
             }
         }
         self.persist_transcript();
+        let mut reactions_changed = false;
+        for id in &family {
+            reactions_changed |= self.reactions.remove_group(id);
+        }
+        if reactions_changed {
+            self.reactions.persist_now();
+        }
         {
             let mut folds = self
                 .historical_folds
@@ -3760,6 +3854,33 @@ impl MarmotEngine {
                 self.persist_transcript_locked();
             }
         }
+    }
+
+    fn remember_own_send(&self, wrapper_id: EventId, group_id: &GroupId, message_id: EventId) {
+        self.own_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(wrapper_id, group_id.clone(), message_id);
+    }
+
+    /// The row of one of our recent sends, by its kind-445 wrapper id. Looks
+    /// in that one group only, never across every transcript.
+    fn lookup_own_send(&self, wrapper_id: &EventId) -> Option<ChatMessage> {
+        let (group_id, message_id) = self
+            .own_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(wrapper_id)?;
+        if self.is_dropped(&group_id) {
+            return None;
+        }
+        self.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&group_id)?
+            .iter()
+            .find(|m| m.id == message_id)
+            .cloned()
     }
 
     fn lookup_chat(&self, id: &EventId) -> Option<ChatMessage> {
@@ -3967,7 +4088,7 @@ impl MarmotEngine {
         &self,
         group_id: &GroupId,
         rumor: &UnsignedEvent,
-        event: &Event,
+        message_id: EventId,
         mine: bool,
     ) -> Option<ChatMessage> {
         if rumor.kind.as_u16() != CHAT_RUMOR_KIND {
@@ -3981,7 +4102,7 @@ impl MarmotEngine {
         let (content, reply) =
             crate::reply::project_application_content(&rumor.content, rumor.tags.iter());
         Some(ChatMessage {
-            id: event.id,
+            id: message_id,
             group_id: group_id.clone(),
             sender: rumor.pubkey,
             classification: MessageClassification::of(&content),
@@ -3996,6 +4117,7 @@ impl MarmotEngine {
             media,
             sticker_ref,
             reply,
+            reactions: Vec::new(),
         })
     }
 
@@ -4011,7 +4133,12 @@ impl MarmotEngine {
             return None;
         }
         let sender_pk = PublicKey::from_slice(sender.as_slice()).ok()?;
-        let id = message_id_to_event(message_id).ok()?;
+        // The inner app-event id names the message for every client (White
+        // Noise keys replies and reactions by it, as MDK 0.8 keyed rumor ids).
+        // MDK's `message_id` is an MLS-level id the sender never sees.
+        let id = EventId::from_hex(&app.id)
+            .ok()
+            .or_else(|| message_id_to_event(message_id).ok())?;
         let tags: Tags = app
             .tags
             .iter()
@@ -4036,51 +4163,34 @@ impl MarmotEngine {
             media,
             sticker_ref,
             reply,
+            reactions: Vec::new(),
         })
     }
 
-    /// Attach kind-7 tallies for the messages in `msgs`.
-    ///
-    /// `page_reactions` are kind-7 rows already seen in the same bounded cursor
-    /// scan that built the page. The target-keyed [`crate::reaction::ReactionStore`]
-    /// (durable beside the DB) supplies later reactions on older parents without
-    /// a 10,000-row scan on backscroll.
-    fn hydrate_page_reactions(
-        &self,
-        group_id: &GroupId,
-        msgs: &mut [ChatMessage],
-        page_reactions: Vec<crate::reaction::ParsedReaction>,
-    ) -> Result<()> {
+    /// Attach kind-7 tallies to transcript rows from the target-keyed
+    /// [`crate::reaction::ReactionIndex`]. A fold family pages rows from
+    /// several groups (a recovered v1 chat and its v2 successor), so each row
+    /// is looked up under its own group id. The chat-list read
+    /// (`messages_page`) stays tally-free.
+    fn attach_reaction_tallies(&self, msgs: &mut [ChatMessage]) {
         if msgs.is_empty() {
-            return Ok(());
+            return;
         }
-        // Every page row is recorded before the lookup, so the index is a
-        // superset of the page scan.
-        self.reactions.record_all(group_id, page_reactions);
-        let targets: HashSet<EventId> = msgs.iter().map(|m| m.id).collect();
-        let reactions = self.reactions.for_targets(group_id, &targets);
+        let mut targets_by_group: HashMap<GroupId, HashSet<EventId>> = HashMap::new();
+        for m in msgs.iter() {
+            targets_by_group
+                .entry(m.group_id.clone())
+                .or_default()
+                .insert(m.id);
+        }
+        let mut reactions = Vec::new();
+        for (group_id, targets) in &targets_by_group {
+            reactions.extend(self.reactions.for_targets(group_id, targets));
+        }
+        if reactions.is_empty() {
+            return;
+        }
         crate::reaction::attach_tallies(msgs, &reactions, self.identity.public_key());
-        Ok(())
-    }
-
-    /// One-shot derived-index rebuild from MDK rows (newest
-    /// `DEFAULT_MESSAGE_LIMIT` rows per group). Used after account restore
-    /// (sidecar wiped) and when the sidecar is missing, unreadable or dirty —
-    /// never on the chat-open paging path. Backscroll re-records older rows as
-    /// the cursor scan passes them.
-    fn rebuild_reaction_store_from_storage(&self) -> Result<()> {
-        let groups = dispatch!(&self.storage, |mdk| mdk.get_groups())?;
-        let mut rebuilt = crate::reaction::ReactionStore::default();
-        for g in groups {
-            let msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(&g.mls_group_id, None))?;
-            for m in msgs {
-                if let Some(r) = crate::reaction::parse_stored(&m) {
-                    rebuilt.record(&g.mls_group_id, r);
-                }
-            }
-        }
-        self.reactions.install_rebuilt(rebuilt);
-        Ok(())
     }
 
     /// Roll back a locally echoed kind-7 whose publish exhausted auto-retries.
@@ -4392,6 +4502,33 @@ fn key_package_to_event(
     Ok(event)
 }
 
+/// A kind-7 reaction inside a decrypted app message, attributed to the MLS
+/// sender. `None` for every other app event.
+fn reaction_from_payload(
+    message_id: &MessageId,
+    sender: &MemberId,
+    payload: &[u8],
+) -> Option<crate::reaction::ParsedReaction> {
+    let app = MarmotAppEvent::decode(payload).ok()?;
+    if app.kind != u64::from(crate::reaction::REACTION_RUMOR_KIND) {
+        return None;
+    }
+    let tags: Tags = app
+        .tags
+        .iter()
+        .filter_map(|t| Tag::parse(t.clone()).ok())
+        .collect();
+    crate::reaction::parse_app_event(
+        EventId::from_hex(&app.id)
+            .ok()
+            .or_else(|| message_id_to_event(message_id).ok())?,
+        PublicKey::from_slice(sender.as_slice()).ok()?,
+        app.kind,
+        &app.content,
+        &tags,
+    )
+}
+
 /// A timezone share inside a decrypted app message, attributed to the MLS
 /// sender. `None` for every other app event (chat, White Noise's own kinds).
 fn timezone_share_from_payload(
@@ -4500,6 +4637,40 @@ fn transport_group_id(msg: &TransportMessage) -> Option<GroupId> {
             Some(GroupId::new(transport_group_id.clone()))
         }
         TransportEnvelope::Welcome { .. } => None,
+    }
+}
+
+/// The canonical NIP-01 id of an encoded Marmot app event: the message id
+/// every client (Sonar, White Noise) records for it.
+fn app_event_id_of(payload: &[u8]) -> Result<EventId> {
+    let app = MarmotAppEvent::decode(payload).map_err(|e| Error::Mdk(e.to_string()))?;
+    EventId::from_hex(&app.id).map_err(|e| Error::Mdk(format!("app event id: {e}")))
+}
+
+/// Cap on [`OwnSendIds`]: relay echoes of our sends arrive within seconds.
+const OWN_SEND_IDS_CAP: usize = 1024;
+
+/// Bounded wrapper id → (group, message id) map for our own sends.
+#[derive(Default)]
+struct OwnSendIds {
+    map: HashMap<EventId, (GroupId, EventId)>,
+    order: std::collections::VecDeque<EventId>,
+}
+
+impl OwnSendIds {
+    fn insert(&mut self, wrapper_id: EventId, group_id: GroupId, message_id: EventId) {
+        if self.map.insert(wrapper_id, (group_id, message_id)).is_none() {
+            self.order.push_back(wrapper_id);
+        }
+        while self.order.len() > OWN_SEND_IDS_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, wrapper_id: &EventId) -> Option<(GroupId, EventId)> {
+        self.map.get(wrapper_id).cloned()
     }
 }
 
@@ -5017,6 +5188,7 @@ mod historical_fold_tests {
             sticker_ref: None,
             classification: MessageClassification::of(body),
             reply: None,
+            reactions: Vec::new(),
         }
     }
 
@@ -6024,5 +6196,74 @@ mod key_package_event_tests {
             .required_capabilities
             .app_components
             .contains(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID));
+    }
+}
+
+#[cfg(test)]
+mod message_identity_tests {
+    use super::*;
+
+    async fn joined_pair() -> (MarmotEngine, MarmotEngine, GroupId) {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let kp = bob.key_package_event(relays.clone()).await.unwrap();
+        let creation = alice.create_group("dm", vec![kp], relays).await.unwrap();
+        let gid = creation.group.id.clone();
+        alice.merge_pending_commit(&gid).await.unwrap();
+        for (_, welcome) in &creation.welcomes {
+            bob.process_incoming(welcome).await.unwrap();
+        }
+        (alice, bob, gid)
+    }
+
+    /// MDK v2's `MessageReceived.message_id` is an MLS-level id the sender
+    /// never sees, and the kind-445 wrapper id is the sender's alone. Keying
+    /// rows by either made a reaction or reply from one device target an id
+    /// the author did not have (#613 port). Both sides must use the inner
+    /// app-event id — the id White Noise keys messages by, as MDK 0.8 (Sonar
+    /// v1) keyed rumor ids, so migrated v1 rows and v2 rows agree.
+    #[tokio::test]
+    async fn a_message_has_one_id_for_sender_and_receiver() {
+        let (alice, bob, gid) = joined_pair().await;
+        let (event, incoming) = alice
+            .create_and_process_text_message(&gid, "same id everywhere")
+            .await
+            .unwrap();
+        let Incoming::Message(sent) = incoming else {
+            panic!("sender row");
+        };
+        let Incoming::Message(received) = bob.process_incoming(&event).await.unwrap() else {
+            panic!("receiver row");
+        };
+        assert_eq!(sent.id, received.id, "sender and receiver must agree");
+        assert_ne!(sent.id, event.id, "not the sender-only kind-445 wrapper id");
+
+        let rumor = alice.kind9_rumor("same id everywhere", Vec::new(), None).unwrap();
+        let mut expected = rumor.clone();
+        expected.created_at = Timestamp::from_secs(sent.created_at.as_secs());
+        expected.id = None;
+        expected.ensure_id();
+        assert_eq!(
+            Some(sent.id),
+            expected.id,
+            "the id is the inner app event's NIP-01 id"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_own_echo_resolves_to_its_row() {
+        let (alice, _bob, gid) = joined_pair().await;
+        let (event, incoming) = alice
+            .create_and_process_text_message(&gid, "echo")
+            .await
+            .unwrap();
+        let Incoming::Message(sent) = incoming else {
+            panic!("sender row");
+        };
+        match alice.process_incoming(&event).await.unwrap() {
+            Incoming::Message(echo) => assert_eq!(echo.id, sent.id),
+            other => panic!("own echo must resolve to its row, got {other:?}"),
+        }
     }
 }

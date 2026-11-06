@@ -77,7 +77,15 @@ pub(crate) struct Mdk08Migration {
     /// True when at least one group has more kind-9 rows than the first-paint
     /// window. The rest must be copied from `*.mdk08.bak`.
     pub truncated: bool,
+    /// Kind-7 reactions from the v1 store, newest [`MIGRATED_REACTIONS_CAP`].
+    /// They move into the sealed reaction index under the v1 group id, so a
+    /// migrated message keeps its chips once it pages inside the v2 chat.
+    pub reactions: Vec<(GroupId, crate::reaction::ParsedReaction)>,
 }
+
+/// Newest v1 kind-7 rows moved into the reaction index at first open. One
+/// bounded read, no payload blobs beyond `content`/`tags`/`event`.
+pub(crate) const MIGRATED_REACTIONS_CAP: usize = 5_000;
 
 /// Enough to reopen the quarantined 0.8 file and copy the remaining rows.
 #[derive(Debug, Clone)]
@@ -193,6 +201,17 @@ pub(crate) fn write_sidecars(
     )?;
     write_bytes(&sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX), &sealed)?;
 
+    if !extracted.reactions.is_empty() {
+        // Sealed with the same store key as the transcript, like every v2
+        // reaction. Written before the v1 file is quarantined, so a failure
+        // here leaves the v1 store in place for the next open to retry.
+        let (index, _) = crate::reaction::ReactionIndex::open(db_path, key);
+        for (group_id, reaction) in &extracted.reactions {
+            index.record(group_id, reaction.clone());
+        }
+        index.persist_now();
+    }
+
     let names: HashMap<String, String> = extracted
         .group_names
         .iter()
@@ -244,6 +263,7 @@ pub(crate) fn write_sidecars(
         "first_paint_per_group": FIRST_PAINT_MESSAGES_PER_GROUP,
         "groups": extracted.messages.len(),
         "messages": extracted.messages.values().map(|m| m.len()).sum::<usize>(),
+        "reactions": extracted.reactions.len(),
         "wire": "0xf2ee-plaintext-only",
         "metadata_backfill": METADATA_BACKFILL_VERSION,
     });
@@ -829,7 +849,73 @@ fn extract_from_connection(
     let mut extracted = Mdk08Migration::default();
     extract_metadata(conn, &mut extracted)?;
     extract_chat_rows(conn, local_pk, per_group_limit, &mut extracted)?;
+    extract_reactions(conn, &mut extracted)?;
     Ok(extracted)
+}
+
+/// Copy the newest v1 kind-7 reactions. MDK 0.8 stored them decrypted in
+/// `messages` beside the chat rows; a deleted or failed row is skipped.
+fn extract_reactions(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
+    if !table_exists(conn, "messages")? {
+        return Ok(());
+    }
+    let cols = message_select_columns(conn)?;
+    let sql = format!(
+        "SELECT m.mls_group_id, m.id, m.pubkey, m.content, {state}, {tags}, {event}
+         FROM messages m WHERE m.kind = 7
+         ORDER BY m.created_at DESC LIMIT {cap}",
+        state = cols.state,
+        tags = cols.tags,
+        event = cols.event,
+        cap = MIGRATED_REACTIONS_CAP,
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| Error::Storage(format!("mdk08 reactions query: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|e| Error::Storage(format!("mdk08 reactions query: {e}")))?;
+    for row in rows {
+        let (group_id, id, pubkey, content, state, tags_raw, event_raw) =
+            row.map_err(|e| Error::Storage(format!("mdk08 reactions row: {e}")))?;
+        if group_id.is_empty() {
+            continue;
+        }
+        if state.as_deref().is_some_and(|state| {
+            is_invalid_message_state(state) || state.eq_ignore_ascii_case("deleted")
+        }) {
+            continue;
+        }
+        let (Ok(id), Ok(sender)) = (EventId::from_slice(&id), PublicKey::from_slice(&pubkey))
+        else {
+            continue;
+        };
+        let tags: Tags = merge_stored_tags(tags_raw.as_deref(), event_raw.as_deref())
+            .into_iter()
+            .collect();
+        if let Some(reaction) = crate::reaction::parse_app_event(
+            id,
+            sender,
+            u64::from(crate::reaction::REACTION_RUMOR_KIND),
+            &content,
+            &tags,
+        ) {
+            extracted
+                .reactions
+                .push((GroupId::new(group_id), reaction));
+        }
+    }
+    Ok(())
 }
 
 fn extract_metadata(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
@@ -1483,6 +1569,7 @@ fn chat_from_mdk08_row(
         media,
         sticker_ref,
         reply,
+        reactions: Vec::new(),
     })
 }
 
@@ -1765,6 +1852,56 @@ mod tests {
             extracted.group_names.values().next().map(String::as_str),
             Some("alice & bob")
         );
+    }
+
+    /// v1 reactions move with their messages: a kind-7 row on a migrated
+    /// message lands in the sealed reaction index under the v1 group id, so
+    /// the chip shows once that row pages inside the v2 chat. A deleted v1
+    /// reaction stays behind.
+    #[test]
+    fn v1_reactions_move_into_the_reaction_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        let parent = write_mdk08_fixture(&path, &local, peer, "react to me");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(KEY)))
+                .unwrap();
+            let tags = serde_json::json!([["e", parent.to_hex()], ["p", peer.to_hex()]]).to_string();
+            for (id, content, state) in [(0x71u8, "👍", "processed"), (0x72u8, "🔥", "deleted")] {
+                conn.execute(
+                    "INSERT INTO messages
+                        (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                         wrapper_event_id, state, epoch)
+                     VALUES (?1, ?2, ?3, 7, 1_700_000_002, ?4, ?5, '{}', ?2, ?6, 1)",
+                    rusqlite::params![
+                        vec![0x11u8; 16],
+                        vec![id; 32],
+                        local.public_key().to_bytes().to_vec(),
+                        content,
+                        tags,
+                        state,
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let extracted = detect_and_extract(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        assert_eq!(extracted.reactions.len(), 1, "the deleted reaction stays behind");
+        assert_eq!(extracted.reactions[0].1.target_id, parent);
+        assert_eq!(extracted.reactions[0].1.emoji, "👍");
+
+        let db = dir.path().join("live.sqlite");
+        write_sidecars(&db, &extracted, &KEY).unwrap();
+        let (index, _) = crate::reaction::ReactionIndex::open(&db, &KEY);
+        let hist = GroupId::new(vec![0x11u8; 16]);
+        let found = index.for_targets(&hist, &HashSet::from([parent]));
+        assert_eq!(found.len(), 1, "sealed beside the migrated transcript");
+        assert_eq!(found[0].sender, local.public_key());
     }
 
     #[test]
