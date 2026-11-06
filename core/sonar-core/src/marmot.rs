@@ -6272,3 +6272,64 @@ mod message_identity_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod transcript_open_bench {
+    use super::*;
+
+    /// MDK v2 keeps no plaintext rows, so Sonar's sealed transcript is the
+    /// local message store and loads whole at open. Measures that open cost
+    /// for a large account. Run with
+    /// `cargo test -p sonar-core --release --lib -- --ignored --nocapture bench_transcript_open`.
+    #[test]
+    #[ignore]
+    fn bench_transcript_open() {
+        for (groups, per_group) in [(50usize, 200usize), (200, 100), (400, 50)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("marmot.sqlite");
+            let me = Identity::generate();
+            let peer = Keys::generate().public_key();
+            let key = [0x42u8; 32];
+            {
+                let engine = MarmotEngine::persistent(me.clone(), &db, key).unwrap();
+                for g in 0..groups {
+                    let gid = GroupId::new((g as u32).to_be_bytes().repeat(4));
+                    for i in 0..per_group {
+                        let seed = (g * per_group + i) as u64;
+                        let mut id = [0u8; 32];
+                        id[..8].copy_from_slice(&seed.to_be_bytes());
+                        engine.push_transcript_message(ChatMessage {
+                            id: EventId::from_byte_array(id),
+                            group_id: gid.clone(),
+                            sender: peer,
+                            content: format!("message {i} with a typical length of chat text"),
+                            created_at: Timestamp::from_secs(1_700_000_000 + seed),
+                            mine: i % 2 == 0,
+                            delivery_state: DeliveryState::Received,
+                            media: Vec::new(),
+                            sticker_ref: None,
+                            classification: MessageClassification::Text,
+                            reply: None,
+                            reactions: Vec::new(),
+                        });
+                    }
+                }
+                engine.persist_transcript();
+            }
+            let started = std::time::Instant::now();
+            let engine = MarmotEngine::persistent(me, &db, key).unwrap();
+            let open = started.elapsed();
+            let started = std::time::Instant::now();
+            let gid = GroupId::new(0u32.to_be_bytes().repeat(4));
+            let page = engine.messages_cursor_page(&gid, None, None, 50).unwrap();
+            let page_time = started.elapsed();
+            println!(
+                "BENCH transcript_open rows={} groups={groups} open_ms={:.1} first_page_ms={:.2} page_len={}",
+                groups * per_group,
+                open.as_secs_f64() * 1e3,
+                page_time.as_secs_f64() * 1e3,
+                page.len()
+            );
+        }
+    }
+}

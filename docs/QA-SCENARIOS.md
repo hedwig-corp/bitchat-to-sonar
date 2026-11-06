@@ -562,7 +562,7 @@ nothing by design.
   every iOS notification-extension wake — rebuilt the index, and a failed
   rebuild refused to open the account's chats).
 
-## MDK 0.8 → 0.10 upgrade (#613)
+## MDK v1 (0.8) → v2 (v0.14.0) upgrade (#613, MDK v0.14 bump)
 
 Build history on an MDK 0.8 install, then replace it **in place** with the
 #613 build (MDK v0.10.4; it was v0.9.14 until the White Noise interop bump —
@@ -647,6 +647,24 @@ chat above 80 messages (the first-paint extract window) and one image.
 - **Expect:** `core/build-ios.sh` leaves `git status` clean.
 - **Origin:** i1 (#613) — edited `///` doc comments moved two UniFFI checksums;
   a build from the committed binding would fatalError at launch.
+
+### QA-208 — A real v1 store migrates, and its history moves into the v2 chat
+- **Platforms:** core, both apps' path (headless, `sonar-cli` on a local relay)
+- **Steps:** `V1_CLI=<main's MDK 0.8 sonar-cli> scripts/qa/mdk-upgrade-e2e.sh`.
+  Two peers trade texts and a 👍 on v1; the v2 CLI then opens the same homes
+  (the real MDK 0.8 SQLCipher stores); one peer sends on v2, the other
+  listens and replies.
+- **Expect:** `RESULT … fail=0`: each v1 store is quarantined as
+  `*.mdk08.bak`; its decrypted rows and the reaction land in sealed sidecars
+  (no plaintext on disk); the first v2 send makes ONE v2 DM both peers join;
+  each side's v1 history, with the 👍, pages inside that v2 chat; replies flow
+  both ways; neither side lists a second chat.
+- **Guard:** `mdk08_migrate::v1_reactions_move_into_the_reaction_index`,
+  `marmot::message_identity_tests::a_message_has_one_id_for_sender_and_receiver`,
+  `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
+- **Origin:** MDK v0.14 bump — the hand-written v1 fixtures only model the
+  0.8 schema; this runs the real one. One-shot CLI verbs can exit before a
+  live welcome lands, so the receiving side uses `listen`.
 
 ## White Noise interop (#613)
 

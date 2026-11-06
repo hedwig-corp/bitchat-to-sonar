@@ -541,15 +541,6 @@ pub(crate) struct ReactionIndex {
 }
 
 impl ReactionIndex {
-    pub(crate) fn in_memory() -> Self {
-        Self {
-            store: Mutex::new(ReactionStore::default()),
-            suppressed: Mutex::new(HashSet::new()),
-            persist: None,
-            rebuild_pending: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
     /// Load the sealed sidecar beside `db_path`. The bool is true when it was
     /// missing, dirty or unreadable: the caller re-persists the loaded store so
     /// the marker clears ([`Self::settle_after_open`]).
@@ -579,6 +570,7 @@ impl ReactionIndex {
     }
 
     /// Install a store rebuilt from SQLCipher and persist it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn install_rebuilt(&self, rebuilt: ReactionStore) {
         {
             let suppressed = self.suppressed.lock().unwrap();
@@ -593,19 +585,10 @@ impl ReactionIndex {
         self.persist();
     }
 
-    /// The open-time rebuild could not read SQLCipher: serve what we have and
-    /// leave the dirty marker for the next open to retry.
-    pub(crate) fn mark_rebuild_failed(&self) {
-        self.rebuild_pending
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(p) = &self.persist {
-            mark_reaction_store_dirty(&p.db_path);
-        }
-    }
-
     /// Set the dirty marker before an MDK write that may commit a kind-7. The
     /// guard restores the previous marker state on every exit path unless
-    /// [`ReactionWriteGuard::commit_changed`] failed to persist.
+    /// the write is told to keep it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn begin_write(&self) -> ReactionWriteGuard<'_> {
         let restore_clean = match &self.persist {
             Some(p) => {
@@ -629,21 +612,6 @@ impl ReactionIndex {
             return false;
         }
         self.store.lock().unwrap().record(group_id, reaction)
-    }
-
-    /// Record rows found by a read of already-committed MDK rows, persisting
-    /// once if any was new.
-    pub(crate) fn record_all<I>(&self, group_id: &crate::GroupId, reactions: I)
-    where
-        I: IntoIterator<Item = ParsedReaction>,
-    {
-        let mut inserted = false;
-        for r in reactions {
-            inserted |= self.record(group_id, r);
-        }
-        if inserted {
-            self.persist();
-        }
     }
 
     pub(crate) fn is_suppressed(&self, id: &EventId) -> bool {
@@ -730,14 +698,6 @@ pub(crate) struct ReactionWriteGuard<'a> {
 // index any more; the guard is kept for its tests and a later MDK store.
 #[cfg_attr(not(test), allow(dead_code))]
 impl ReactionWriteGuard<'_> {
-    /// The write changed the in-memory store: replace the sidecar. When that
-    /// fails the marker stays, so the next open rebuilds from SQLCipher.
-    pub(crate) fn commit_changed(mut self) {
-        if !self.index.persist() {
-            self.keep_dirty = true;
-        }
-    }
-
     /// MDK may hold a kind-7 the index never saw: leave the marker set so the
     /// next open rebuilds from SQLCipher.
     pub(crate) fn keep_dirty(mut self) {

@@ -124,6 +124,29 @@ re-measure and report:
 >    (ceiling N, `ok`, `converged`, welcome bytes). Ignore `build`/`fanout`
 >    timings (machine-bound). Note the current MDK rev from `core/Cargo.toml`.
 
+## Findings (2026-11-06, MDK v0.14.0 `3fb4b475`)
+
+Measured with the same command (`--ramp 2,5,10,25,50,100 --batch 25 --mode
+incremental --no-nip11 --chaos`) on the bump from v0.10.4, the rev White Noise
+iOS ships (MarmotKit 0.14.0). **No structural change**: every size is
+byte-identical to the v0.10.4 table below, so the welcome and commit wire did
+not move.
+
+| N   | welcome (wrapped) | Δ vs v0.10.4 | evolution | Δ vs v0.10.4 | result |
+| --- | ----------------- | ------------ | --------- | ------------ | ------ |
+| 2   | 5 969 B           | 0            | —         |              | ok     |
+| 5   | 11 429 B          | 0            | —         |              | ok     |
+| 10  | 16 893 B          | 0            | —         |              | ok     |
+| 25  | 38 737 B          | 0            | —         |              | ok     |
+| 50  | 66 045 B          | 0            | 18 800 B  | 0            | ok     |
+| 100 | 66 045 B          | 0            | 19 412 B  | 0            | welcome too long |
+
+- **Ceiling stays at 50**, failing the same way at 100:
+  `add_members(at 50): wrap failed: nip44 encryption error: message too long`.
+- **Chaos**: unchanged, `could not stage concurrent commits`,
+  `converged=false` at every N (Finding 2 below).
+- Application message size is 956–960 B, as before.
+
 ## Findings (2026-09-26, MDK v0.10.4 `fcc85edd`)
 
 Measured with `--batch 25 --mode incremental --no-nip11 --chaos`, the same
