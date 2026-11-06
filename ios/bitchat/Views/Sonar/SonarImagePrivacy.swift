@@ -29,11 +29,12 @@ enum SNImageSendDecision: Equatable, Sendable {
 /// copy.
 ///
 /// The core recognizes images by their bytes, so a photo sent as a file is
-/// cleaned too and every other file passes through untouched. JPEG, PNG, GIF
-/// and WebP are cleaned in place: pixels and animation stay as they were. What
-/// the core cannot rewrite (HEIC, AVIF, TIFF) or parse is re-encoded to an
-/// upright JPEG; if ImageIO cannot decode it either, it is refused rather than
-/// sent as-is. CPU-bound: call it off the main actor.
+/// cleaned too and every other file passes through untouched. JPEG, PNG, GIF,
+/// WebP, HEIC and AVIF are cleaned in place: pixels, animation and format stay
+/// as they were, so an iPhone photo arrives as a HEIC. What the core cannot
+/// rewrite (TIFF, HEIF sequences) or parse is re-encoded to an upright JPEG; if
+/// ImageIO cannot decode it either, it is refused rather than sent as-is.
+/// CPU-bound: call it off the main actor.
 func snImageBytesForSend(
     _ data: Data,
     filename: String,

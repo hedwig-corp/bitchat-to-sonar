@@ -16,10 +16,11 @@ internal sealed class ImageSendDecision {
  * local echo, the mesh retry queue and the outbox all hold the clean copy.
  *
  * The core recognizes images by their bytes, so a photo sent as `notes.bin` is
- * cleaned too and every other file passes through untouched. JPEG, PNG, GIF and
- * WebP are cleaned in place: pixels and animation stay as they were. What the
- * core cannot rewrite (HEIC, AVIF, TIFF) or parse is re-encoded to an upright
- * JPEG; if it cannot be decoded either, it is refused rather than sent as-is.
+ * cleaned too and every other file passes through untouched. JPEG, PNG, GIF,
+ * WebP, HEIC and AVIF are cleaned in place: pixels, animation and format stay
+ * as they were, so an iPhone photo arrives as a HEIC. What the core cannot
+ * rewrite (TIFF, HEIF sequences) or parse is re-encoded to an upright JPEG; if
+ * it cannot be decoded either, it is refused rather than sent as-is.
  */
 internal fun imageBytesForSend(
     raw: ByteArray,
