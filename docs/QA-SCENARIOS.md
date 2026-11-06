@@ -329,25 +329,35 @@ shape if the codec is at fault, and extend the scenario here.
 ### QA-190 — Every image send strips location and device metadata
 - **Platforms:** both, incl. macOS and desktop (manual on device; guards below)
 - **Steps:** with the fixtures in `core/sonar-media-privacy/tests/fixtures/`
-  (`located.{jpg,png,gif,webp,heic,tiff}`, every field marked `LEAK`; GPS in
-  the JPEG/PNG/WebP/HEIC), send each one four ways: photo picker, *Send file*,
-  drag-drop onto the chat (Mac/desktop), and the share sheet / share intent.
-  Do it once over White Noise and once over Bluetooth to a mesh peer. Fetch
-  each with `sonar-cli fetch` (or save it on the receiving phone) and run
-  `exiftool` or `grep -c LEAK` on it.
+  (`located.{jpg,png,gif,webp,heic,avif,tiff}`, every field marked `LEAK`; GPS
+  in the JPEG/PNG/WebP/HEIC/AVIF), plus a real iPhone HEIC with location on,
+  send each one four ways: photo picker, *Send file*, drag-drop onto the chat
+  (Mac/desktop), and the share sheet / share intent. Do it once over White
+  Noise and once over Bluetooth to a mesh peer. Fetch each with
+  `sonar-cli fetch` (or save it on the receiving phone) and run `exiftool` or
+  `grep -c LEAK` on it.
 - **Expect:** no GPS, Make/Model, serial, comment, XMP or `LEAK` text in any
-  received file. JPEG/PNG/GIF/WebP arrive in their own format with the same
-  pixels, still animated, still upright. HEIC/TIFF arrive as an upright `.jpg`.
-  A file that looks like an image but cannot be decoded (a HEIC on desktop) is
-  refused with a toast, never sent as-is. Non-image files arrive byte for byte.
+  received file. JPEG/PNG/GIF/WebP/HEIC/AVIF arrive in their own format with
+  the same pixels, still animated, still upright. A HEIC or AVIF also keeps its
+  name and exact size: its Exif item is left holding only the Orientation, its
+  XMP is zeros, and it opens in Photos, Chrome and on Android. The photo picker
+  is the exception: it sends every still as a JPEG it compresses itself. TIFF,
+  and a HEIF image sequence, arrive as an upright `.jpg`. A file that looks
+  like an image but cannot be cleaned or decoded (on desktop, a HEIF sequence)
+  is refused with a toast, never sent as-is. Non-image files arrive byte for
+  byte.
 - **Guard:** crate `sonar-media-privacy` tests (`nothing_marked_survives`,
-  `every_truncation_is_safe`, pixel and frame equality); iOS
-  `ImageMetadataStripTests` (incl. the `snReadAttachments` call site); Compose
-  `ImagePrivacyTest`, `ImagePrivacyFixtureTest`
+  `heif_and_avif_are_zeroed_in_place`, `every_truncation_is_safe`, pixel and
+  frame equality); iOS `ImageMetadataStripTests` (incl. the `snReadAttachments`
+  call site, and `aHeicStaysAHeicButLosesGPSAndDevice`, which decodes the
+  pixels back); Compose `ImagePrivacyTest`, `ImagePrivacyFixtureTest`
+  (`aHeicIsSentAsAHeic`)
 - **Origin:** brainstorm `docs/brainstorms/2026-11-02-strip-image-metadata-every-send-path.md`.
   Only the picker re-encode stripped metadata before this. Send file, drag-drop,
   share and macOS picks went out byte for byte over BLE, and over White Noise
   MDK only stripped JPEG/PNG and fell back to the original bytes on failure.
+  HEIC and AVIF were then re-encoded to JPEG (losing quality, HDR and depth,
+  and refused on desktop) until the core cleaned them in place.
 
 ## Share sheet (#559)
 
