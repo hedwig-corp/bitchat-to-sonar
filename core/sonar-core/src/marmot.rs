@@ -701,12 +701,15 @@ impl AccountIdentityProofSigner for NostrProofSigner {
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match session key".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
-        request.signature_from_signed_event(event)
+        // The proof is a fork-nostr event (MDK v0.11+); sign it as Sonar's
+        // nostr and hand MDK back the same signed bytes.
+        let unsigned = request.proof_event()?;
+        let unsigned = crate::mdk_nostr::unsigned_from_mdk(&unsigned).map_err(|e| e.to_string())?;
+        let signed = unsigned
+            .sign_with_keys(&self.keys)
+            .map_err(|err| err.to_string())?;
+        let signed = crate::mdk_nostr::event_to_mdk(&signed).map_err(|e| e.to_string())?;
+        request.signature_from_signed_event(signed)
     }
 }
 
@@ -720,7 +723,9 @@ struct SonarWelcomePeeler {
 
 impl SonarWelcomePeeler {
     fn new(keys: Keys) -> Self {
-        let inner = NostrMlsPeeler::new().with_welcome_signer(keys.clone());
+        let welcome_signer = crate::mdk_nostr::keys_to_mdk(&keys)
+            .expect("a valid secret key converts to the MDK nostr fork");
+        let inner = NostrMlsPeeler::new().with_welcome_signer(welcome_signer);
         Self { inner, keys }
     }
 
@@ -4620,15 +4625,15 @@ fn wrapped_welcomes(welcomes: &[TransportMessage]) -> Result<Vec<(PublicKey, Eve
 }
 
 fn nostr_event_to_transport(event: &Event) -> Result<TransportMessage> {
-    NostrTransportEvent::from_nostr_event(event)
-        .and_then(|e| e.to_transport_message())
+    crate::mdk_nostr::transport_event(event)
+        .to_transport_message()
         .map_err(|e| Error::Mdk(e.to_string()))
 }
 
 fn transport_to_event(msg: &TransportMessage) -> Result<Event> {
-    NostrTransportEvent::from_transport_message(msg)
-        .and_then(|e| e.to_verified_nostr_event())
-        .map_err(|e| Error::Mdk(e.to_string()))
+    let dto = NostrTransportEvent::from_transport_message(msg)
+        .map_err(|e| Error::Mdk(e.to_string()))?;
+    crate::mdk_nostr::event_from_transport(&dto)
 }
 
 fn transport_group_id(msg: &TransportMessage) -> Option<GroupId> {

@@ -52,6 +52,7 @@ sonar-stickers = { path = "../sonar-stickers" }
 bitchat-protocol = { path = "../bitchat-protocol" }
 serde_json.workspace = true
 cgka-traits.workspace = true
+nostr-mdk.workspace = true
 cgka-engine.workspace = true
 cgka-session.workspace = true
 # Persistent storage: MDK 0.9 `storage-sqlite` wraps rusqlite 0.40 with

@@ -18,8 +18,8 @@
 //!   and queues it for the host, so it can never become a transcript row,
 //!   unread count, notification, or chat preview.
 //! - **Not a Marmot protocol event**: kinds MDK assigns meaning to are reserved
-//!   (MDK v0.10.4 `RESERVED_APP_EVENT_KINDS`: 5, 7, 9, 447–449, 1009,
-//!   1200–1202, 1210, 1984, 1985, 4891). The first version used 449, which
+//!   (MDK v0.14.0 `RESERVED_APP_EVENT_KINDS`: 5, 7, 9, 447–449, 1009, 1018,
+//!   1068, 1200–1202, 1210, 1984, 1985, 4891). The first version used 449, which
 //!   MIP-05 now defines as a push-token removal, so White Noise members parsed
 //!   every share as one. 30078 is a custom kind MDK passes through, and White
 //!   Noise does not render unknown kinds. The `d` tag keeps it apart from
@@ -202,11 +202,12 @@ fn is_valid_zone_segment(seg: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// MDK v0.10.4 `RESERVED_APP_EVENT_KINDS` (marmot-app
+    /// MDK v0.14.0 `RESERVED_APP_EVENT_KINDS` (marmot-app
     /// `messages/intents.rs`): kinds other clients act on under MDK's
-    /// meaning. 449 is MIP-05's push-token removal.
-    const MARMOT_RESERVED_APP_EVENT_KINDS: [u64; 14] = [
-        5, 7, 9, 447, 448, 449, 1009, 1200, 1201, 1202, 1210, 1984, 1985, 4891,
+    /// meaning. 449 is MIP-05's push-token removal; v0.14 added polls
+    /// (1018 response, 1068 poll). Re-check on every MDK bump.
+    const MARMOT_RESERVED_APP_EVENT_KINDS: [u64; 16] = [
+        5, 7, 9, 447, 448, 449, 1009, 1018, 1068, 1200, 1201, 1202, 1210, 1984, 1985, 4891,
     ];
 
     #[test]

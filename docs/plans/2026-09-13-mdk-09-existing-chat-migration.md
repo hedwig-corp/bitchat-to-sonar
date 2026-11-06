@@ -13,6 +13,36 @@ Parent plan: [#327](https://github.com/hedwig-corp/bitchat-to-sonar/issues/327) 
 > including `0057_openmls_values_msgpack`, which re-encodes the stored MLS
 > state). "0.9.14" below is the pin this plan was written against.
 
+> **Update 2026-11-06 (MDK v0.14.0, "v1 → v2"):** #613 was closed unmerged;
+> its port was merged onto current `main` and bumped to MDK **v0.14.0**
+> (`3fb4b475`), the exact rev White Noise iOS pins (`MarmotKit 0.14.0`). In
+> this doc "0.8" is Sonar's shipped **v1** chat store and "0.9" the **v2**
+> runtime. What changed on top of the plan below:
+>
+> - **nostr seam.** MDK v0.11+ builds on a `rust-nostr` fork (0.45-dev).
+>   sonar-core stays on crates.io `nostr` 0.44 (nostr-sdk, nostr-blossom, the
+>   relay builder) and bridges at the only two places MDK takes nostr types:
+>   the transport DTO and the account-identity proof
+>   (`core/sonar-core/src/mdk_nostr.rs`).
+> - **One message id.** The port keyed sent rows by the kind-445 wrapper id
+>   and received rows by MDK's MLS-level `message_id`, so a reaction or reply
+>   from one device named an id its author never had. Both sides now key by
+>   the inner Marmot app-event id — what White Noise keys by, and the rumor id
+>   the v1 store used — so moved v1 rows and new v2 rows are one id space
+>   (`marmot::message_identity_tests`).
+> - **Reactions move too.** MDK v2 stores no plaintext app events, so the
+>   sealed reaction index is the only copy of the chips: v1 kind-7 rows are
+>   decrypted-and-moved into it with their messages
+>   (`mdk08_migrate::v1_reactions_move_into_the_reaction_index`), account
+>   backups carry it, and a dirty marker no longer discards it.
+> - **What "move into the v2 chat" means at runtime.** First open copies the
+>   v1 plaintext (newest 80 rows per chat at once, the rest in bounded idle
+>   pages) and the v1 reactions onto sealed sidecars, quarantines the v1 file
+>   as `*.mdk08.bak`, and lists each v1 chat. The first send in a v1 chat
+>   (or the peer's v2 welcome) creates/joins the v2 group and records a
+>   durable hist→live fold; from then on the v1 rows page inside the v2
+>   conversation and the v1 row leaves the chat list.
+
 This is the missing Stage 1 storage step. The protocol port is already on
 `cursor/mdk-v0.9.14`. Without this path, shipping 0.9.14 as a silent replace
 would lock existing users out of their White Noise / Marmot transcripts.

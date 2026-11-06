@@ -41,21 +41,30 @@ lto = "thin"
 codegen-units = 1
 
 [workspace.dependencies]
-# MDK v0.10.4 (commit fcc85edd, tag v0.10.4, 2026-09-20): the release White
-# Noise iOS ships (MarmotKit v0.10.4). v0.9.21+ rejects invitee KeyPackages
-# that list default MLS capabilities, which every 0.9.14 package did, so an
-# older pin cannot be invited by current White Noise. Upstream deleted the
-# 0.8 crates (`mdk-core` / `mdk-sqlite-storage` / `mdk-memory-storage` /
-# `mdk-storage-traits`) and split the workspace into `cgka-engine` /
-# `cgka-session` / `storage-sqlite` / `transport-nostr-peeler`. Wire format is
-# Marmot `0xf2f1` — NOT byte-compatible with the 0.8 `e8cd584` / `0xf2ee` pin.
-# crates.io still only publishes 0.8.0.
-cgka-traits = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
-cgka-engine = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
-cgka-session = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
-storage-sqlite = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
-transport-nostr-peeler = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
+# MDK v0.14.0 (commit 3fb4b475, tag v0.14.0, 2026-10-23): the latest stable
+# MDK release. Upstream deleted the 0.8 crates (`mdk-core` /
+# `mdk-sqlite-storage` / `mdk-memory-storage` / `mdk-storage-traits`) and split
+# the workspace into `cgka-engine` / `cgka-session` / `storage-sqlite` /
+# `transport-nostr-peeler`. Wire format is Marmot `0xf2f1` — NOT
+# byte-compatible with the 0.8 `e8cd584` / `0xf2ee` pin Sonar shipped before
+# ("v1"). Existing v1 chats are decrypted and moved into their v2 successor
+# by `sonar-core/src/mdk08_migrate.rs`; see
+# `docs/plans/2026-09-13-mdk-09-existing-chat-migration.md`.
+# Bump checklist (CLAUDE.md): run `sonar-sim group-scale` and diff
+# docs/GROUP-SCALE-SIM.md, and re-check MDK's RESERVED_APP_EVENT_KINDS
+# (`timezone.rs` tests) against White Noise.
+cgka-traits = { git = "https://github.com/marmot-protocol/mdk", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
+cgka-engine = { git = "https://github.com/marmot-protocol/mdk", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
+cgka-session = { git = "https://github.com/marmot-protocol/mdk", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
+storage-sqlite = { git = "https://github.com/marmot-protocol/mdk", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
+transport-nostr-peeler = { git = "https://github.com/marmot-protocol/mdk", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
 nostr = { version = "0.44", features = ["std", "nip44", "nip59"] }
+# Since MDK v0.11 the protocol crates build on a rust-nostr fork (0.45-dev).
+# Only `transport-nostr-peeler` and the account-identity proof take nostr types,
+# so sonar-core keeps crates.io 0.44 (with nostr-sdk, nostr-blossom and the
+# relay builder) and bridges at that seam (`sonar-core/src/mdk_nostr.rs`).
+# Keep this rev equal to MDK's own `nostr` pin.
+nostr-mdk = { package = "nostr", git = "https://github.com/erskingardner/rust-nostr", rev = "48801bf6f2f1cd55bb1729e94159946c8832a786", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
 nostr-sdk = "0.44"
 nostr-relay-builder = "0.44"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time"] }
