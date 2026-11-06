@@ -5414,9 +5414,10 @@ final class SonarAppStore: ObservableObject {
         static let marmotNsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
     }
 
-    #if os(iOS)
+    /// All platforms: the recovered-chat fold cleanup mirrors
+    /// `historicalFolds` into this suite on Mac too (an iOS-only constant
+    /// broke the macOS build once those paths landed).
     private static let appGroupId = "group.sh.hedwig.sonar"
-    #endif
 
     private static let maxStoredCallsPerConversation = 100
     private static let capabilitySettleWindow: TimeInterval = 1.5
