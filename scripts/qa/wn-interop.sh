@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wn-interop.sh — Sonar ↔ White Noise interop QA, headless (QA-198…QA-207).
+# wn-interop.sh — Sonar ↔ White Noise interop QA, headless (QA-198…QA-207, QA-209).
 #
 # White Noise iOS runs MDK's own runtime (marmot-app). The MDK checkout Sonar
 # pins ships the White Noise CLI (`crates/cli`: `wn` + daemon `wnd`) on that
@@ -311,10 +311,14 @@ for l in sys.stdin:
     (sonar_listen "n$i" 10 >/dev/null; sonar_accept_named "n$i" "wn-$n-$run"; sonar_listen "n$i" 8 >/dev/null) &
   done
   wait
-  sonar n01 group-send --group "$gw" --text "n01 in wn-$n $run" >/dev/null
+  # `seq -w` pads to the widest index, so the first home is n1 below N=12
+  # and n01 from there on; never hard-code it.
+  local first
+  first="n$(seq -w 1 $((n - 2)) | head -1)"
+  sonar "$first" group-send --group "$gw" --text "$first in wn-$n $run" >/dev/null
   local joined=0
   for i in $(seq -w 1 $((n - 2))); do sonar_has "n$i" "$gw" "hello $n $run" && joined=$((joined + 1)); done
-  if [ "$joined" = "$((n - 2))" ] && eventually 40 wn_has "$gw" "n01 in wn-$n $run"; then
+  if [ "$joined" = "$((n - 2))" ] && eventually 40 wn_has "$gw" "$first in wn-$n $run"; then
     pass QA-205 "$n-member White Noise group: $joined/$((n - 2)) Sonar members joined and replied"
   else
     fail QA-205 "$n-member group: $joined/$((n - 2)) joined"
@@ -336,6 +340,57 @@ for l in sys.stdin:
     pass QA-207 "timezone share reached Sonar and stayed invisible in White Noise"
   else
     fail QA-207 "timezone share: sonar got=$tz_got, White Noise chat before=[$tz_before] after=[$tz_after]"
+  fi
+
+  # QA-209: one message id on both clients, and reactions both ways. White
+  # Noise keys a message by its inner app-event id and its kind-7 `e` tag
+  # names that id; a Sonar row keyed by anything else (the kind-445 wrapper,
+  # MDK's MLS-level message id) makes a reaction or reply name an id the
+  # other side never had.
+  wn --account "$W" sync >/dev/null 2>&1 || true
+  local sid wid tid rx_on_sonar=0 rx_on_wn=0
+  sid=$(sonar a messages --group "$g3" | python3 -c '
+import json,sys
+for l in sys.stdin:
+    m=json.loads(l)
+    if m.get("mine"): print(m["id"]); break')
+  wid=$(wn --account "$W" messages list "$g3" --limit 50 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin); r=d.get("result")
+rows=r if isinstance(r,list) else (r or {}).get("messages",[])
+print(" ".join(m.get("message_id","") for m in rows))')
+  if [ -n "$sid" ] && wn --account "$W" messages react "$g3" "$sid" "🔥" >/dev/null 2>&1; then
+    sonar_listen a 12 >/dev/null
+    sonar a messages --group "$g3" | python3 -c '
+import json,sys
+for l in sys.stdin:
+    m=json.loads(l)
+    if m.get("id")==sys.argv[1] and any(x.get("emoji")=="🔥" for x in (m.get("reactions") or [])): sys.exit(0)
+sys.exit(1)' "$sid" && rx_on_sonar=1
+  fi
+  wn --account "$W" messages send "$g3" "react to wn $run" >/dev/null 2>&1 || true
+  sonar_listen a 12 >/dev/null
+  tid=$(sonar a messages --group "$g3" | python3 -c '
+import json,sys
+for l in sys.stdin:
+    m=json.loads(l)
+    if m.get("content")==sys.argv[1]: print(m["id"])' "react to wn $run")
+  if [ -n "$tid" ] && sonar a react --group "$g3" --target "$tid" --emoji "👍" >/dev/null; then
+    wn_reacted() {
+      wn --account "$W" sync >/dev/null 2>&1 || true
+      wn --account "$W" messages list "$g3" --limit 80 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin); r=d.get("result")
+rows=r if isinstance(r,list) else (r or {}).get("messages",[])
+sys.exit(0 if any(m.get("kind")==7 and m.get("plaintext")=="👍" and
+  any(t[:2]==["e",sys.argv[1]] for t in m.get("tags",[])) for m in rows) else 1)' "$tid"
+    }
+    eventually 40 wn_reacted && rx_on_wn=1
+  fi
+  if [ -n "$sid" ] && [[ " $wid " == *" $sid "* ]] && [ "$rx_on_sonar" = 1 ] && [ "$rx_on_wn" = 1 ]; then
+    pass QA-209 "one message id on Sonar and White Noise; reactions tally both ways"
+  else
+    fail QA-209 "ids/reactions: sonar id in WN=$([[ " $wid " == *" $sid "* ]] && echo yes || echo no) wn→sonar=$rx_on_sonar sonar→wn=$rx_on_wn"
   fi
 
   echo "failures: $FAILS"

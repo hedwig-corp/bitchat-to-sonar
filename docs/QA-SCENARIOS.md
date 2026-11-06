@@ -768,6 +768,20 @@ overlap, NIP-42 inbox relays.
   profile reserves for MIP-05 push-token removal, so White Noise members read
   each share as one. Now kind 30078 with a `sonar/local-time` `d` tag.
 
+### QA-209 — One message id on Sonar and White Noise; reactions both ways
+- **Platforms:** core (both apps), headless (`wn-interop.sh run`)
+- **Steps:** in a White Noise group with a Sonar member: White Noise reacts 🔥
+  to the Sonar member's message; White Noise posts, the Sonar member reacts 👍.
+- **Expect:** the Sonar row id appears in White Noise's own list; the 🔥 tallies
+  on the Sonar row; White Noise's 👍 kind-7 `e` tag names its own id for the
+  target.
+- **Guard:** `wn-interop.sh run` (QA-209); core
+  `marmot::message_identity_tests::a_message_has_one_id_for_sender_and_receiver`
+- **Origin:** MDK v0.14 bump — the #613 port keyed sent rows by the kind-445
+  wrapper id and received rows by MDK's MLS-level `message_id`, so reactions
+  and replies never resolved across devices or with White Noise. Rows are now
+  keyed by the inner app-event id White Noise uses.
+
 ## Notifications and lifecycle
 
 ### QA-020 — Background receive
