@@ -4891,8 +4891,7 @@ final class MarmotChatModel: ObservableObject {
                 try await self.publishText(trimmed, to: groupId, reply: reply)
             } catch {
                 self.discardOptimistic(id: echo.id, from: groupId)
-                onFailure?()
-                self.errorText = Self.describe(error)
+                self.reportSendFailure(error, onFailure: onFailure)
                 return
             }
             // The core conversation-change callback refreshes this one bounded
@@ -5275,8 +5274,7 @@ final class MarmotChatModel: ObservableObject {
                     model.pendingOptimistic[failedStoreId, default: []].append(failed)
                     model.messagesByGroup[failedStoreId, default: []].append(failed)
                 }
-                onFailure?()
-                model.errorText = Self.describe(error)
+                model.reportSendFailure(error, onFailure: onFailure)
             }
         }
     }
@@ -5399,8 +5397,7 @@ final class MarmotChatModel: ObservableObject {
                     model.pendingOptimistic[failedStoreId, default: []].append(failed)
                     model.messagesByGroup[failedStoreId, default: []].append(failed)
                 }
-                onFailure?()
-                model.errorText = Self.describe(error)
+                model.reportSendFailure(error, onFailure: onFailure)
             }
         }
     }
@@ -5467,8 +5464,7 @@ final class MarmotChatModel: ObservableObject {
                     sendGroupId: groupId
                 )
                 self.discardOptimistic(id: echo.id, from: groupId)
-                onFailure?()
-                self.errorText = Self.describe(error)
+                self.reportSendFailure(error, onFailure: onFailure)
                 return
             }
             // The core writes the canonical row locally before publishing.
@@ -6491,6 +6487,16 @@ final class MarmotChatModel: ObservableObject {
     /// completed. (…error 0.)". `ServiceError` deliberately does NOT conform to
     /// `LocalizedError`: that would change the text at every existing `catch`
     /// in the app and put raw Rust strings from `.core` in front of users.
+    /// Record a failed send, then tell the caller. The store's callback reads
+    /// `errorText` to tell "waiting for them to update Sonar" (a peer still on
+    /// MDK 0.8) from any other failure, so the error must be set first: the
+    /// old order handed it nil, and the recovered chat showed no banner while
+    /// the discarded echo vanished (QA-193 on iOS).
+    func reportSendFailure(_ error: Error, onFailure: (() -> Void)?) {
+        errorText = Self.describe(error)
+        onFailure?()
+    }
+
     static func describe(_ error: Error) -> String {
         switch error {
         case MarmotService.ServiceError.notConnected:

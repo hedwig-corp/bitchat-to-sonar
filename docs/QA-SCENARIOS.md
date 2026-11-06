@@ -616,13 +616,17 @@ chat above 80 messages (the first-paint extract window) and one image.
 - **Guard:** `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
 
 ### QA-193 — Peer still on 0.8
-- **Platforms:** Android (UI)
+- **Platforms:** Android (`android-mdk-upgrade.sh`), iOS (`ios-mdk-upgrade.sh`)
 - **Steps:** send in the recovered chat of a peer who has not upgraded.
 - **Expect:** "Waiting for them to update Sonar" banner; no second row; no
   wipe. (The peer's own 0.8 sends never arrive — flag-day by design.)
-- **Guard:** `e2e.rs::recovered_08_resume_with_a_peer_still_on_08_waits_for_their_update`
+- **Guard:** `e2e.rs::recovered_08_resume_with_a_peer_still_on_08_waits_for_their_update`,
+  `SendFailureErrorTextTests.theFailureCallbackSeesTheSendsError` (iOS)
 - **Origin:** A2 (#613) — the peer's 0.8 KeyPackage reached MDK 0.9 and the
-  send failed with an opaque error and "Couldn't send".
+  send failed with an opaque error and "Couldn't send". On iOS (first checked
+  by the MDK v0.14 upgrade walk) the banner never showed: the send's catch
+  called the store's failure callback before setting `errorText`, so the store
+  read nil, and the discarded echo made the message vanish silently.
 
 ### QA-194 — Upgraded peer messages first
 - **Platforms:** iOS (headless), Android
