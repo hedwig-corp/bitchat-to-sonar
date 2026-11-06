@@ -3681,6 +3681,7 @@ impl SonarClient {
     pub async fn ensure_note_to_self(&self) -> Result<GroupId> {
         let _ensure = self.note_to_self_lock.lock().await;
         if let Some(existing) = self.find_note_to_self_group()? {
+            self.fold_historical_note_to_self(&existing);
             return Ok(existing);
         }
         let creation = self
@@ -3699,9 +3700,45 @@ impl SonarClient {
             return Err(err);
         }
         self.ensure_index_for_group(&group_id, SONAR_NOTE_TO_SELF_NAME);
+        self.fold_historical_note_to_self(&group_id);
         self.notify_conversation_changed(&hex::encode(group_id.as_slice()));
         self.schedule_resubscribe_marmot_groups_if_live();
         Ok(group_id)
+    }
+
+    /// Recovered v1 (MDK 0.8) Note to Self chats that are not folded yet: the
+    /// marker description and nobody but us.
+    fn unfolded_historical_notes_to_self(&self) -> Vec<GroupId> {
+        let me = self.identity().public_key();
+        let Ok(historical) = self.engine.historical_groups() else {
+            return Vec::new();
+        };
+        historical
+            .into_iter()
+            .filter(|group| {
+                self.engine.historical_group_description(&group.id).as_deref()
+                    == Some(SONAR_NOTE_TO_SELF_DESCRIPTION)
+                    && group.members.iter().all(|pk| *pk == me)
+                    && !self.is_folded_historical_group(&group.id)
+            })
+            .map(|group| group.id)
+            .collect()
+    }
+
+    /// Fold a recovered v1 Note to Self onto the v2 one, the way any other
+    /// recovered chat folds onto its successor: one row, and the v1 notes
+    /// page inside the v2 chat. Without this an upgraded account listed two
+    /// "Note to Self" rows, and the v1 one could not send (it has no peers
+    /// to resume with).
+    fn fold_historical_note_to_self(&self, live: &GroupId) {
+        for historical in self.unfolded_historical_notes_to_self() {
+            tracing::info!(
+                historical = %hex::encode(historical.as_slice()),
+                live = %hex::encode(live.as_slice()),
+                "folding the recovered v1 Note to Self onto the v2 one"
+            );
+            self.record_resume_fold(&historical, live);
+        }
     }
 
     /// Return the Note to Self group id when a marked solo group already exists.
@@ -8292,6 +8329,13 @@ impl SonarClient {
         // not wait on idle reconcile or a send.
         self.restore_recorded_folds_from_index();
         self.rediscover_unbound_historical_folds();
+        // Cheap when there is nothing to fold: the recovered list is in memory,
+        // and the live Note to Self is only looked up when a v1 one is waiting.
+        if !self.unfolded_historical_notes_to_self().is_empty() {
+            if let Ok(Some(live)) = self.find_note_to_self_group() {
+                self.fold_historical_note_to_self(&live);
+            }
+        }
         self.engine.groups()
     }
 
@@ -8375,6 +8419,12 @@ impl SonarClient {
         if let Some(live) = self.rebound_resume_live(group_id) {
             self.maybe_add_late_resume_members(&live).await;
             return Ok(live);
+        }
+        if self.unfolded_historical_notes_to_self().contains(group_id) {
+            // The v1 Note to Self has no peers to resume with: its successor
+            // is the local v2 Note to Self, which `ensure` folds it onto.
+            drop(_mint);
+            return self.ensure_note_to_self().await;
         }
         let peers = self.engine.historical_resume_peers(group_id);
         let name = self
@@ -12349,6 +12399,90 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, peers.len());
+    }
+
+    /// A v1 store's Note to Self, migrated as a recovered solo chat.
+    async fn client_with_v1_note_to_self() -> (SonarClient, GroupId) {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("in-memory client");
+        let me = client.identity().public_key();
+        let historical = GroupId::new([0x51u8; 16]);
+        client.engine.seed_historical_metadata(
+            historical.clone(),
+            SONAR_NOTE_TO_SELF_NAME,
+            vec![me],
+            1,
+        );
+        client
+            .engine
+            .seed_historical_description(historical.clone(), SONAR_NOTE_TO_SELF_DESCRIPTION);
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(0x51),
+            group_id: historical.clone(),
+            sender: me,
+            content: "a v1 note".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: true,
+            delivery_state: crate::marmot::DeliveryState::Sent,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("a v1 note"),
+            reply: None,
+            reactions: Vec::new(),
+        });
+        assert!(
+            client.engine.is_historical_group(&historical).unwrap(),
+            "precondition: the v1 note is a recovered chat"
+        );
+        (client, historical)
+    }
+
+    /// QA on the MDK v0.14 upgrade: an upgraded account listed two "Note to
+    /// Self" rows (the recovered v1 one and a new v2 one), and the v1 row
+    /// could not send. The v1 note must fold onto the v2 one like any
+    /// recovered chat folds onto its successor.
+    #[tokio::test]
+    async fn the_v1_note_to_self_folds_onto_the_v2_one() {
+        let (client, historical) = client_with_v1_note_to_self().await;
+        let live = client.ensure_note_to_self().await.expect("ensure");
+        assert_ne!(live, historical);
+        assert!(
+            client.is_folded_historical_group(&historical),
+            "the v1 Note to Self must fold onto the v2 one, not stay a second row"
+        );
+        let rows = client.messages(&live).expect("messages");
+        assert!(
+            rows.iter().any(|m| m.content == "a v1 note"),
+            "the v1 notes page inside the v2 Note to Self"
+        );
+        assert_eq!(
+            client.ensure_note_to_self().await.unwrap(),
+            live,
+            "still one Note to Self"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_into_the_v1_note_to_self_lands_in_the_v2_one() {
+        let (client, historical) = client_with_v1_note_to_self().await;
+        client
+            .send_text(&historical, "a v2 note")
+            .await
+            .expect("a send into the recovered Note to Self must not fail");
+        let live = client
+            .find_note_to_self_group()
+            .unwrap()
+            .expect("the send ensured the v2 Note to Self");
+        assert!(client.is_folded_historical_group(&historical));
+        let contents: Vec<String> = client
+            .messages(&live)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert!(contents.contains(&"a v1 note".to_string()));
+        assert!(contents.contains(&"a v2 note".to_string()));
     }
 
     /// A recovered 0.8 peer can share kind-447 before either side resumes.

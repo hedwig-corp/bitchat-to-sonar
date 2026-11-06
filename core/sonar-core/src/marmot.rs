@@ -3964,6 +3964,14 @@ impl MarmotEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn seed_historical_description(&self, group_id: GroupId, description: &str) {
+        self.historical_group_descriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group_id, description.to_string());
+    }
+
+    #[cfg(test)]
     pub(crate) fn add_historical_media_secret(&self, group_id: GroupId, secret: Vec<u8>) {
         self.historical_media_secrets
             .lock()

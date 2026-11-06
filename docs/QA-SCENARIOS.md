@@ -666,6 +666,19 @@ chat above 80 messages (the first-paint extract window) and one image.
   0.8 schema; this runs the real one. One-shot CLI verbs can exit before a
   live welcome lands, so the receiving side uses `listen`.
 
+### QA-210 — The v1 Note to Self becomes the v2 one, not a second row
+- **Platforms:** both (Android: `scripts/qa/android-mdk-upgrade.sh`)
+- **Steps:** onboard on the v1 (MDK 0.8) app, so it ensures its Note to Self;
+  install the v2 build in place; open Messages; open Note to Self and send.
+- **Expect:** exactly one "Note to Self" row; the note sends; any v1 notes page
+  inside it.
+- **Guard:** `client.rs::the_v1_note_to_self_folds_onto_the_v2_one`,
+  `client.rs::a_send_into_the_v1_note_to_self_lands_in_the_v2_one`
+- **Origin:** QA on the MDK v0.14 bump (Android emulator, in-place upgrade):
+  Note to Self landed on main after #613, so the recovered v1 Note to Self
+  stayed a second row next to a new v2 one, and could not send (no peers to
+  resume with). It now folds onto the v2 Note to Self like any recovered chat.
+
 ## White Noise interop (#613)
 
 White Noise iOS runs MDK's own runtime (marmot-app). The pinned MDK checkout
