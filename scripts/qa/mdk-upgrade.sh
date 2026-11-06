@@ -13,7 +13,8 @@
 #   mdk-upgrade.sh upgrade-peer <name>           run the 0.9 CLI on the peer's home
 #                                                 once (migrates its 0.8 store) and
 #                                                 publish a 0.9 KeyPackage
-#   mdk-upgrade.sh send|expect|listen <name> …   peers.sh verbs on the peer's CURRENT CLI
+#   mdk-upgrade.sh send|expect|listen|id-of|react <name> …
+#                                                 peers.sh verbs on the peer's CURRENT CLI
 #   mdk-upgrade.sh groups <name>                 the peer's Marmot groups (JSON lines)
 #   mdk-upgrade.sh wire <name>                   0.8 / 0.9 KeyPackage wire the peer
 #                                                 publishes (0xf2ee vs 0xf2f1)
@@ -99,7 +100,7 @@ case "$cmd" in
     find "$(home "$name")" -name '*.mdk08.bak*' | grep -q . \
       && echo "peer '$name' migrated (*.mdk08.bak present)" \
       || echo "WARNING: no *.mdk08.bak under $(home "$name") — check where the CLI keeps its DB" >&2 ;;
-  send|expect|listen|npub|send-image)
+  send|expect|listen|npub|send-image|id-of|react)
     name="${1:?$cmd <name> …}"
     peers "$cmd" "$@" ;;
   groups)

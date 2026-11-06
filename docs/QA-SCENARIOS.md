@@ -570,7 +570,9 @@ same `0xf2f1` wire, same migration) — never uninstall. "0.9" below and `09` in
 `mdk-upgrade.sh` mean that post-port build. Needs two apps and two CLIs: build `main`
 (pre-#613, 0.8) from a second checkout (`git worktree add --detach <dir>
 <pre-613 commit>`) for both the app and `sonar-cli`, and this branch for the
-0.9 ones. `scripts/qa/mdk-upgrade.sh` drives the peers (`peer <name> 08|09`,
+0.9 ones. On Android, `scripts/qa/android-mdk-upgrade.sh` runs QA-190…196 and
+QA-210…212 end to end on a disposable emulator; on iOS,
+`scripts/qa/ios-mdk-upgrade.sh` runs the same walk on a dedicated simulator. `scripts/qa/mdk-upgrade.sh` drives the peers (`peer <name> 08|09`,
 `seed`, `upgrade-peer`, `send`/`expect`, `store`). iOS runs headless
 (`SIMCTL_CHILD_SONAR_BENCH_NSEC`, same nsec before and after — the bench path
 derives the DB key from it); Android through `android-ui.sh`. Seed at least one
@@ -592,14 +594,19 @@ chat above 80 messages (the first-paint extract window) and one image.
   transcript were gone, sync restarted from 0 and re-parked old 0.8 welcomes.
 
 ### QA-191 — Older recovered history pages in
-- **Platforms:** Android (UI), iOS (sidecar check: `.sonar-transcript.json`
-  holds every row after an idle minute)
-- **Steps:** open the > 80-message recovered chat; scroll to the top.
-- **Expect:** reaches message 1, including the rows only in the bak.
-- **Guard:** `TranscriptDisplayPolicyTest.exhaustedSourceDoesNotDemandAnotherExpansion`
+- **Platforms:** Android (`android-mdk-upgrade.sh`), iOS (`ios-mdk-upgrade.sh`,
+  85 seeded rows, paged with swipes)
+- **Steps:** open the > 80-message recovered chat right after the upgrade;
+  scroll to the top.
+- **Expect:** reaches message 1 and its 👍, including the rows only in the bak.
+- **Guard:** `TranscriptDisplayPolicyTest.exhaustedSourceDoesNotDemandAnotherExpansion`,
+  `ChatFeedListItemsTest.topTriggerKeyChangesOnlyWhenOlderRowsArePrepended` (R-063)
 - **Origin:** A1 (#613) — every Compose chat stopped after one older page.
-  Also stops after the second page **and on main** (tracked separately, see
-  Open questions) — run it on a chat that fits in two pages until that lands.
+  Then on the MDK v0.14 bump (R-063): on a loaded emulator paging stopped
+  after the first older page again, stuck at row 27–33 of 85 for minutes,
+  while a quiet run paged to the top. The load-older trigger fired on an
+  at-top flag that never turned false when the anchor restore read a stale
+  item list. Not migration-specific: any chat on a slow device.
 
 ### QA-192 — Send in a recovered chat once the peer updated
 - **Platforms:** Android (UI); iOS covered by core e2e (no headless send)
@@ -678,6 +685,34 @@ chat above 80 messages (the first-paint extract window) and one image.
   Note to Self landed on main after #613, so the recovered v1 Note to Self
   stayed a second row next to a new v2 one, and could not send (no peers to
   resume with). It now folds onto the v2 Note to Self like any recovered chat.
+
+### QA-211 — The first v2 launch does not flood the log on Android
+- **Platforms:** Android (`scripts/qa/android-mdk-upgrade.sh`)
+- **Steps:** install the v2 build over a v1 install with history; launch;
+  count `sqlcipher_mlock` lines in logcat from that launch.
+- **Expect:** under 1,000 (0 today). Messages paints from local state.
+- **Guard:** `marmot.rs::sqlcipher_memory_security_is_off_only_on_android`
+  (the option); the log count itself is checked by the script only.
+- **Origin:** QA on the MDK v0.14 bump: v0.14 turns SQLCipher
+  `cipher_memory_security` on by default. Every `mlock` fails on Android, and
+  SQLCipher logs each failure: about 1M lines on the first launch and 31k on
+  every cold start, against about 35 on v1. iOS keeps the default.
+
+### QA-212 — A v1 chat that folds while it is open keeps following
+- **Platforms:** iOS (headless: `ios-drive.sh` + `mdk-upgrade.sh`), Android
+  (`android-mdk-upgrade.sh`, QA-192b)
+- **Steps:** after the in-place upgrade, open a v1 chat whose peer has not
+  updated; `upgrade-peer <peer>`; wait ~15 s; send from the open chat; the
+  peer replies; stay in the chat. Then Back, and tap the chat's row.
+- **Expect:** the reply paints in the open chat within seconds, under the v1
+  history and the app's v2 send; Back then the row tap opens the chat.
+- **Guard:** `FoldHopVisibleTranscriptTests` (iOS, drives
+  `remountFoldedNavigationPath`)
+- **Origin:** app-level upgrade walk on the MDK v0.14 bump (R-062). On iOS the
+  fold rewrote the visible `.dm(v1)` route to `.dm(live)` in place, so the
+  live transcript never followed the store (the reply only showed after a
+  reopen), and the open state stayed on the v1 id: after Back the row tap
+  logged `chat_open … path=already-open` and did nothing.
 
 ## White Noise interop (#613)
 
@@ -2031,7 +2066,17 @@ real mint and need the maintainer's approval of the amounts.
 - **Compose load-older stops early (main too):** a chat opened at its unread
   anchor never loads older rows, and a read chat stops after the second older
   page (`firstVisibleItemIndex <= 2` never re-arms after a prepend). Seen on the
-  `main` build in the #613 pass; not caused by #613.
+  `main` build in the #613 pass; not caused by #613. **The re-arm is fixed by
+  R-063** (the trigger keys on the oldest row while at the top). The upgrade
+  walks open an unread 85-message chat and page it to message 1, but the
+  unread-anchor case on `main` was not re-checked on its own.
+- **iOS: a send from deep history stays off-screen (main too):** scroll up
+  into older rows, send — the message is sent and appended, but the view stays
+  where it was (`TranscriptTailPinLatch.itemsChanged` only follows appends when
+  the reader was already at the bottom; there is no own-send case). Signal
+  scrolls to the new message. Found by `ios-mdk-upgrade.sh` (85-row chat); the
+  walk now returns to the newest rows before sending. Not caused by the MDK
+  bump; tracked as a follow-up in the shared transcript engine.
 - **Mesh realtime loop saturates the UI thread (main too):** with other BLE
   mesh peers in range (other agents' emulators) `startMeshRealtimeLoop` ran on
   the main dispatcher long enough to ANR the app. Turn Bluetooth off on a QA

@@ -3424,6 +3424,99 @@ republished the dead wrapper.
 - *Including fold aliases of a live group in the publishable set.* After
   resume the hist id is an alias of live; its stored wrapper is still 0.8.
 
+## R-062 — A chat that folds while it is open must keep following, and close
+
+**Invariant:** when a recovered v1 (MDK 0.8) chat folds onto its v2 group
+while it is the visible screen, the screen ends on the live id with that id's
+transcript following the store and the open state recorded on it. Leaving
+then closes the chat.
+
+**Breaks as:** iOS, after the in-place v1 → v2 upgrade: open a v1 chat, the
+peer updates, send. The peer's v2 replies reach core (the Home row previews
+them) but never paint in the open chat until it is reopened. After Back, a tap
+on the row does nothing (`SONAR_BENCH chat_open … path=already-open`) until
+another chat is opened first.
+
+**Why:** with the hist→live fold persisted, `marmotGroupId(v1)` already
+resolves to live, so `remountFoldedOpenChatIfNeeded` takes its "already on
+live" return. Its deferred `remountFoldedNavigationPath` still rewrites the
+top `.dm(v1)` route to `.dm(live)`, and the NavigationStack updates that
+screen in place: neither `closedDM(v1)` nor `openedDM(live)` runs (the R-038
+shape, which `handOverVisibleTranscript` already handles for pending → real).
+The live `ConversationViewState` adopted the window but was never attached,
+and `openedConversationId` stayed on the v1 id, so `closedDM(live)` did not
+clear it and `openDM` saw the chat as still open.
+
+**Apple call site:** `SonarAppStore.remountFoldedNavigationPath` →
+`handOverFoldedVisibleTranscript` (route replacement v1 → live, opened = live
+/ pane = v1, `handOverVisibleTranscript`, mark read).
+
+**Compose call site:** does not apply as written. `SonarAppState` derives the
+open chat from the top of `stack` (`screen`), and the fold's
+`remountFoldedNavStack` rewrites that stack, so the open state moves with
+the route; transcripts are recomposed from state, with no attach/detach to
+miss. QA-212 runs the same steps on Android (`android-mdk-upgrade.sh`,
+QA-192b).
+
+**Guarded by:** `FoldHopVisibleTranscriptTests.theVisibleTranscriptFollowsTheStoreOnTheLiveIdAfterTheFold`
+
+**Also guarded by:** `FoldHopVisibleTranscriptTests.leavingAfterTheFoldClosesTheChatSoItsRowOpensAgain`,
+`FoldHopVisibleTranscriptTests.aLateDisappearOfTheV1ScreenDoesNotCloseTheLiveChat`
+
+**Not guarded:** the tests drive `remountFoldedNavigationPath` with a known
+live target, not the `groups` emission that calls it, and they cannot show
+whether SwiftUI fires the lifecycle pair on a given iOS version; the
+simulator walk (QA-212) is the end-to-end check. iOS tests do not run in CI.
+
+**Rejected:**
+- *Re-running the full remount (path kept on `.dm(v1)`) when the open id
+  already resolves to live.* That branch also copies windows, echoes and
+  send queues keyed by the resolved id, which is live there: a larger change
+  to code with five QA rounds behind it, for the same visible result.
+- *`openedDM(live)` from the path remount.* It hydrates the live id as a
+  fresh open and snaps a scrolled recovered transcript to the tail (the
+  remount comments already rule it out).
+
+## R-063 — Paging older history must keep firing while the reader stays at the top
+
+**Invariant:** each older page a reader pulls in at the top of a transcript
+re-arms the load-older trigger, so they can keep paging to message 1 however
+slow the device is.
+
+**Breaks as:** Compose, after the MDK v0.14 upgrade, on a loaded emulator:
+scrolling up an 85-message recovered chat loads one older page (60 rows)
+and stops at row 27–33; more swipes and a minute of idle never page further.
+On a quiet run the same chat pages to the top. `FOLDDBG` tracing showed one
+`loadOlderMessages` call in the whole scroll and no failed one.
+
+**Why:** the trigger was `snapshotFlow { atTop }.distinctUntilChanged()`.
+After a prepend, the continuity restore waited one frame and then read
+`currentListItems`; on a slow device that list was still the pre-prepend
+one, so the anchor's old index (≤ 2) kept the reader at the top, `atTop`
+never turned false, and the flow never emitted again.
+
+**Compose call site:** `App.kt` `rememberChatTranscriptViewport` load-older
+`LaunchedEffect`: the trigger is now `transcriptTopTriggerKey(currentListItems)`
+while at the top (the oldest message row), and the restore waits up to 1 s
+for the recomposed list before scrolling to the anchor.
+
+**Apple call site:** not the same code. iOS pages through
+`ConversationViewState.loadOlder` from the UIKit host; `ios-mdk-upgrade.sh`
+QA-191 pages the same 85-message chat with swipes.
+
+**Guarded by:** `ChatFeedListItemsTest.topTriggerKeyChangesOnlyWhenOlderRowsArePrepended`
+
+**Not guarded:** the test pins the key, not the `LaunchedEffect` wiring or the
+restore wait, which need a device. The scripted QA-191 is the end-to-end
+check and only reproduced the stall under heavy host load.
+
+**History:** #613 QA A1 fixed a different cause of the same symptom
+(`transcriptSourceHasOlder` re-arming an exhausted source).
+
+**Rejected:**
+- *Waiting longer (more frames) before reading the list.* Still a race on a
+  slower device; the key-based trigger does not depend on the restore at all.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
