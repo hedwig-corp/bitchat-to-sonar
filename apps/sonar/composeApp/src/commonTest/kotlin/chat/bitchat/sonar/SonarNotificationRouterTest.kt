@@ -35,6 +35,38 @@ class SonarNotificationRouterTest {
     }
 
     @Test
+    fun recoveredWakePassesRoomAsConversationTitleAndGroupName() {
+        val names = wakeNotificationNames(summaryName = "standup", senderName = "Alice")
+        val n = SonarNotificationRouter.build(
+            idKey = "group-1",
+            kind = SonarNotificationKind.Message,
+            conversationTitle = names.conversationTitle,
+            senderName = "Alice",
+            groupName = names.groupName,
+            preview = "hello",
+            prefs = SonarNotificationPrefs(showNames = true, showPreview = true),
+        )
+        assertEquals("Alice in standup", n?.title)
+        assertEquals("hello", n?.body)
+    }
+
+    @Test
+    fun recoveredDirectWakeUsesSenderOnly() {
+        val names = wakeNotificationNames(summaryName = "", senderName = "Alice")
+        val n = SonarNotificationRouter.build(
+            idKey = "dm-1",
+            kind = SonarNotificationKind.Message,
+            conversationTitle = names.conversationTitle,
+            senderName = "Alice",
+            groupName = names.groupName,
+            preview = "hello",
+            prefs = SonarNotificationPrefs(showNames = true, showPreview = true),
+        )
+        assertEquals("Alice", n?.title)
+        assertEquals("hello", n?.body)
+    }
+
+    @Test
     fun previewsRequireOptIn() {
         val n = SonarNotificationRouter.build(
             idKey = "chat-1",

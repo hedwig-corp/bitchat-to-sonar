@@ -21,6 +21,12 @@ pub(crate) const OUTBOX_STATE_FILE_SUFFIX: &str = ".sonar-outbox.json";
 const OUTBOX_STATE_VERSION: u32 = 1;
 pub(crate) const OUTBOX_RETRY_ATTEMPT_LIMIT: u32 = 20;
 
+/// Stable Display text of [`Error::HistoricalProtocolRetry`]. Outbox rows
+/// keyed by a recovered 0.8 id keep this `last_error` so hosts paint
+/// Failed instead of eternal Sending, and a tap cannot flip them Sent.
+pub(crate) const HISTORICAL_PROTOCOL_RETRY_ERROR: &str =
+    "this message used an older Sonar protocol; send it again";
+
 /// Backoff before core auto-retries a failed publish. Hosts also call
 /// `retry_outbox` on idle/reconnect; this schedule keeps a transient outage
 /// from stranding the row until app restart while an active chat keeps the
@@ -155,6 +161,12 @@ impl OutboxState {
 
     pub fn status_for_message(&self, message_id_hex: &str) -> Option<DeliveryState> {
         self.entries.get(message_id_hex).map(|entry| entry.state)
+    }
+
+    pub fn group_id_hex_for_message(&self, message_id_hex: &str) -> Option<String> {
+        self.entries
+            .get(message_id_hex)
+            .map(|entry| entry.group_id_hex.clone())
     }
 
     #[cfg(test)]
@@ -403,15 +415,24 @@ impl OutboxState {
         Ok((group_id_hex, event))
     }
 
-    /// Returns `(message_id_hex, group_id_hex, event, silent)` for each
-    /// retryable row. `group_id_hex` is the MLS id hosts use for conversation
-    /// refresh (not the Nostr `#h` / `nostr_group_id`).
+    /// Returns `(retryable, newly_failed_group_ids)`. Each retryable row is
+    /// `(message_id_hex, group_id_hex, event, silent)`; `group_id_hex` is the
+    /// MLS id hosts use for conversation refresh (not the Nostr `#h`).
+    ///
+    /// `active_group_ids` keeps a row on disk (live v2 plus recovered v1).
+    /// `publishable_group_ids` is the live-only set that may be republished.
+    /// A recovered v1 (MDK 0.8) id can be active (so the upgrade does not purge
+    /// it and paint Sent) without being publishable (v2 peers cannot decrypt
+    /// it). Those rows are marked Failed and listed in `newly_failed_group_ids`
+    /// once so hosts refresh Sending → Couldn't send.
     pub fn retryable_events(
         &mut self,
         now_secs: u64,
         active_group_ids: &HashSet<String>,
-    ) -> Result<Vec<(String, String, Event, bool)>> {
+        publishable_group_ids: &HashSet<String>,
+    ) -> Result<(Vec<(String, String, Event, bool)>, Vec<String>)> {
         let mut out = Vec::new();
+        let mut newly_failed = Vec::new();
         let before = self.entries.len();
         self.entries
             .retain(|_, entry| active_group_ids.contains(&entry.group_id_hex));
@@ -419,6 +440,21 @@ impl OutboxState {
             self.dirty = true;
         }
         for entry in self.entries.values_mut() {
+            if !publishable_group_ids.contains(&entry.group_id_hex) {
+                if !matches!(entry.state, DeliveryState::Pending | DeliveryState::Failed) {
+                    continue;
+                }
+                let already_failed = entry.state == DeliveryState::Failed
+                    && entry.last_error.as_deref() == Some(HISTORICAL_PROTOCOL_RETRY_ERROR);
+                if !already_failed {
+                    entry.state = DeliveryState::Failed;
+                    entry.updated_at_secs = now_secs;
+                    entry.last_error = Some(HISTORICAL_PROTOCOL_RETRY_ERROR.to_string());
+                    self.dirty = true;
+                    newly_failed.push(entry.group_id_hex.clone());
+                }
+                continue;
+            }
             if !matches!(entry.state, DeliveryState::Pending | DeliveryState::Failed) {
                 continue;
             }
@@ -439,7 +475,7 @@ impl OutboxState {
             ));
         }
         self.save_if_dirty()?;
-        Ok(out)
+        Ok((out, newly_failed))
     }
 
     /// Rumor ids whose automatic publish budget is exhausted. Restart recovery
@@ -640,10 +676,11 @@ mod tests {
             .expect("mark pending");
 
         let active_group_ids = HashSet::new();
-        let events = outbox
-            .retryable_events(2, &active_group_ids)
+        let (events, newly_failed) = outbox
+            .retryable_events(2, &active_group_ids, &active_group_ids)
             .expect("retryable events");
         assert!(events.is_empty());
+        assert!(newly_failed.is_empty());
 
         let reloaded = OutboxState::load(Some(path));
         assert_eq!(reloaded.status_for_message("deleted-message"), None);
@@ -840,10 +877,12 @@ mod tests {
         outbox
             .mark_failed_by_message_id("message", "still offline".into(), 4)
             .expect("mark failed after retry");
-        let retryable = outbox
-            .retryable_events(5, &HashSet::from(["group".to_string()]))
+        let publishable = HashSet::from(["group".to_string()]);
+        let (retryable, newly_failed) = outbox
+            .retryable_events(5, &publishable, &publishable)
             .expect("automatic retry budget was reset");
         assert_eq!(retryable.len(), 1);
+        assert!(newly_failed.is_empty());
 
         let reloaded = OutboxState::load(Some(path));
         assert_eq!(
@@ -1036,5 +1075,50 @@ mod coalescing_tests {
                 started.elapsed().as_secs_f64() * 1e3
             );
         }
+    }
+
+    #[test]
+    fn retryable_events_keeps_unpublishable_active_rows_and_marks_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+
+        outbox
+            .mark_pending(
+                "hist-08".into(),
+                "pending-08".into(),
+                "wrapper".into(),
+                "{}".into(),
+                1,
+            )
+            .expect("mark pending");
+
+        let active = HashSet::from(["hist-08".to_string()]);
+        let publishable = HashSet::new();
+        let (events, newly_failed) = outbox
+            .retryable_events(2, &active, &publishable)
+            .expect("retryable events");
+        assert!(events.is_empty(), "0.8 ciphertext must not be republished");
+        assert_eq!(newly_failed, vec!["hist-08".to_string()]);
+        assert_eq!(
+            outbox.status_for_message("pending-08"),
+            Some(DeliveryState::Failed)
+        );
+
+        let (events, newly_failed) = outbox
+            .retryable_events(3, &active, &publishable)
+            .expect("second pass");
+        assert!(events.is_empty());
+        assert!(
+            newly_failed.is_empty(),
+            "already-failed hist rows must not re-notify every idle tick"
+        );
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(
+            reloaded.status_for_message("pending-08"),
+            Some(DeliveryState::Failed),
+            "upgrade must not purge a recovered 0.8 row and lie that it sent"
+        );
     }
 }

@@ -7,6 +7,8 @@ enum class MediaTransferPhase {
     Downloading,
     Available,
     Failed,
+    /** Recovered 0.8 attachment — cannot decrypt; do not offer Retry. */
+    Unavailable,
 }
 
 /** Signal-style attachment pointer/stream state shared by Android and desktop. */
@@ -14,12 +16,15 @@ data class MediaTransferState(
     val phase: MediaTransferPhase,
     val progress: Float? = null,
     val localPath: String? = null,
+    val userMessage: String? = null,
 ) {
     companion object {
         val NotDownloaded = MediaTransferState(MediaTransferPhase.NotDownloaded)
         fun downloading(progress: Float?) = MediaTransferState(MediaTransferPhase.Downloading, progress)
         fun available(path: String) = MediaTransferState(MediaTransferPhase.Available, 1f, path)
         val Failed = MediaTransferState(MediaTransferPhase.Failed)
+        fun unavailable(message: String) =
+            MediaTransferState(MediaTransferPhase.Unavailable, userMessage = message)
     }
 }
 

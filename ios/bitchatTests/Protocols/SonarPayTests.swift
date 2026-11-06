@@ -349,4 +349,58 @@ final class SonarPayTests: XCTestCase {
 
         defaults.removePersistentDomain(forName: suite)
     }
+
+    func testRemountPeerKeysMovesHistoricalChatOntoLiveSibling() {
+        let (ledger, defaults, suite) = freshActivityLedger()
+        let created = Date(timeIntervalSince1970: 1_800_000_000)
+        func activity(id: String, peerKey: String) -> SonarPaymentActivity {
+            SonarPaymentActivity(
+                id: id,
+                kind: .sonarDirect,
+                peerKey: peerKey,
+                peerName: "Alice",
+                direction: .outgoing,
+                sats: 21000,
+                via: "internet",
+                createdAt: created,
+                destinationHash: nil,
+                status: .paid
+            )
+        }
+        XCTAssertTrue(ledger.recordPending(activity(id: "pay-08", peerKey: "marmot:group-08")))
+        XCTAssertTrue(ledger.recordPending(activity(id: "pay-09", peerKey: "marmot:group-09")))
+        XCTAssertTrue(ledger.recordPending(activity(id: "wallet", peerKey: "wallet")))
+        XCTAssertTrue(ledger.recordPending(activity(id: "unify", peerKey: "unify:peer")))
+        XCTAssertTrue(ledger.remountPeerKeys(
+            historicalKeys: ["marmot:group-08", "group-08"],
+            onto: "marmot:group-09"
+        ))
+        XCTAssertEqual(
+            Set(ledger.activities(peerKey: "marmot:group-09").map(\.id)),
+            ["pay-08", "pay-09"]
+        )
+        XCTAssertTrue(ledger.activities(peerKey: "marmot:group-08").isEmpty)
+        XCTAssertEqual(ledger.entries["wallet"]?.peerKey, "wallet")
+        XCTAssertEqual(ledger.entries["unify"]?.peerKey, "unify:peer")
+        XCTAssertEqual(
+            Set(ledger.activities(peerKeys: [
+                "marmot:group-08", "group-08",
+                "marmot:group-09", "group-09",
+            ]).map(\.id)),
+            ["pay-08", "pay-09"]
+        )
+
+        let reloaded = SonarPaymentActivityLedger(defaults: defaults)
+        XCTAssertEqual(
+            Set(reloaded.activities(peerKey: "marmot:group-09").map(\.id)),
+            ["pay-08", "pay-09"]
+        )
+        XCTAssertEqual(reloaded.entries["wallet"]?.peerKey, "wallet")
+        XCTAssertFalse(ledger.remountPeerKeys(
+            historicalKeys: ["marmot:group-08", "group-08"],
+            onto: "marmot:group-09"
+        ))
+
+        defaults.removePersistentDomain(forName: suite)
+    }
 }

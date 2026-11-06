@@ -190,6 +190,7 @@ class EventDrivenRefreshTest {
         npub: String = "me",
         hold: Int = 0,
         noteToSelfGroupId: String? = null,
+        conversationIndex: Int = 0,
     ) = VisibleChatsKey(
         chatsIdentity,
         folded,
@@ -200,6 +201,7 @@ class EventDrivenRefreshTest {
         npub,
         hold,
         noteToSelfGroupId,
+        conversationIndex,
     )
 
     @Test
@@ -245,5 +247,10 @@ class EventDrivenRefreshTest {
     @Test
     fun ownNpubChangeInvalidates() {
         assertFalse(key(npub = "me") == key(npub = "someoneElse"))
+    }
+
+    @Test
+    fun conversationIndexVersionChangeInvalidates() {
+        assertFalse(key(conversationIndex = 0) == key(conversationIndex = 1))
     }
 }

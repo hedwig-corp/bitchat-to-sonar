@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import Testing
 @testable import TranscriptEngine
 
@@ -232,6 +233,46 @@ struct TranscriptScrollPolicyTests {
                 unreadCountAtOpen: 0, lastUnreadCountAtOpen: 0,
                 jumpMessageId: "m1", lastJumpMessageId: nil,
                 expectedNewestDate: nil, lastExpectedNewestDate: nil
+            )
+        )
+        #expect(
+            !TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: 7, lastContentVersion: 7,
+                unreadCountAtOpen: 3, lastUnreadCountAtOpen: 3,
+                jumpMessageId: nil, lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil,
+                familyHasOlder: false, lastFamilyHasOlder: true
+            )
+        )
+        #expect(TranscriptScrollPolicy.shouldSettleJump(parentVisible: true))
+        #expect(!TranscriptScrollPolicy.shouldSettleJump(parentVisible: false))
+        let hist = Date(timeIntervalSince1970: 50)
+        let live = Date(timeIntervalSince1970: 10)
+        #expect(
+            !TranscriptScrollPolicy.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: live,
+                expectedNewest: hist,
+                familyHasOlder: false
+            )
+        )
+        #expect(
+            !TranscriptScrollPolicy.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 80),
+                expectedNewest: hist,
+                familyHasOlder: true
+            )
+        )
+        #expect(
+            TranscriptScrollPolicy.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 80),
+                expectedNewest: hist,
+                familyHasOlder: false
             )
         )
     }

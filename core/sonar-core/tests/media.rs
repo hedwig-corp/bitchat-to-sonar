@@ -151,7 +151,7 @@ async fn media_sends_over_white_noise_end_to_end() {
         .await
         .expect("ios starts dm");
     android.sync().await.expect("android joins");
-    let android_group = android.groups().expect("groups")[0].mls_group_id.clone();
+    let android_group = android.groups().expect("groups")[0].id.clone();
 
     // iOS sends a real 1x1 PNG. The mock Blossom accepts only the ciphertext's
     // true MIME (application/octet-stream), catching source-MIME upload bugs.
@@ -267,7 +267,7 @@ async fn media_album_sends_n_attachments_in_one_message() {
         .await
         .expect("alice starts dm");
     bob.sync().await.expect("bob joins via welcome");
-    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let bob_group = bob.groups().expect("bob groups")[0].id.clone();
 
     // Three distinct "photos". Generic mime keeps the crypto path decoder-free
     // (MDK sniffs real image bytes for image/* mimes); the imeta/album path is
@@ -303,6 +303,7 @@ async fn media_album_sends_n_attachments_in_one_message() {
     let event = alice
         .engine()
         .create_media_event_multi(&alice_group, &refs, "three photos")
+        .await
         .expect("alice builds album event");
 
     alice
@@ -342,6 +343,7 @@ async fn media_album_sends_n_attachments_in_one_message() {
         alice
             .engine()
             .create_media_event_multi(&alice_group, &[], "")
+            .await
             .is_err(),
         "empty album must be rejected"
     );
@@ -357,7 +359,7 @@ async fn fetch_media_refuses_non_https() {
         .await
         .expect("connect");
     // A fabricated group id is fine — the https check happens before any lookup.
-    let gid = sonar_core::GroupId::from_slice(&[7u8; 32]);
+    let gid = sonar_core::GroupId::new([7u8; 32]);
     let err = client
         .fetch_media(&gid, "http://127.0.0.1:1/blob")
         .await
@@ -387,7 +389,7 @@ async fn media_round_trips_through_the_group_key() {
         .await
         .expect("alice starts dm");
     bob.sync().await.expect("bob joins via welcome");
-    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let bob_group = bob.groups().expect("bob groups")[0].id.clone();
 
     // Alice attaches a file. Generic mime so the test doesn't depend on an image
     // decoder — the crypto path is identical for any bytes.
@@ -413,6 +415,7 @@ async fn media_round_trips_through_the_group_key() {
     let event = alice
         .engine()
         .create_media_event(&alice_group, &upload, &url, "here's a file")
+        .await
         .expect("alice builds media event");
 
     // Record for the sender, then hand the 445 to the receiver (stands in for the

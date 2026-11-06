@@ -56,9 +56,17 @@ struct SonarAttachmentImportTests {
             conversationID: "pending:npub1peer",
             routeReplacement: replacement
         ))
+        #expect(snPreservesAttachmentImport(
+            conversationID: "marmot:group",
+            routeReplacement: replacement
+        ))
         #expect(!snPreservesAttachmentImport(
             conversationID: "another-chat",
             routeReplacement: replacement
+        ))
+        #expect(!snPreservesAttachmentImport(
+            conversationID: "marmot:group",
+            routeReplacement: nil
         ))
     }
 
