@@ -192,7 +192,14 @@ send_in_open_chat "waiting $RUN"; sleep 20
 # before core accepts it stays an in-memory "Couldn't send · Retry" echo
 # (#613, by design), so sending at once would test relay propagation.
 sleep 15
+# QA-213: send from older history; the view must follow the reader's message
+# with no manual scroll (Signal).
+for i in $(seq 1 8); do adbs shell input swipe 540 700 540 1900 300; sleep 1; done
 send_in_open_chat "resumed $RUN"
+sleep 2
+"$UI" dump | grep -c "resumed $RUN" >/dev/null \
+  && pass QA-213 "a send from older history scrolls into view" \
+  || fail QA-213 "the send from older history stayed off-screen"
 if "$M" expect "up-p-$RUN" "resumed $RUN" 180 >/dev/null 2>&1; then
   pass QA-192 "after the peer updated, the app's send reached it on v2"
 else

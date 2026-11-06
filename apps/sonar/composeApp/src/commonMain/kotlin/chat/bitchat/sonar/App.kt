@@ -1259,6 +1259,15 @@ internal fun chatFeedListIndexForFeedRow(listItems: List<ChatFeedListItem>, feed
 internal fun chatFeedListIndexForKey(listItems: List<ChatFeedListItem>, key: String): Int =
     listItems.indexOfFirst { chatFeedListKey(it) == key }
 
+/** A new own send for the open chat: the transcript scrolls to it (Signal),
+ *  even from older history. Not the one already seen at composition, not
+ *  another chat's. */
+internal fun ownSendShouldFollow(
+    send: SonarAppState.OwnSend?,
+    seen: SonarAppState.OwnSend?,
+    openChatId: String,
+): Boolean = send != null && send != seen && send.chatId == openChatId
+
 /** Load-older trigger key while the reader is at the top: the oldest message
  *  row, so each prepend re-arms paging even when the reader never left the
  *  top. Empty (still a key) for a feed with no message row yet. */
@@ -1781,6 +1790,31 @@ private fun rememberChatTranscriptViewport(
                 listState.scrollToItem(newIndex, scrollOffset = -offset)
             }
             isPrepending = false
+        }
+    }
+
+    // Signal scrolls to the reader's own send even from older history; the
+    // tail-pin rules leave the view alone for incoming rows there. Jump to the
+    // tail on the send, then follow once more if the echo (or the newest-page
+    // reload a send triggers from a pinned window) lands within 2 s.
+    LaunchedEffect(transcriptSessionKey, listState) {
+        var seen = state.lastOwnSend
+        fun tailKey(): String? =
+            currentListItems.lastOrNull { it is ChatFeedListItem.Row }?.let(::chatFeedListKey)
+        suspend fun toTail() {
+            withFrameNanos { }
+            val last = listState.layoutInfo.totalItemsCount - 1
+            if (last >= 0) listState.anchorTranscriptTail(last, animate = true)
+        }
+        snapshotFlow { state.lastOwnSend }.collect { send ->
+            if (!ownSendShouldFollow(send, seen, screen.id)) return@collect
+            seen = send
+            val before = tailKey()
+            toTail()
+            val moved = withTimeoutOrNull(2_000) {
+                snapshotFlow { tailKey() }.first { it != null && it != before }
+            }
+            if (moved != null) toTail()
         }
     }
 

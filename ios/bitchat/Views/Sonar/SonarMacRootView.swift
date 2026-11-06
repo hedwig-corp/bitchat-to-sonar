@@ -4049,6 +4049,7 @@ private struct MacCollectionHostDM<Composer: View>: View {
                 familyHasOlder: store.canLoadOlderDM(peerId),
                 jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
                 onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
+                ownSendRevision: store.ownSendRevision(for: peerId),
                 composer: composer
             )
         }

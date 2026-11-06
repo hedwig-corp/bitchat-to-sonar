@@ -12180,7 +12180,22 @@ final class SonarAppStore: ObservableObject {
         return .internet
     }
 
+    /// Bumped on every send the reader makes from a conversation's composer.
+    /// Transcript hosts compare it to follow the reader's own message even
+    /// when they were reading older history (Signal scrolls to your send).
+    /// Not `@Published`: every send path already publishes the store.
+    private(set) var ownSendRevisionByChat: [String: UInt64] = [:]
+
+    func ownSendRevision(for chatId: String) -> UInt64 {
+        ownSendRevisionByChat[chatId] ?? 0
+    }
+
+    private func noteOwnSend(_ chatId: String) {
+        ownSendRevisionByChat[chatId, default: 0] &+= 1
+    }
+
     func sendDm(_ id: String, _ text: String) {
+        noteOwnSend(id)
         // Every send route lands a local echo synchronously; repaint this
         // frame instead of waiting on the throttled service republish. One
         // defer covers all early-return branches (mesh route, Marmot,
@@ -12425,6 +12440,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func sendSticker(_ id: String, sticker: StickerInfo, packCoordinate: String) {
+        noteOwnSend(id)
         let content = meshStickerContent(
             packCoordinate: packCoordinate,
             shortcode: sticker.shortcode,
@@ -14671,6 +14687,7 @@ final class SonarAppStore: ObservableObject {
     /// media. Same routing as `sendImage`, audio mime. Cleans up the temp file.
     func sendVoiceNote(_ id: String, url: URL) {
         defer { try? FileManager.default.removeItem(at: url) }
+        noteOwnSend(id)
         if let route = liveMeshRoutePeerId(for: id) {
             chatViewModel.selectedPrivateChatPeer = PeerID(str: route)
             chatViewModel.sendVoiceNote(at: url)

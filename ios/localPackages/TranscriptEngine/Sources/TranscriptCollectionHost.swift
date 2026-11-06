@@ -103,6 +103,10 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     /// the hosted SwiftUI value on every such tick schedules needless intrinsic
     /// sizing/layout beside the active keyboard.
     var composerVersion: UInt64?
+    /// Bumped by the app on each send from its composer. The reader's own
+    /// message is scrolled into view even when they were in older history;
+    /// incoming appends there still leave the view alone. Nil = never.
+    var ownSendRevision: UInt64?
     @ViewBuilder var composer: () -> Composer
 
     public init(
@@ -120,6 +124,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         onJumpSettled: (() -> Void)? = nil,
         contentVersion: UInt64? = nil,
         composerVersion: UInt64? = nil,
+        ownSendRevision: UInt64? = nil,
         @ViewBuilder composer: @escaping () -> Composer
     ) {
         self.entries = entries
@@ -136,6 +141,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.onJumpSettled = onJumpSettled
         self.contentVersion = contentVersion
         self.composerVersion = composerVersion
+        self.ownSendRevision = ownSendRevision
         self.composer = composer
     }
 
@@ -158,6 +164,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             contentVersion: contentVersion,
+            ownSendRevision: ownSendRevision,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             callbacks: callbacks,
@@ -181,6 +188,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             contentVersion: contentVersion,
+            ownSendRevision: ownSendRevision,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             callbacks: callbacks,
@@ -276,6 +284,8 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var contentSizeObservation: NSKeyValueObservation?
     private var lastContentHeight: CGFloat = 0
     private var lastAppliedContentVersion: UInt64?
+    /// Last `ownSendRevision` seen; a change is the reader's own send.
+    private var lastOwnSendRevision: UInt64?
     private var lastAppliedComposerVersion: UInt64?
 
     private let heightCache = TranscriptRowHeightCache()
@@ -470,6 +480,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         familyHasOlder: Bool = false,
         jumpMessageId: String? = nil,
         contentVersion: UInt64? = nil,
+        ownSendRevision: UInt64? = nil,
         loadOlder: (() async -> Bool)?,
         loadNewest: (() async -> Void)?,
         callbacks: TranscriptCollectionHostCallbacks? = nil,
@@ -490,6 +501,15 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         if let transcriptBackgroundColor {
             self.transcriptBackgroundColor = transcriptBackgroundColor
             if isViewLoaded { applyTranscriptBackground() }
+        }
+        // Before the unchanged-apply skip: a send can reach here in an update
+        // whose rows did not change yet (the echo lands in the next one).
+        if let ownSendRevision {
+            if let last = lastOwnSendRevision, last != ownSendRevision, didInitialScroll {
+                let action = latch.ownSendRequested(at: ProcessInfo.processInfo.systemUptime)
+                followTail(action, animateAppends: true)
+            }
+            lastOwnSendRevision = ownSendRevision
         }
         if TranscriptScrollPolicy.shouldSkipUnchangedApply(
             contentVersion: contentVersion,
@@ -892,7 +912,8 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             tailID: entries.last?.id,
             isNearBottom: near,
             userScrolling: isUserScrolling,
-            isPrepending: isLoadingOlder
+            isPrepending: isLoadingOlder,
+            now: ProcessInfo.processInfo.systemUptime
         )
         followTail(action, animateAppends: feedCaughtUp)
     }

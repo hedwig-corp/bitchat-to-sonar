@@ -403,7 +403,8 @@ struct SonarDMScreenContent: View {
                     familyHasOlder: store.canLoadOlderDM(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
                     onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
-                    composerVersion: composerVersion
+                    composerVersion: composerVersion,
+                    ownSendRevision: store.ownSendRevision(for: peerId)
                 ) {
                     dmComposer
                 }
@@ -439,7 +440,8 @@ struct SonarDMScreenContent: View {
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
                     familyHasOlder: store.canLoadOlderDM(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
-                    onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) }
+                    onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
+                    ownSendRevision: store.ownSendRevision(for: peerId)
                 )
                 dmComposer
             }

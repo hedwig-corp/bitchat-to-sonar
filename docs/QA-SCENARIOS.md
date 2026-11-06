@@ -571,7 +571,7 @@ same `0xf2f1` wire, same migration) — never uninstall. "0.9" below and `09` in
 (pre-#613, 0.8) from a second checkout (`git worktree add --detach <dir>
 <pre-613 commit>`) for both the app and `sonar-cli`, and this branch for the
 0.9 ones. On Android, `scripts/qa/android-mdk-upgrade.sh` runs QA-190…196 and
-QA-210…212 end to end on a disposable emulator; on iOS,
+QA-210…213 end to end on a disposable emulator; on iOS,
 `scripts/qa/ios-mdk-upgrade.sh` runs the same walk on a dedicated simulator. `scripts/qa/mdk-upgrade.sh` drives the peers (`peer <name> 08|09`,
 `seed`, `upgrade-peer`, `send`/`expect`, `store`). iOS runs headless
 (`SIMCTL_CHILD_SONAR_BENCH_NSEC`, same nsec before and after — the bench path
@@ -701,6 +701,27 @@ chat above 80 messages (the first-paint extract window) and one image.
   `cipher_memory_security` on by default. Every `mlock` fails on Android, and
   SQLCipher logs each failure: about 1M lines on the first launch and 31k on
   every cold start, against about 35 on v1. iOS keeps the default.
+
+### QA-213 — A send from older history scrolls into view
+- **Platforms:** both (`android-mdk-upgrade.sh`, `ios-mdk-upgrade.sh`)
+- **Steps:** in a long chat, scroll up into older messages; send from the
+  composer without scrolling back.
+- **Expect:** the view moves to the bottom and the sent message is on
+  screen. An incoming message while you read history still leaves the view
+  where it is.
+- **Guard:** `TranscriptScrollPolicyTests.ownSendFromHistoryFollowsItsEcho`
+  (+ `ownSendAfterItsEchoLandedStillFollows`,
+  `incomingAppendWhileReadingHistoryStaysPut`,
+  `anExpiredOwnSendRequestDoesNotFollowLaterIncoming`),
+  `ChatFeedListItemsTest.ownSendFollowsOnlyANewSendInTheOpenChat`
+- **Origin:** the MDK v0.14 upgrade walk (85-message chat), on both apps and
+  on `main`: the message was sent and appended but stayed off-screen, so it
+  looked unsent. The tail-pin rules only followed appends when the reader was
+  already at the bottom. Signal scrolls to your send. The screens now bump an
+  own-send revision on each composer send (text, sticker, voice); iOS's
+  `TranscriptTailPinLatch.ownSendRequested` follows its echo (either order,
+  expiring after 5 s so a failed send cannot yank a later incoming message),
+  and Compose scrolls to the tail on `SonarAppState.lastOwnSend`.
 
 ### QA-212 — A v1 chat that folds while it is open keeps following
 - **Platforms:** iOS (headless: `ios-drive.sh` + `mdk-upgrade.sh`), Android
@@ -2074,13 +2095,6 @@ real mint and need the maintainer's approval of the amounts.
   R-063** (the trigger keys on the oldest row while at the top). The upgrade
   walks open an unread 85-message chat and page it to message 1, but the
   unread-anchor case on `main` was not re-checked on its own.
-- **iOS: a send from deep history stays off-screen (main too):** scroll up
-  into older rows, send — the message is sent and appended, but the view stays
-  where it was (`TranscriptTailPinLatch.itemsChanged` only follows appends when
-  the reader was already at the bottom; there is no own-send case). Signal
-  scrolls to the new message. Found by `ios-mdk-upgrade.sh` (85-row chat); the
-  walk now returns to the newest rows before sending. Not caused by the MDK
-  bump; tracked as a follow-up in the shared transcript engine.
 - **Mesh realtime loop saturates the UI thread (main too):** with other BLE
   mesh peers in range (other agents' emulators) `startMeshRealtimeLoop` ran on
   the main dispatcher long enough to ANR the app. Turn Bluetooth off on a QA

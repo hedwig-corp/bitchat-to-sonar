@@ -1951,6 +1951,9 @@ struct SNMsgList: View {
     var jumpMessageId: String? = nil
     /// Cleared only after the parent is painted (remainder / family reveal).
     var onJumpSettled: (() -> Void)? = nil
+    /// Bumped by the screen on each send from its composer: the reader's own
+    /// message is followed even from older history (Signal).
+    var ownSendRevision: UInt64? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -2503,11 +2506,18 @@ struct SNMsgList: View {
                         tailID: msgs.last?.id,
                         isNearBottom: isNearBottom,
                         userScrolling: isUserScrolling,
-                        isPrepending: isLoadingOlder
+                        isPrepending: isLoadingOlder,
+                        now: ProcessInfo.processInfo.systemUptime
                     )
                     // Hydration is not a new message: absorb it instantly so a
                     // folded chat never visibly chases its late local rows.
                     followTail(action, proxy: proxy, animateAppends: feedCaughtUp)
+                }
+                .onChange(of: ownSendRevision) { _ in
+                    // Either order with the echo's row change in this update:
+                    // the latch follows the echo already landed, or the next.
+                    let action = tailPin.ownSendRequested(at: ProcessInfo.processInfo.systemUptime)
+                    followTail(action, proxy: proxy, animateAppends: true)
                 }
                 .onChange(of: feedCaughtUp) { caughtUp in
                     guard caughtUp else { return }

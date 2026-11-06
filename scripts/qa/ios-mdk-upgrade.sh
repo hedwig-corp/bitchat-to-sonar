@@ -147,11 +147,7 @@ has 'mdk08.bak' "$store" \
   && pass QA-195 "v1 store quarantined as *.mdk08.bak" || fail QA-195 "no *.mdk08.bak in the App Group"
 
 swipes="$(printf 'swipedown;%.0s' $(seq 1 30))"
-back_down="$(printf 'swipeup;%.0s' $(seq 1 30))"
-# Page to message 1, then back to the newest rows the way a reader would: on
-# iOS a send made while the view sits in old history does not scroll to it
-# (tracked gap, see QA-SCENARIOS "Known gaps").
-drive open-p "activate;tapc:p v1 $RUN $SEED_N/$SEED_N;expect:p v1 $RUN $SEED_N/$SEED_N@20;${swipes}expect:p v1 $RUN 1/$SEED_N@20;expect:👍@15;${back_down}expect:p v1 $RUN $SEED_N/$SEED_N@20" \
+drive open-p "activate;tapc:p v1 $RUN $SEED_N/$SEED_N;expect:p v1 $RUN $SEED_N/$SEED_N@20;${swipes}expect:p v1 $RUN 1/$SEED_N@20;expect:👍@15" \
   && pass QA-191 "the v1 history and its 👍 chip are in the chat" \
   || fail QA-191 "v1 history or the v1 👍 chip missing"
 # No expect on the typed text: a send that cannot reach a v1 peer drops its
@@ -162,7 +158,12 @@ drive wait-v1 "$(type_send "waiting $RUN");expect:Waiting for them to update@40"
 
 "$M" upgrade-peer "$P" >/dev/null 2>&1
 sleep 15  # the peer's v2 KeyPackage must reach the relays (see android-mdk-upgrade.sh)
-drive send-v2 "$(type_send "resumed $RUN");expect:resumed $RUN@20"
+# QA-213: send from older history; the view must follow the reader's message
+# with no manual scroll (Signal). The view is back near message 1 first.
+up="$(printf 'swipedown;%.0s' $(seq 1 15))"
+drive send-v2 "activate;${up}$(type_send "resumed $RUN" | sed 's/^activate;//');expect:resumed $RUN@20" \
+  && pass QA-213 "a send from older history scrolls into view" \
+  || fail QA-213 "the send from older history stayed off-screen"
 if "$M" expect "$P" "resumed $RUN" 180 >/dev/null 2>&1; then
   pass QA-192 "after the peer updated, the app's send reached it on v2"
 else

@@ -13319,6 +13319,20 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun String.trimCommandSubject(): String =
         trim().removePrefix("@").trim()
 
+    /** The reader's latest send from a composer. The open transcript scrolls
+     *  to it even from older history, as Signal does; incoming rows there
+     *  leave the view alone. */
+    data class OwnSend(val chatId: String, val seq: Long)
+
+    var lastOwnSend by mutableStateOf<OwnSend?>(null)
+        private set
+    private var ownSendSeq = 0L
+
+    private fun noteOwnSend(chatId: String) {
+        ownSendSeq += 1
+        lastOwnSend = OwnSend(chatId, ownSendSeq)
+    }
+
     fun send(chatId: String, text: String) {
         val t = text.trim()
         if (t.isEmpty()) return
@@ -13326,6 +13340,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this contact before sending."
             return
         }
+        noteOwnSend(chatId)
         val reply = consumeComposerReply(chatId)
         if (isMeshChat(chatId)) {
             sendDmAuto(meshPeerId(chatId), t, reply)
@@ -14875,6 +14890,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun sendVoiceNote(chatId: String, bytes: ByteArray) {
         if (marmotAccountMutationSuspended) return
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
+        noteOwnSend(chatId)
         // ~98k values out of a seeded PRNG collide by birthday after a few
         // hundred sends, and this name travels with the attachment.
         val filename = "vn-${secureRandomHex(6)}.m4a"
@@ -14978,6 +14994,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun sendStickerItem(chatId: String, sticker: SonarStickerItem, packCoordinate: String) {
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
+        noteOwnSend(chatId)
         val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
         reloadNewestAfterSendIfNeeded(chatId)
         if (isMeshChat(chatId)) {

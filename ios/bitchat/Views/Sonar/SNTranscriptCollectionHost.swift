@@ -101,6 +101,9 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     /// mention roster fingerprint, reply, transport, peer title). Unrelated
     /// store updates then leave the active keyboard hierarchy untouched.
     var composerVersion: UInt64? = nil
+    /// Bumped by the screen on each send from its composer: the reader's own
+    /// message is scrolled into view even from older history (Signal).
+    var ownSendRevision: UInt64? = nil
     @ViewBuilder var composer: () -> Composer
 
     /// Compatibility: kill-switch / Mac SwiftUI host still takes a bare array.
@@ -136,6 +139,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             jumpMessageId: jumpMessageId,
             onJumpSettled: onJumpSettled,
             composerVersion: composerVersion,
+            ownSendRevision: ownSendRevision,
             composer: composer
         )
         .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -163,6 +167,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             onJumpSettled: onJumpSettled,
+            ownSendRevision: ownSendRevision,
             composer: composer
         )
         #endif
@@ -198,6 +203,7 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
     var familyHasOlder: Bool = false
     var jumpMessageId: String? = nil
     var onJumpSettled: (() -> Void)? = nil
+    var ownSendRevision: UInt64? = nil
     @ViewBuilder var composer: () -> Composer
 
     @State private var chromeHeight: CGFloat = 56
@@ -226,7 +232,8 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
                 expectedNewestDate: expectedNewestDate,
                 familyHasOlder: familyHasOlder,
                 jumpMessageId: jumpMessageId,
-                onJumpSettled: onJumpSettled
+                onJumpSettled: onJumpSettled,
+                ownSendRevision: ownSendRevision
             )
             .padding(.bottom, chromeHeight)
 

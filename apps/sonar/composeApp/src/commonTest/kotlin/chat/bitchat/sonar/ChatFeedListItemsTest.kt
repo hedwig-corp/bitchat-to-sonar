@@ -155,4 +155,18 @@ class ChatFeedListItemsTest {
         // or a prepend within the same day would not change it.
         assertEquals("", transcriptTopTriggerKey(emptyList()))
     }
+
+    /** Signal scrolls to the reader's own send even from older history: a new
+     *  send for the open chat follows, the one already seen and another chat's
+     *  do not (found by the MDK upgrade walk on both apps). */
+    @Test
+    fun ownSendFollowsOnlyANewSendInTheOpenChat() {
+        val first = SonarAppState.OwnSend("marmot:abc", 1)
+        val next = SonarAppState.OwnSend("marmot:abc", 2)
+        val other = SonarAppState.OwnSend("marmot:def", 3)
+        assertTrue(ownSendShouldFollow(next, seen = first, openChatId = "marmot:abc"))
+        assertEquals(false, ownSendShouldFollow(first, seen = first, openChatId = "marmot:abc"))
+        assertEquals(false, ownSendShouldFollow(other, seen = first, openChatId = "marmot:abc"))
+        assertEquals(false, ownSendShouldFollow(null, seen = null, openChatId = "marmot:abc"))
+    }
 }
