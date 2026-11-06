@@ -1,6 +1,6 @@
 //! Fixtures come from `tests/fixtures/generate.py`: real encoder output (Pillow,
-//! `sips`) carrying Exif with GPS, XMP, IPTC, comments, text chunks, MPF and
-//! trailers, every text field marked `LEAK`.
+//! libavif, `sips`) carrying Exif with GPS, XMP, IPTC, comments, text chunks,
+//! MPF and trailers, every text field marked `LEAK`.
 
 use std::io::Cursor;
 
@@ -16,7 +16,9 @@ const WEBP: &[u8] = include_bytes!("fixtures/located.webp");
 const ANIMATED_WEBP: &[u8] = include_bytes!("fixtures/located-animated.webp");
 const TIFF: &[u8] = include_bytes!("fixtures/located.tiff");
 const HEIC: &[u8] = include_bytes!("fixtures/located.heic");
+const AVIF: &[u8] = include_bytes!("fixtures/located.avif");
 
+/// Rewritten without the chunks, segments and blocks decoders do not need.
 const IN_PLACE: [(&str, &[u8]); 6] = [
     ("jpeg", JPEG),
     ("png", PNG),
@@ -25,6 +27,13 @@ const IN_PLACE: [(&str, &[u8]); 6] = [
     ("webp", WEBP),
     ("animated webp", ANIMATED_WEBP),
 ];
+
+/// Cleaned by zeroing: the same length, so every `iloc` offset still holds.
+const ZEROED: [(&str, &[u8]); 2] = [("heic", HEIC), ("avif", AVIF)];
+
+fn cleaned_in_place() -> impl Iterator<Item = (&'static str, &'static [u8])> {
+    IN_PLACE.into_iter().chain(ZEROED)
+}
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
@@ -39,10 +48,7 @@ fn stripped(name: &str, data: &[u8]) -> Vec<u8> {
 
 #[test]
 fn fixtures_carry_metadata_to_strip() {
-    for (name, data) in IN_PLACE
-        .iter()
-        .chain([("tiff", TIFF), ("heic", HEIC)].iter())
-    {
+    for (name, data) in cleaned_in_place().chain([("tiff", TIFF)]) {
         assert!(contains(data, b"LEAK"), "{name}: fixture lost its metadata");
     }
 }
@@ -57,9 +63,70 @@ fn nothing_marked_survives() {
     }
 }
 
+/// Top-level boxes of an ISO-BMFF file: type and byte range.
+fn top_level_boxes(data: &[u8]) -> Vec<([u8; 4], std::ops::Range<usize>)> {
+    let mut boxes = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let mut size = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        if size == 1 {
+            // `sips` writes mdat with a 64-bit size.
+            size = u64::from_be_bytes(data[pos + 8..pos + 16].try_into().unwrap()) as usize;
+        }
+        assert!(size >= 8, "{pos}: box size {size}");
+        boxes.push((data[pos + 4..pos + 8].try_into().unwrap(), pos..pos + size));
+        pos += size;
+    }
+    boxes
+}
+
+/// TIFF header offset 6, `Exif\0\0`, then IFD0 with Orientation 6 alone.
+const ORIENTATION_EXIF: &[u8] = b"\0\0\0\x06Exif\0\0MM\0*\0\0\0\x08\0\x01\
+    \x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0";
+/// The same with an empty IFD0: libavif moves the Orientation into `irot`
+/// and drops the tag, so the AVIF's Exif has none to keep.
+const EMPTY_EXIF: &[u8] = b"\0\0\0\x06Exif\0\0MM\0*\0\0\0\x08\0\0\0\0\0\0";
+
+#[test]
+fn heif_and_avif_are_zeroed_in_place() {
+    for ((name, data), (format, minimal_exif)) in ZEROED.into_iter().zip([
+        (ImageFormat::Heif, ORIENTATION_EXIF),
+        (ImageFormat::Avif, EMPTY_EXIF),
+    ]) {
+        let out = stripped(name, data);
+        assert!(!contains(&out, b"LEAK"), "{name}: metadata survived");
+        assert!(!contains(&out, b"xmpmeta"), "{name}: XMP survived");
+        assert_eq!(out.len(), data.len(), "{name}: a byte moved");
+        assert_eq!(sniff_image(&out), Some(format), "{name}");
+        // The Exif item now holds a TIFF header and the Orientation alone:
+        // libavif rejects a file whose Exif item has no TIFF header.
+        let exif = (0..out.len() - 10)
+            .find(|&at| &out[at..at + 10] == b"Exif\0\0MM\0*")
+            .expect("an Exif item")
+            - 4;
+        let exif = exif..exif + minimal_exif.len();
+        assert_eq!(&out[exif.clone()], minimal_exif, "{name}");
+        // Every other byte is the original or zero, and only mdat changed:
+        // ftyp and meta — the item list, every iloc offset, irot and colr —
+        // are untouched.
+        for (at, (&o, &d)) in out.iter().zip(data).enumerate() {
+            let rewritten = !exif.contains(&at) && o != d && o != 0;
+            assert!(!rewritten, "{name}: byte {at} rewritten");
+        }
+        let boxes = top_level_boxes(data);
+        assert_eq!(top_level_boxes(&out), boxes, "{name}: box layout changed");
+        for (kind, range) in boxes {
+            if &kind != b"mdat" {
+                assert_eq!(out[range.clone()], data[range], "{name}: {kind:?} changed");
+            }
+        }
+        assert!(contains(&out, b"irot"), "{name}: orientation dropped");
+    }
+}
+
 #[test]
 fn scrubbing_twice_finds_nothing_more() {
-    for (name, data) in IN_PLACE {
+    for (name, data) in cleaned_in_place() {
         assert_eq!(
             scrub_image(&stripped(name, data)),
             ImageScrub::Clean,
@@ -160,8 +227,6 @@ fn png_and_webp_drop_their_exif_containers() {
 
 #[test]
 fn containers_we_cannot_rewrite_are_reencoded() {
-    assert_eq!(sniff_image(HEIC), Some(ImageFormat::Heif));
-    assert_eq!(scrub_image(HEIC), ImageScrub::Reencode);
     assert_eq!(sniff_image(TIFF), Some(ImageFormat::Tiff));
     assert_eq!(scrub_image(TIFF), ImageScrub::Reencode);
     assert_eq!(image_orientation(TIFF), 6);
@@ -171,7 +236,7 @@ fn containers_we_cannot_rewrite_are_reencoded() {
 /// result that still carries metadata.
 #[test]
 fn every_truncation_is_safe() {
-    for (name, data) in IN_PLACE {
+    for (name, data) in cleaned_in_place() {
         for len in 0..=data.len() {
             let prefix = &data[..len];
             match scrub_image(prefix) {
@@ -186,10 +251,7 @@ fn every_truncation_is_safe() {
 
 #[test]
 fn corrupt_bytes_never_panic() {
-    for (_, data) in IN_PLACE
-        .iter()
-        .chain([("tiff", TIFF), ("heic", HEIC)].iter())
-    {
+    for (_, data) in cleaned_in_place().chain([("tiff", TIFF)]) {
         let mut copy = data.to_vec();
         for at in 0..copy.len() {
             let original = copy[at];

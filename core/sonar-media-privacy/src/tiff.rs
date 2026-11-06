@@ -4,6 +4,25 @@
 const ORIENTATION: u16 = 0x0112;
 const SHORT: u16 = 3;
 
+/// A big-endian TIFF structure whose IFD0 holds `orientation` and nothing
+/// else: 26 bytes with an Orientation tag, 14 without.
+pub(crate) fn minimal(orientation: Option<u8>) -> Vec<u8> {
+    let mut tiff = b"MM\0*\0\0\0\x08".to_vec();
+    match orientation {
+        Some(value) => {
+            tiff.extend_from_slice(&[0, 1]);
+            tiff.extend_from_slice(&ORIENTATION.to_be_bytes());
+            tiff.extend_from_slice(&SHORT.to_be_bytes());
+            tiff.extend_from_slice(&1u32.to_be_bytes());
+            tiff.extend_from_slice(&[0, value, 0, 0]);
+        }
+        None => tiff.extend_from_slice(&[0, 0]),
+    }
+    // No next IFD.
+    tiff.extend_from_slice(&[0; 4]);
+    tiff
+}
+
 /// The IFD0 Orientation value (1–8), if present and well formed.
 pub(crate) fn orientation(tiff: &[u8]) -> Option<u8> {
     let little_endian = match tiff.get(..4)? {
@@ -90,6 +109,14 @@ mod tests {
         assert_eq!(orientation(&tiff(true, ORIENTATION, SHORT, 1, 0)), None);
         assert_eq!(orientation(&tiff(true, ORIENTATION, 4, 1, 6)), None);
         assert_eq!(orientation(&tiff(true, 0x010F, SHORT, 1, 6)), None);
+    }
+
+    #[test]
+    fn minimal_holds_only_the_orientation() {
+        assert_eq!(orientation(&minimal(Some(6))), Some(6));
+        assert_eq!(minimal(Some(6)).len(), 26);
+        assert_eq!(orientation(&minimal(None)), None);
+        assert_eq!(minimal(None).len(), 14);
     }
 
     #[test]

@@ -8,17 +8,20 @@
 //! send path.
 //!
 //! [`scrub_image`] rewrites the containers it can edit without decoding —
-//! JPEG, PNG (and APNG), GIF and WebP (still and animated) — keeping only what a
-//! decoder needs to draw the same picture: the coded image data, the colour
-//! profile and the orientation. The coded pixel data is copied byte for byte.
+//! JPEG, PNG (and APNG), GIF, WebP (still and animated), HEIF (HEIC) and AVIF —
+//! keeping only what a decoder needs to draw the same picture: the coded image
+//! data, the colour profile and the orientation. The coded pixel data is copied
+//! byte for byte. HEIF and AVIF are cleaned in place, by zeroing: an iPhone
+//! photo stays a HEIC of the same size.
 //!
 //! It never decodes and never guesses. A file it recognizes as an image but
-//! cannot rewrite (HEIF, AVIF, TIFF, JPEG XL) or cannot parse is
+//! cannot rewrite (TIFF, JPEG XL, HEIF image sequences) or cannot parse is
 //! [`ImageScrub::Reencode`]: the caller must decode it and encode a new file,
 //! the one way to be sure nothing survives. Images are recognized by their
 //! bytes, never by the file name or MIME type they arrived with.
 
 mod gif;
+mod heif;
 mod jpeg;
 mod png;
 mod tiff;
@@ -62,9 +65,8 @@ pub fn scrub_image(data: &[u8]) -> ImageScrub {
         ImageFormat::Png => png::scrub(data),
         ImageFormat::Gif => gif::scrub(data),
         ImageFormat::WebP => webp::scrub(data),
-        ImageFormat::Heif | ImageFormat::Avif | ImageFormat::Tiff | ImageFormat::JpegXl => {
-            return ImageScrub::Reencode
-        }
+        ImageFormat::Heif | ImageFormat::Avif => heif::scrub(data),
+        ImageFormat::Tiff | ImageFormat::JpegXl => return ImageScrub::Reencode,
     };
     match rewrite {
         Ok(None) => ImageScrub::Clean,
@@ -151,6 +153,11 @@ fn be16(data: &[u8], at: usize) -> Option<u16> {
 fn be32(data: &[u8], at: usize) -> Option<u32> {
     let b = data.get(at..at.checked_add(4)?)?;
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn be64(data: &[u8], at: usize) -> Option<u64> {
+    let b = data.get(at..at.checked_add(8)?)?;
+    Some(u64::from_be_bytes(b.try_into().ok()?))
 }
 
 fn le32(data: &[u8], at: usize) -> Option<u32> {

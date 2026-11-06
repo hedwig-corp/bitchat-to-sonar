@@ -163,10 +163,7 @@ fn minimal_exif(orientation: u8) -> [u8; 36] {
     let mut s = [0u8; 36];
     s[..4].copy_from_slice(&[0xFF, APP1, 0x00, 0x22]);
     s[4..10].copy_from_slice(EXIF);
-    s[10..18].copy_from_slice(b"MM\0*\0\0\0\x08");
-    s[18..20].copy_from_slice(&[0x00, 0x01]);
-    s[20..32].copy_from_slice(&[0x01, 0x12, 0x00, 0x03, 0, 0, 0, 1, 0, orientation, 0, 0]);
-    // Bytes 32..36 stay zero: no next IFD.
+    s[10..].copy_from_slice(&tiff::minimal(Some(orientation)));
     s
 }
 

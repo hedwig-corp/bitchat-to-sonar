@@ -132,10 +132,10 @@ pub enum ImageMetadataScrub {
     Clean,
     /// The image without its metadata: send these bytes instead.
     Stripped { data: Vec<u8> },
-    /// An image the core cannot rewrite in place (HEIF, AVIF, TIFF, JPEG XL)
-    /// or could not parse. Decode it and send a re-encoded JPEG, rotated per
-    /// [`image_exif_orientation`] when the decoder ignores EXIF orientation.
-    /// Never send the original bytes.
+    /// An image the core cannot rewrite in place (TIFF, JPEG XL, HEIF image
+    /// sequences) or could not parse. Decode it and send a re-encoded JPEG,
+    /// rotated per [`image_exif_orientation`] when the decoder ignores EXIF
+    /// orientation. Never send the original bytes.
     Reencode,
 }
 

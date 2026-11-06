@@ -3,9 +3,11 @@
 
     python3 -I core/sonar-media-privacy/tests/fixtures/generate.py
 
-Needs Pillow (with WebP) and, on macOS, `sips` for the HEIC fixture. Every
-piece of metadata a fixture carries contains the ASCII marker LEAK, so a test
-can assert that nothing of it survives with a plain substring search. GPS
+Needs Pillow 11.3+ (with WebP and AVIF) and, on macOS, `sips` for the HEIC
+fixture. Every piece of metadata a fixture carries contains the ASCII marker
+LEAK, so a test can assert that nothing of it survives with a plain substring
+search. The sRGB profile carries its creation time, so a rerun rewrites the
+JPEG, PNG and WebP fixtures with different bytes but the same content. GPS
 coordinates are numbers, not text: tests check those by asserting the Exif
 segment that remains is the minimal Orientation-only one.
 """
@@ -138,6 +140,8 @@ def main():
         ),
     )
     save("located.tiff", encode(frame(9), "TIFF", exif=exif()))
+    # libavif turns the Exif orientation into an `irot` property, as cameras do.
+    save("located.avif", encode(frame(10), "AVIF", quality=90, exif=exif(), xmp=XMP))
     if sys.platform == "darwin":
         jpg = os.path.join(HERE, "located.jpg")
         heic = os.path.join(HERE, "located.heic")
