@@ -686,6 +686,20 @@ func snRemountShouldPreserveOpenTranscriptRoute(
     return preserveIds.contains { snOpenedConversationIdMatches(routeId, $0) }
 }
 
+/// The top DM route the fold rewrote in place (v1 conversation id → live), or
+/// nil when the visible screen kept its id. Only the top route matters: it is
+/// the screen the NavigationStack updates without a disappear/appear pair.
+func snFoldHopOfVisibleDM(
+    previousTop: SonarRoute?,
+    nextTop: SonarRoute?
+) -> (historical: String, live: String)? {
+    guard case .dm(let historical)? = previousTop,
+          case .dm(let live)? = nextTop,
+          !historical.isEmpty, !live.isEmpty, historical != live
+    else { return nil }
+    return (historical, live)
+}
+
 /// Remount group-info / contact-profile / call / buried DM routes after
 /// FFI hides a folded 0.8 id.
 func snRemountFoldedPath(
@@ -13354,14 +13368,16 @@ final class SonarAppStore: ObservableObject {
 
     /// Rewrite group-info / contact-profile / call / buried DM routes after
     /// FFI hides a folded 0.8 id. Transcript remount still copies host state
-    /// when the open route is a DM.
-    private func remountFoldedNavigationPath(
+    /// when the open route is a DM. Internal so `FoldHopVisibleTranscriptTests`
+    /// drive this call site.
+    func remountFoldedNavigationPath(
         listedGroupIds: Set<String>,
         knownLiveTargets: [String: String] = [:],
         preserveIds: Set<String> = []
     ) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let remount = remountOpenedAndPane()
+        let previousTop = path.last
         let next = snRemountFoldedPath(
             path: path,
             listedGroupIds: listedGroupIds,
@@ -13378,6 +13394,9 @@ final class SonarAppStore: ObservableObject {
         )
         if next != path {
             path = next
+            if let hop = snFoldHopOfVisibleDM(previousTop: previousTop, nextTop: next.last) {
+                handOverFoldedVisibleTranscript(from: hop.historical, to: hop.live)
+            }
         }
         if let call = activeCall {
             let remounted = snRemountFoldedConversationId(
@@ -13536,6 +13555,33 @@ final class SonarAppStore: ObservableObject {
     private func handOverVisibleTranscript(from pendingId: String, to realId: String) {
         conversationViewStates[pendingId]?.deactivate()
         conversationViewState(realId).activate()
+    }
+
+    /// The fold rewrote the visible `.dm(v1)` route to `.dm(live)`. The
+    /// NavigationStack updates that screen in place (the R-038 shape above),
+    /// so neither `closedDM(v1)` nor `openedDM(live)` runs. Without this the
+    /// live transcript never followed the store — the peer's v2 replies stayed
+    /// invisible until the chat was reopened — and the open state stayed on
+    /// the v1 id, so after leaving, a tap on the row was taken as "already
+    /// open" and did nothing. The route replacement makes a late
+    /// `closedDM(v1)` a no-op and maps a late `openedDM(live)` onto the same
+    /// pair, so a lifecycle callback that does fire is harmless (R-062).
+    func handOverFoldedVisibleTranscript(from historicalId: String, to liveId: String) {
+        pendingMarmotRouteReplacement = SNMarmotRouteReplacement(
+            pendingId: historicalId,
+            realId: liveId
+        )
+        openedConversationId = liveId
+        openedConversationPaneId = historicalId
+        marmot.rememberRemountPair(
+            openedConversationId: liveId,
+            openedConversationPaneId: historicalId
+        )
+        handOverVisibleTranscript(from: historicalId, to: liveId)
+        if let groupId = marmotGroupId(liveId) {
+            markMarmotGroupsRead(matchingGroupId: groupId)
+        }
+        syncViewingUnreadGroups()
     }
 
     private func resolvePendingSecureChats() {
