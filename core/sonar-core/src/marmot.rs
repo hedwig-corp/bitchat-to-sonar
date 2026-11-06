@@ -108,6 +108,40 @@ pub struct HistoricalGroup {
     pub members: Vec<PublicKey>,
 }
 
+/// SQLCipher options for the MDK store. MDK v0.14 turns on
+/// `cipher_memory_security` (lock key and page memory in RAM with `mlock`).
+/// Android's mlock budget is tiny, so every lock fails and SQLCipher logs
+/// each failure: QA measured ~31k failed-mlock log lines per cold start and
+/// ~1M on the first launch after the v1 -> v2 upgrade, against ~35 on v1
+/// (QA-211). The locks never take effect there, so Android opts out; every
+/// other platform keeps MDK's default.
+fn sonar_storage_options() -> storage_sqlite::SqliteStorageOptions {
+    storage_sqlite::SqliteStorageOptions {
+        cipher_memory_security: !cfg!(target_os = "android"),
+        ..storage_sqlite::SqliteStorageOptions::default()
+    }
+}
+
+#[cfg(test)]
+mod storage_options_tests {
+    use super::*;
+
+    /// QA-211: Android opts out of SQLCipher memory security; everywhere else
+    /// MDK's default stands, so a later MDK default change is not masked.
+    #[test]
+    fn sqlcipher_memory_security_is_off_only_on_android() {
+        let ours = sonar_storage_options();
+        if cfg!(target_os = "android") {
+            assert!(!ours.cipher_memory_security);
+        } else {
+            assert_eq!(
+                ours.cipher_memory_security,
+                storage_sqlite::SqliteStorageOptions::default().cipher_memory_security
+            );
+        }
+    }
+}
+
 /// Documented encoding of the host's 32-byte SQLCipher key for MDK 0.9.
 /// MDK 0.9 applies the string via `PRAGMA key = '<passphrase>'`, not the 0.8
 /// raw-key form `PRAGMA key = "x'HEX'"`.
@@ -1098,6 +1132,7 @@ impl MarmotEngine {
         if defer_hydration {
             config = config.defer_group_hydration();
         }
+        config = config.storage_options(sonar_storage_options());
         let session = AccountDeviceSession::open(config)?;
         let parked = load_parked(db_path);
         let dropped = load_dropped(db_path);
