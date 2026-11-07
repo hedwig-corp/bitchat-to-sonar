@@ -7,13 +7,18 @@
 # SecureLogger, which only logs with `%{public}@` privacy (i.e. readable in the
 # unified log) in DEBUG builds. A Release build would render them as <private>.
 #
-# Signing is intentionally DISABLED. CLI builds of this app sign ad-hoc with
-# empty entitlements (the bundle id `sh.hedwig.sonar` belongs to the Hedwig team
-# and a local personal team can't provision it), so Keychain returns
-# errSecMissingEntitlement (-34018) regardless. The benchmark provisioning path
-# (SONAR_BENCH_NSEC) is therefore Keychain-INDEPENDENT: it adopts the env
-# identity directly and derives the encrypted-DB key from it. So the unsigned
-# build — which launches reliably on the simulator — is exactly what we want.
+# Signed for the simulator, the way scripts/qa/ios-setup.sh builds. Since #362
+# the Marmot store lives only in the App Group container, and the app refuses
+# to open it without one. An unsigned build has no App Group, so every bench
+# run stopped at "Marmot local open failed: App Group group.sh.hedwig.sonar
+# unavailable" before t1_local_paint and the KeyPackage was never published. A
+# simulator build needs no device provisioning; if Xcode still refuses to sign,
+# put your own DEVELOPMENT_TEAM in the gitignored ios/Configs/Local.xcconfig
+# (see .agents/skills/qa-run/SKILL.md).
+#
+# The benchmark path stays Keychain-INDEPENDENT (SONAR_BENCH_NSEC): it adopts
+# the env identity and derives the encrypted-DB key from it, so a keychain
+# entry an earlier launch left behind does not change which store opens.
 #
 # Prereq: run `core/build-ios.sh` first so SonarCore/Frameworks/sonarffi.xcframework
 # (incl. the ios-arm64-simulator slice) exists.
@@ -31,7 +36,7 @@ if [[ ! -d "$REPO_ROOT/ios/localPackages/SonarCore/Frameworks/sonarffi.xcframewo
   exit 1
 fi
 
-echo ">> Building \"$SCHEME\" (Debug, iphonesimulator, arm64, unsigned) → $DERIVED_DATA" >&2
+echo ">> Building \"$SCHEME\" (Debug, iphonesimulator, arm64, signed) → $DERIVED_DATA" >&2
 # arm64 ONLY: the Arti (libarti_bitchat.a) and sonarffi simulator slices are
 # arm64-only (Apple Silicon). 'generic/platform=iOS Simulator' would also try
 # the x86_64 slice and fail to link. Pin to arm64.
@@ -41,11 +46,10 @@ xcodebuild -skipPackagePluginValidation build \
   -configuration Debug \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "$DERIVED_DATA" \
+  -allowProvisioningUpdates \
   ARCHS=arm64 \
   ONLY_ACTIVE_ARCH=YES \
   EXCLUDED_ARCHS=x86_64 \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO \
   >&2
 
 APP_PATH="$DERIVED_DATA/Build/Products/Debug-iphonesimulator/Sonar.app"
