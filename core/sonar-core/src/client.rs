@@ -12298,8 +12298,11 @@ mod tests {
             .await
             .expect("register");
 
+        // Up to 60 s. Each publish in a batch waits up to 10 s for the relay's
+        // OK (nostr-relay-pool `WAIT_FOR_OK_TIMEOUT`), so on a loaded runner
+        // one late OK alone used up the old cap. Returns as soon as it is idle.
         let wait_idle = || async {
-            for _ in 0..200 {
+            for _ in 0..2400 {
                 if !alice.push_token_share_in_flight.load(Ordering::Acquire) {
                     return;
                 }
@@ -12353,8 +12356,12 @@ mod tests {
                 .merge_pending_commit(&creation.group.id)
                 .await.expect("merge");
         }
+        // Up to 60 s. Each of the 16 publishes waits up to 10 s for the relay's
+        // OK (nostr-relay-pool `WAIT_FOR_OK_TIMEOUT`), so on a loaded runner
+        // one late OK alone used up the old 10 s cap (100 ms on a quiet host).
+        // Returns as soon as the batch is idle.
         let wait_idle = || async {
-            for _ in 0..400 {
+            for _ in 0..2400 {
                 if !alice.push_token_share_in_flight.load(Ordering::Acquire) {
                     return;
                 }
