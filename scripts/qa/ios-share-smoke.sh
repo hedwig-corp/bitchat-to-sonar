@@ -199,6 +199,15 @@ launched_with_identity() { # launched_with_identity <pid>
     --predicate "processID == $1 AND eventMessage CONTAINS \"identity from env\"" 2>/dev/null |
     grep -q "identity from env"
 }
+# The store-open error the app logged, if any. The database key is derived
+# from the bench identity, so a store another identity left on this simulator
+# (a mdk-upgrade walk, an earlier onboarding) cannot be opened: the app then
+# never connects and never publishes a KeyPackage.
+store_open_error() { # store_open_error <pid>
+  xcrun simctl spawn "$UDID" log show --last 5m --info --style compact \
+    --predicate "processID == $1 AND eventMessage CONTAINS \"local open failed\"" 2>/dev/null |
+    sed -n 's/.*local open failed: //p' | tail -1
+}
 launch_sonar() { # launch_sonar <out dir>
   local out="$1" try pid
   mkdir -p "$out"
@@ -423,7 +432,16 @@ for _ in $(seq 1 12); do
       --group-name "Share QA $PEER" 2>/dev/null | grep -q '"type"'; then sent=1; break; fi
   sleep 10
 done
-(( sent )) || { echo "bootstrap failed: the app's KeyPackage never reached the relays" >&2; exit 1; }
+if (( ! sent )); then
+  open_err="$(store_open_error "$(sonar_pid)")"
+  if [[ -n "$open_err" ]]; then
+    echo "bootstrap failed: the app could not open its Marmot store ($open_err)." >&2
+    echo "   This simulator holds another identity's store; rerun scripts/qa/ios-setup.sh --fresh." >&2
+  else
+    echo "bootstrap failed: the app's KeyPackage never reached the relays" >&2
+  fi
+  exit 1
+fi
 drive "$RUN/bootstrap" "activate@sonar;expect:$HELLO@120;tree:home;shot:home" ||
   { echo "bootstrap failed: the app never showed the peer's chat" >&2; exit 1; }
 CHAT_ROW="$(python3 - "$RUN/bootstrap/home.txt" "$HELLO" <<'ROW_PY'
