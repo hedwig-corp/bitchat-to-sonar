@@ -732,6 +732,51 @@ chat above 80 messages (the first-paint extract window) and one image.
   expiring after 5 s so a failed send cannot yank a later incoming message),
   and Compose scrolls to the tail on `SonarAppState.lastOwnSend`.
 
+### QA-214 — A received photo keeps its shape
+- **Platforms:** both (Android: `android-smoke.sh` QA-106 sends a 320×180
+  photo and checks the bubble; iOS: the same photo from `scripts/qa/peers.sh
+  send-image`, then a `tree` dump of the chat)
+- **Steps:** a peer sends a landscape photo; open the chat.
+- **Expect:** the bubble has the photo's aspect ratio (16:9 here) from first
+  paint, before the blob is downloaded; no grey bars above and below.
+- **Guard:** `media.rs::media_sends_over_white_noise_end_to_end` (the
+  receiver's media reference carries the sender's size; fails without the
+  fix), `media_dimensions::tests` (PNG, GIF, WebP, JPEG + EXIF orientation,
+  truncated input)
+- **Origin:** the stability round on the MDK v0.14 bump (QA-106 failed "no 😮
+  chip under the photo"): the photo was drawn letterboxed in the app's largest
+  media box, 660 px tall for a 320×180 image. MDK 0.8 filled the MIP-04 `dim`
+  field by decoding the image; the v2 port encrypted without it, so every
+  photo Sonar sent arrived without a size and both apps fell back to the max
+  box. `media_crypto::encrypt_with_scheme` now reads the size from the image
+  header (`media_dimensions.rs`, no decode). `blurhash` stays out: MIP-04 v2
+  rejects it.
+
+### QA-215 — A burst of mesh messages to one peer all arrive
+- **Platforms:** both (mesh). iOS sender: `BLEService`; Android/desktop
+  sender: the Rust engine.
+- **Steps:** with two phones in range, send several private messages (or
+  public channel messages) in quick succession, or while the Noise handshake
+  is still running so they queue and flush together.
+- **Expect:** every message arrives, once, in order.
+- **Guard:** `BLEServicePrivateMediaTests.backToBackSendsToOnePeerNeverShareATimestamp`
+  (20 back-to-back sends leave with distinct timestamps),
+  `mesh_engine::tests::two_broadcasts_in_one_tick_both_arrive` (two-engine:
+  both arrive; only the first without the fix), `wire_timestamps_never_repeat`.
+- **Origin:** the stability round on the MDK v0.14 bump, chasing a flake in
+  `handshakeProvesCapabilitiesAndMediaGoesEncrypted` (main's version failed by
+  its 3rd of 25 repeats). Receivers drop a repeat of
+  `<sender>-<timestamp>-<type>` (iOS, both reference clients; the Rust engine
+  keys public messages on sender + timestamp), and both Sonar senders stamped
+  packets from the clock: every packet built in the same millisecond (iOS) or
+  the same driver tick (Rust) shared a timestamp, and all but the first were
+  dropped. The test's own peer hit it with its capability proof and file;
+  the apps hit it flushing payloads queued during a handshake and sending
+  bursts. Senders now keep their timestamps strictly increasing
+  (`PacketSendClock`, `Engine::wall`; `core/bitchat-protocol/SPEC.md` §1).
+  **Not guarded:** stock bitchat clients still stamp from the clock; a burst
+  they send can still lose packets at any receiver.
+
 ### QA-212 — A v1 chat that folds while it is open keeps following
 - **Platforms:** iOS (headless: `ios-drive.sh` + `mdk-upgrade.sh`), Android
   (`android-mdk-upgrade.sh`, QA-192b)
@@ -1089,6 +1134,18 @@ unread. See `docs/CHAT-TYPES.md`.
   iOS had the same two gaps (the Message/Call/Pay/Verify circles and the
   placeholder-only search field); the 2026-09-27 sweep of all of the above,
   reaction chips included, is clean.
+- **Clipped rows (2026-11-07, MDK v0.14 stability round):** the chat sweep
+  failed intermittently with one NAF `View` at the list's bottom edge: the
+  transcript row (the node with the long-press menu and Reply/Copy actions)
+  had no label of its own and borrowed its bubble's, so when the list clipped
+  the bubble off-screen and a sliver of the row stayed visible, TalkBack met
+  an actionable node with nothing to read. Compose rows now carry their own
+  label (author, message or kind, time, delivery state), as iOS's
+  `SNTextBubbleCell` already did. Reproduce: a chat longer than the screen,
+  `android-ui.sh swipe 540 1100 540 1290` a step at a time, `naf` after each.
+  Guard: `MessageRowLabelUiTest` (fails without the label). The harness's
+  `find`/`boundst` now return the innermost match, since a row's label repeats
+  its bubble's text.
 - **Also:** every settings toggle is a switch that reports its state
   (uiautomator `checkable="true"` and `checked` match the switch; VoiceOver
   reads "On"/"Off"). `android-smoke.sh` QA-043 checks "Share local time" is a

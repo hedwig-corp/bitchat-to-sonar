@@ -4,8 +4,10 @@
 # docs/QA-SCENARIOS.md; add one here whenever a QA pass finds a bug that can
 # be driven headlessly (the registry says which ones are automated).
 #
-#   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003] [--max-idle-cpu 3]
-#   (set QA_APP_NPUB to run a scenario that needs the app's npub with --only)
+#   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003[,QA-043,…]] [--max-idle-cpu 3]
+#   (--only takes a comma list; scenarios still run in the default order, so
+#   --only QA-001,QA-043 builds QA-001's chat before QA-043 sweeps it. Set
+#   QA_APP_NPUB to run a scenario that needs the app's npub on its own.)
 #   QA_ALLOW_WIPE=1 also runs QA-118, which CLEARS the app's data: throwaway
 #   emulators only, never a device or an emulator holding an account you need.
 #   On API 34+ images turn stylus handwriting off first
@@ -49,7 +51,7 @@ record() { # id status detail
   [[ "$2" == FAIL ]] && FAILED=$((FAILED + 1))
   return 0
 }
-want() { [[ -z "$ONLY" || "$ONLY" == "$1" ]]; }
+want() { [[ -z "$ONLY" || ",$ONLY," == *",$1,"* ]]; }
 ui() { "$UI" "$@" >/dev/null 2>&1; }
 has() { [[ -n "$("$UI" find "$1" 2>/dev/null)" ]]; }
 hasx() { [[ -n "$("$UI" findx "$1" 2>/dev/null)" ]]; }
@@ -356,7 +358,7 @@ qa102() { # counts across senders; tapping my own chip sends nothing
 
 qa106() { # long-press a photo → reaction row; chip under the photo (#603 A5)
   [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-106 SKIP "needs QA-001"; return; }
-  local img="$QA_HOME/qa106-$RUN.png" id xy py cy t
+  local img="$QA_HOME/qa106-$RUN.png" id xy py cy t px1 py1 px2 py2
   python3 - "$img" <<'PNG'
 import struct, sys, zlib
 w, h = 320, 180
@@ -370,13 +372,24 @@ PNG
   xy="$("$UI" findx "Photo" 2>/dev/null)" || true
   [[ -n "$xy" ]] || { record QA-106 FAIL "the photo never showed (no node labelled Photo)"; return; }
   sleep 2
+  # QA-214: the bubble keeps the photo's 16:9 shape. Without the sender's
+  # MIP-04 `dim` the app letterboxes it in its largest (taller-than-wide) box.
+  local pb; pb="$("$UI" bounds "Photo" 2>/dev/null)" || true
+  read -r px1 py1 px2 py2 <<<"$pb"
+  [[ -n "${py2:-}" ]] && python3 -c "import sys; w,h=$((px2 - px1)),$((py2 - py1)); sys.exit(0 if h > 0 and 1.5 <= w/h <= 2.1 else 1)" || {
+    record QA-106 FAIL "QA-214: the 320x180 photo is drawn ${pb:-?} (not 16:9; sent without its size?)"; return; }
   ui longpress $xy
   "$UI" wait "Reply" 5 >/dev/null || { record QA-106 FAIL "long-press on the photo opened no menu (it opened the viewer?)"; ui key 4; return; }
   hasx "😮" || { record QA-106 FAIL "the photo's menu has no reaction row"; ui key 4; return; }
   ui tapx "😮"
   sleep 2
+  # Under the photo: below its centre and within 200 px of its bottom edge
+  # (bounds re-read, since the reaction can move the transcript).
+  pb="$("$UI" bounds "Photo" 2>/dev/null)" || true
+  read -r px1 py1 px2 py2 <<<"$pb"
   py="${xy#* }"; cy="$("$UI" findx "😮" 2>/dev/null | awk '{print $2}')"
-  [[ -n "$cy" ]] && (( cy > py && cy < py + 400 )) || { record QA-106 FAIL "no 😮 chip under the photo"; return; }
+  [[ -n "$cy" && -n "${py2:-}" ]] && (( cy > (py1 + py2) / 2 && cy < py2 + 200 )) ||
+    { record QA-106 FAIL "no 😮 chip under the photo (photo ${pb:-?}, chip y=${cy:-none})"; return; }
   id="$("$PEERS" id-of-media "a-$RUN")" || { record QA-106 FAIL "peer has no media message"; return; }
   if "$PEERS" expect-reaction "a-$RUN" "😮" 60 "$id" >/dev/null 2>&1; then
     record QA-106 PASS "photo long-press opened the menu; chip under the photo; peer got 😮"
