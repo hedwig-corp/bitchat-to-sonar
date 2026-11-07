@@ -242,6 +242,30 @@ Marmot group · live relays · `woke=1` every run:
 
 (`t1→t2` is effectively zero here — see findings.)
 
+### MDK v0.14 bump A/B (2026-11-07, PR #683)
+
+`provision-and-bench.sh --runs 5 --msgs-per-run 3`, one dedicated simulator
+(iOS 26.5), `main` (`fdf091cbb`, MDK 0.8) and the branch run back to back,
+5 runs each, all `woke=1`; medians in ms:
+
+| phase | main | branch, passphrase key | branch, final |
+|---|---|---|---|
+| launch → t0 | 488 | 491 | 489 |
+| **t0 → t1 (open DB + local paint)** | **202** | **300** | **211** |
+| t1 → t2 | 249 | 153 | 242 |
+| t2 → t3 | 130 | 228 | 135 |
+| t3 → t4 | 9 | 9 | 8 |
+| **launch → t4** | **1079** | **1181** | **1086** |
+
+The middle column is the first v0.14 build: its store was keyed with a
+passphrase, so SQLCipher ran PBKDF2 on every open, +88 ms on first paint. The
+store now uses a raw key derived from the host key (`marmot.rs::store_raw_key`);
+branch and main overlap (1083–1094 against 1069–1092 ms). Both runs also have
+SQLCipher memory security off (`sonar_storage_options`): left on, it made group
+creation ~3× slower in release (`sonar-sim group-scale`). The `main` column
+is the run paired with the final branch; the run paired with the middle
+column, 35 minutes earlier, measured t0 → t1 212 ms and launch → t4 1092 ms.
+
 ## Device result (real account — the real pain point)
 
 Median of 4–5 cold starts · iPhone 14 Pro Max · **real account with 24 Marmot
