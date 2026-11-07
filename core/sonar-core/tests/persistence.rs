@@ -2415,6 +2415,112 @@ async fn mdk08_first_paint_defers_older_rows_until_remainder() {
     assert!(!engine.has_pending_mdk08_remainder());
 }
 
+/// A real MDK 0.8 SQLCipher store with one DM of `total` text rows from `peer`.
+fn write_mdk08_dm_store(
+    db_path: &std::path::Path,
+    group_id: &[u8],
+    peer: &Identity,
+    total: usize,
+) {
+    let conn = rusqlite::Connection::open(db_path).expect("open 0.8 file");
+    let hex_key = DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE groups (
+            mls_group_id BLOB PRIMARY KEY,
+            nostr_group_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );",
+    )
+    .expect("0.8 schema");
+    conn.execute(
+        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+         VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
+        rusqlite::params![group_id.to_vec(), vec![0x22u8; 32]],
+    )
+    .expect("group row");
+    for i in 0..total {
+        let mut id = [0u8; 32];
+        id[0] = (i / 256) as u8;
+        id[1] = (i % 256) as u8;
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed')",
+            rusqlite::params![
+                group_id.to_vec(),
+                id.to_vec(),
+                peer.public_key().to_bytes().to_vec(),
+                1_700_000_000 + i as i64,
+                format!("row-{i}"),
+            ],
+        )
+        .expect("chat row");
+    }
+}
+
+/// QA-191 on iOS. The idle remainder drain used to take the pending remainder
+/// out of its slot while it copied rows, so a scroll-up page read in that
+/// window saw "nothing pending", came back short, and the host stopped paging:
+/// the oldest messages never appeared. A page read racing the drain must wait
+/// for it and still get a full page.
+#[test]
+fn a_page_read_racing_the_remainder_drain_still_gets_a_full_page() {
+    for round in 0..20 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let group_id = vec![0x11u8; 16];
+        write_mdk08_dm_store(&db_path, &group_id, &Identity::generate(), 530);
+        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
+            .expect("0.8 store must migrate");
+        assert!(engine.has_pending_mdk08_remainder());
+        let gid = sonar_core::GroupId::new(group_id);
+        let window = engine.messages_page(&gid, 80, 0).expect("first-paint window");
+        let oldest = window.last().expect("oldest first-paint row").clone();
+
+        let start = std::sync::Barrier::new(2);
+        let page = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                let _ = engine.ensure_mdk08_remainder();
+            });
+            start.wait();
+            engine
+                .messages_cursor_page(
+                    &gid,
+                    Some(oldest.created_at.as_secs()),
+                    Some(&oldest.id),
+                    10,
+                )
+                .expect("scroll-up page")
+        });
+        assert_eq!(
+            page.len(),
+            10,
+            "round {round}: a page read racing the remainder drain came back short"
+        );
+    }
+}
+
 /// Leave/delete clears the transcript but leaves `*.mdk08.bak` intact. A later
 /// remainder tick (idle sync or `messages()` on any other chat) must not copy
 /// those rows back onto a dropped group.

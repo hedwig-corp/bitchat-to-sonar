@@ -3517,6 +3517,43 @@ check and only reproduced the stall under heavy host load.
 - *Waiting longer (more frames) before reading the list.* Still a race on a
   slower device; the key-based trigger does not depend on the restore at all.
 
+## R-064 — A page read racing the 0.8 remainder drain must not end paging
+
+**Invariant:** while leftover 0.8 rows are still being copied out of
+`*.mdk08.bak`, a scroll-up page read waits for the copy and returns a full
+page; "no remainder pending" is reported only once the bak is exhausted.
+
+**Breaks as:** right after the v1 → v2 upgrade, scrolling up a long recovered
+chat stops at the oldest migrated row (row 7 of 85); the rows only in the bak
+never appear. Intermittent: it happens when the idle drain is mid-copy as the
+reader reaches the top (1 of 6 iOS walk runs). Platform-independent (core).
+
+**Why:** `ensure_mdk08_remainder_budget` took the pending remainder out of its
+slot (`slot.take()`) for the whole extraction. A concurrent
+`messages_cursor_page` saw `has_pending_mdk08_remainder() == false`, skipped
+the fill and returned a short page; the host then set "nothing older" and
+stopped asking, and the drained rows landed below a window it no longer paged.
+
+**Core call site:** `MarmotEngine::ensure_mdk08_remainder_budget` now holds
+`mdk08_remainder_extract` for the whole extraction and reads the pending
+remainder without taking it (cleared only when the bak is exhausted).
+
+**Hosts:** not applicable — both page through `messages_cursor_page`.
+
+**Guarded by:** `persistence.rs::a_page_read_racing_the_remainder_drain_still_gets_a_full_page`
+(fails on the first round without the fix)
+
+**Not guarded:** a host that sets "nothing older" from a short page for any
+other reason; the walks (`ios-mdk-upgrade.sh`, `android-mdk-upgrade.sh`
+QA-191) page an 85-row chat right after the upgrade.
+
+**History:** #613 QA A1 and R-063 fixed two other causes of the same
+symptom (a host re-arming an exhausted source; Compose's at-top trigger).
+
+**Rejected:**
+- *Waiting for the idle drain to finish before first paint.* Puts the bak
+  copy on the open path (Signal-Comparable Performance Rule).
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**

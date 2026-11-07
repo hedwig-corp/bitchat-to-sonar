@@ -600,13 +600,16 @@ chat above 80 messages (the first-paint extract window) and one image.
   scroll to the top.
 - **Expect:** reaches message 1 and its 👍, including the rows only in the bak.
 - **Guard:** `TranscriptDisplayPolicyTest.exhaustedSourceDoesNotDemandAnotherExpansion`,
-  `ChatFeedListItemsTest.topTriggerKeyChangesOnlyWhenOlderRowsArePrepended` (R-063)
+  `ChatFeedListItemsTest.topTriggerKeyChangesOnlyWhenOlderRowsArePrepended` (R-063),
+  `persistence.rs::a_page_read_racing_the_remainder_drain_still_gets_a_full_page` (R-064)
 - **Origin:** A1 (#613) — every Compose chat stopped after one older page.
   Then on the MDK v0.14 bump (R-063): on a loaded emulator paging stopped
   after the first older page again, stuck at row 27–33 of 85 for minutes,
   while a quiet run paged to the top. The load-older trigger fired on an
   at-top flag that never turned false when the anchor restore read a stale
-  item list. Not migration-specific: any chat on a slow device.
+  item list. Not migration-specific: any chat on a slow device. Then on iOS
+  (1 of 6 walk runs) the page stopped at row 7 when it raced the idle bak
+  drain, which hid the pending remainder while copying (R-064, core).
 
 ### QA-192 — Send in a recovered chat once the peer updated
 - **Platforms:** Android (UI); iOS covered by core e2e (no headless send)

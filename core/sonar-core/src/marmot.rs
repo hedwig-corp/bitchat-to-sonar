@@ -967,6 +967,11 @@ pub struct MarmotEngine {
     historical_folds: Mutex<HashMap<GroupId, GroupId>>,
     /// Leftover 0.8 rows still in `*.mdk08.bak` after the first-paint window.
     pending_mdk08: Mutex<Option<crate::mdk08_migrate::PendingMdk08Remainder>>,
+    /// Serializes remainder extractions (idle drain, page fills). The pending
+    /// remainder stays in `pending_mdk08` while one runs, so a page read that
+    /// races the idle drain waits for it instead of reading "nothing pending"
+    /// and telling the host its history is complete (QA-191 on iOS).
+    mdk08_remainder_extract: Mutex<()>,
     /// MIP-04 exporter secrets copied from the 0.8 `group_exporter_secrets`
     /// table (`encrypted-media` label). Used only to decrypt recovered blobs.
     historical_media_secrets: Mutex<HashMap<GroupId, Vec<Vec<u8>>>>,
@@ -1180,6 +1185,7 @@ impl MarmotEngine {
             ),
             historical_folds: Mutex::new(historical_folds),
             pending_mdk08: Mutex::new(pending_mdk08),
+            mdk08_remainder_extract: Mutex::new(()),
             historical_media_secrets: Mutex::new(historical_media_secrets),
             _tempdir: None,
         };
@@ -1219,12 +1225,20 @@ impl MarmotEngine {
         budget: usize,
         only_group: Option<&GroupId>,
     ) -> Result<()> {
+        // One extraction at a time. The pending remainder is read, not taken:
+        // while this runs, `has_pending_mdk08_remainder` stays true, so a
+        // concurrent page fill comes here and waits instead of returning a
+        // short page that ends the host's paging for good.
+        let _extracting = self
+            .mdk08_remainder_extract
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pending = {
-            let mut slot = self
+            let slot = self
                 .pending_mdk08
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            slot.take()
+            slot.clone()
         };
         let Some(pending) = pending else {
             return Ok(());
@@ -1251,33 +1265,21 @@ impl MarmotEngine {
             &omit_groups,
         ) {
             Ok(Some((extracted, more))) => {
-                if more {
-                    let mut slot = self
+                if !more {
+                    *self
                         .pending_mdk08
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(pending);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
                 extracted
             }
+            // The remainder stays pending on any failure.
             Ok(None) => {
-                let mut slot = self
-                    .pending_mdk08
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *slot = Some(pending);
                 return Err(Error::Storage(
                     "0.8 remainder bak unreadable; leftover rows kept pending".into(),
                 ));
             }
-            Err(err) => {
-                let mut slot = self
-                    .pending_mdk08
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *slot = Some(pending);
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
         {
             let mut transcript = self
