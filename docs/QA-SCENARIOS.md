@@ -698,12 +698,18 @@ chat above 80 messages (the first-paint extract window) and one image.
 - **Steps:** install the v2 build over a v1 install with history; launch;
   count `sqlcipher_mlock` lines in logcat from that launch.
 - **Expect:** under 1,000 (0 today). Messages paints from local state.
-- **Guard:** `marmot.rs::sqlcipher_memory_security_is_off_only_on_android`
-  (the option); the log count itself is checked by the script only.
+- **Guard:** `marmot.rs::sqlcipher_memory_security_stays_off_after_an_engine_opens`
+  (opens a real engine, then reads SQLCipher's process-wide setting); the log
+  count itself is checked by the script only.
 - **Origin:** QA on the MDK v0.14 bump: v0.14 turns SQLCipher
   `cipher_memory_security` on by default. Every `mlock` fails on Android, and
   SQLCipher logs each failure: about 1M lines on the first launch and 31k on
-  every cold start, against about 35 on v1. iOS keeps the default.
+  every cold start, against about 35 on v1. Android opted out first. On the
+  other platforms the `mlock` calls succeed but cost a syscall pair per SQLite
+  allocation in the whole process: release `sonar-sim group-scale` on macOS
+  took 74 s with it on against 26 s off, and 2-member group creation ~750 ms
+  against ~240 ms. v1 never ran with it, so Sonar now turns it off on every
+  platform (`marmot.rs::sonar_storage_options`).
 
 ### QA-213 — A send from older history scrolls into view
 - **Platforms:** both (`android-mdk-upgrade.sh`, `ios-mdk-upgrade.sh`)

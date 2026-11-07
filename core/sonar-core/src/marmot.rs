@@ -108,16 +108,29 @@ pub struct HistoricalGroup {
     pub members: Vec<PublicKey>,
 }
 
-/// SQLCipher options for the MDK store. MDK v0.14 turns on
-/// `cipher_memory_security` (lock key and page memory in RAM with `mlock`).
-/// Android's mlock budget is tiny, so every lock fails and SQLCipher logs
-/// each failure: QA measured ~31k failed-mlock log lines per cold start and
-/// ~1M on the first launch after the v1 -> v2 upgrade, against ~35 on v1
-/// (QA-211). The locks never take effect there, so Android opts out; every
-/// other platform keeps MDK's default.
+/// SQLCipher options for the MDK store. MDK v0.14 turns
+/// `cipher_memory_security` on by default; Sonar turns it off on every
+/// platform, which is how v1 (MDK 0.8) always ran.
+///
+/// It is not a per-connection option. It swaps SQLCipher's allocator for the
+/// whole process, so every SQLite allocation (this store, the conversation
+/// index, backups) becomes malloc + `mlock`, and every free `munlock` + wipe.
+/// That made v2 slower than `main` on the paths users feel. Release
+/// `sonar-sim group-scale --ramp 2,5,10,25,50` on macOS, same machine, only
+/// this flag changed (2026-11-07, two runs each): the ramp took 74 s with it
+/// on (28 s of that in the kernel) against 26 s off; creating a 2-member group
+/// ~750 ms against ~240 ms; fanning one message out to 25 members ~96 ms
+/// against ~88 ms. Wire sizes and the ceiling were identical. On Android every
+/// `mlock` also fails and is logged: ~31k log lines per cold start and ~1M on
+/// the first launch after the v1 -> v2 upgrade, against ~35 on v1 (QA-211).
+///
+/// The store stays encrypted at rest either way. What is given up is wiping
+/// freed SQLite heap and keeping it out of swap, which v1 never had either.
+/// SQLCipher itself has shipped the feature off by default since 4.5.0;
+/// Signal's clients keep that default and Telegram iOS sets it OFF.
 fn sonar_storage_options() -> storage_sqlite::SqliteStorageOptions {
     storage_sqlite::SqliteStorageOptions {
-        cipher_memory_security: !cfg!(target_os = "android"),
+        cipher_memory_security: false,
         ..storage_sqlite::SqliteStorageOptions::default()
     }
 }
@@ -126,19 +139,29 @@ fn sonar_storage_options() -> storage_sqlite::SqliteStorageOptions {
 mod storage_options_tests {
     use super::*;
 
-    /// QA-211: Android opts out of SQLCipher memory security; everywhere else
-    /// MDK's default stands, so a later MDK default change is not masked.
-    #[test]
-    fn sqlcipher_memory_security_is_off_only_on_android() {
-        let ours = sonar_storage_options();
-        if cfg!(target_os = "android") {
-            assert!(!ours.cipher_memory_security);
-        } else {
-            assert_eq!(
-                ours.cipher_memory_security,
-                storage_sqlite::SqliteStorageOptions::default().cipher_memory_security
-            );
-        }
+    /// QA-211 at the real call site. The setting is process-wide and sticky:
+    /// once one connection turns it on, it stays on for every connection
+    /// after. So open a real persistent engine, then ask SQLCipher on a fresh
+    /// connection. The engine's open is the only place sonar-core opens an MDK
+    /// store, so reading ON here means that path turned it back on.
+    #[tokio::test]
+    async fn sqlcipher_memory_security_stays_off_after_an_engine_opens() {
+        assert!(!sonar_storage_options().cipher_memory_security);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _engine = MarmotEngine::persistent(
+            Identity::generate(),
+            dir.path().join("marmot.sqlite"),
+            [7u8; 32],
+        )
+        .expect("open engine");
+        let probe = rusqlite::Connection::open_in_memory().expect("probe connection");
+        let on: String = probe
+            .query_row("PRAGMA cipher_memory_security", [], |row| row.get(0))
+            .expect("read cipher_memory_security");
+        assert_eq!(
+            on, "0",
+            "opening an engine turned SQLCipher memory security on for the whole process"
+        );
     }
 }
 
