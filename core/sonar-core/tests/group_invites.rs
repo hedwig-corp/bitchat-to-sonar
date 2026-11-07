@@ -689,17 +689,28 @@ async fn welcome_sealed_by_a_third_party_is_rejected() {
 async fn dm_invite_flood_is_capped() {
     let bob = MarmotEngine::in_memory(Identity::generate());
 
-    // Exhaust the auto-accept budget…
-    for _ in 0..UNKNOWN_DM_AUTOACCEPT_MAX {
+    // Mint every welcome before Bob processes any. The auto-accept budget is
+    // a real-clock window (UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS): minting one per
+    // step let a slow CI runner spend more than the window on the 31 strangers,
+    // the first auto-accepts aged out, and welcome 18 was admitted on a refilled
+    // budget. Processing them back to back keeps the whole flood inside one
+    // window, which is what this test is about.
+    let mut welcomes = Vec::with_capacity(UNKNOWN_DM_AUTOACCEPT_MAX + PENDING_INVITE_CAP + 1);
+    for _ in 0..(UNKNOWN_DM_AUTOACCEPT_MAX + PENDING_INVITE_CAP + 1) {
         let (_s, wrapped) = stranger_dm_welcome(&bob).await;
+        welcomes.push(wrapped);
+    }
+    let mut welcomes = welcomes.into_iter();
+
+    // Exhaust the auto-accept budget…
+    for wrapped in welcomes.by_ref().take(UNKNOWN_DM_AUTOACCEPT_MAX) {
         match bob.process_incoming(&wrapped).await.expect("process") {
             Incoming::GroupUpdated(_) => {}
             other => panic!("expected auto-accept, got {other:?}"),
         }
     }
     // …then park up to the ceiling…
-    for i in 0..PENDING_INVITE_CAP {
-        let (_s, wrapped) = stranger_dm_welcome(&bob).await;
+    for (i, wrapped) in welcomes.by_ref().take(PENDING_INVITE_CAP).enumerate() {
         match bob.process_incoming(&wrapped).await.expect("process") {
             Incoming::GroupInvitePending(_) => {}
             other => panic!("welcome {i} should park, got {other:?}"),
@@ -710,7 +721,7 @@ async fn dm_invite_flood_is_capped() {
         PENDING_INVITE_CAP
     );
     // …past it, welcomes are declined outright and stay invisible.
-    let (_s, wrapped) = stranger_dm_welcome(&bob).await;
+    let wrapped = welcomes.next().expect("one welcome past the ceiling");
     match bob.process_incoming(&wrapped).await.expect("process") {
         Incoming::None => {}
         other => panic!("past the cap the welcome must be dropped, got {other:?}"),
