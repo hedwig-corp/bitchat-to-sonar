@@ -186,18 +186,14 @@ async fn deliver(agent: &Agent, event: &nostr::Event) -> Result<Incoming, String
 /// error string describing where the join failed. `sender` and `invitee` must be
 /// distinct agents (the borrow checker enforces this at call sites).
 async fn wrap_and_accept(
-    sender: &Agent,
+    _sender: &Agent,
     invitee: &mut Agent,
     member_pk: &PublicKey,
-    welcome: nostr::UnsignedEvent,
+    welcome: nostr::Event,
 ) -> Result<usize, String> {
-    let wrapped = sender
-        .engine
-        .gift_wrap_welcome(member_pk, welcome)
-        .await
-        .map_err(|e| format!("gift_wrap_welcome({member_pk}): {e}"))?;
-    let size = wrapped.as_json().len();
-    match deliver(invitee, &wrapped).await? {
+    // MDK 0.9 already gift-wraps welcomes (kind-1059) at create/invite time.
+    let size = welcome.as_json().len();
+    match deliver(invitee, &welcome).await? {
         Incoming::GroupInvitePending(_) => {
             let invites = invitee
                 .engine
@@ -209,6 +205,7 @@ async fn wrap_and_accept(
             invitee
                 .engine
                 .accept_group_invite(&invite.id)
+                .await
                 .map_err(|e| format!("accept_group_invite({member_pk}): {e}"))?;
             invitee.active = true;
         }
@@ -224,7 +221,7 @@ async fn wrap_and_accept(
 async fn deliver_welcomes(
     creator: &Agent,
     agents: &mut [Agent],
-    welcomes: &[(PublicKey, nostr::UnsignedEvent)],
+    welcomes: &[(PublicKey, nostr::Event)],
     anomalies: &mut Vec<String>,
 ) -> usize {
     let mut max_welcome = 0usize;
@@ -244,6 +241,27 @@ async fn deliver_welcomes(
 /// Fan an event out to every active agent except `skip`. Returns the number of
 /// **distinct recipients** that did not accept it (one per broken member, never
 /// two), and appends one diagnostic per broken recipient to `errors`.
+/// Sleep the MIP-03 quiescence window, then apply every agent's buffered
+/// kind-445 commits. Ingest must not do this itself.
+async fn settle_buffered_commits(
+    agents: &mut [Agent],
+    group_id: &sonar_core::GroupId,
+    anomalies: &mut Vec<String>,
+) {
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    for (i, agent) in agents.iter_mut().enumerate() {
+        if !agent.active {
+            continue;
+        }
+        if let Err(e) = agent.engine.advance_group_convergence(group_id).await {
+            anomalies.push(format!("agent-{i}: advance_group_convergence: {e}"));
+        }
+        if let Err(e) = agent.engine.apply_pending_convergence().await {
+            anomalies.push(format!("agent-{i}: apply_pending_convergence: {e}"));
+        }
+    }
+}
+
 async fn fan_out(
     agents: &mut [Agent],
     skip: PublicKey,
@@ -301,7 +319,7 @@ async fn run_step(
     // Key packages for everyone but the creator.
     let mut kps = Vec::with_capacity(n - 1);
     for agent in &agents[1..] {
-        match agent.engine.key_package_event(relays.clone()) {
+        match agent.engine.key_package_event(relays.clone()).await {
             Ok(kp) => kps.push(kp),
             Err(e) => anomalies.push(format!("key_package_event({}): {e}", agent.pk)),
         }
@@ -312,11 +330,15 @@ async fn run_step(
         Mode::Incremental => batch.min(kps.len()),
     };
 
-    let creation = match agents[0].engine.create_group(
-        &format!("sim-scale-{n}"),
-        kps[..first_wave].to_vec(),
-        relays.clone(),
-    ) {
+    let creation = match agents[0]
+        .engine
+        .create_group(
+            &format!("sim-scale-{n}"),
+            kps[..first_wave].to_vec(),
+            relays.clone(),
+        )
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -337,8 +359,8 @@ async fn run_step(
             )
         }
     };
-    let group_id = creation.group.mls_group_id.clone();
-    if let Err(e) = agents[0].engine.merge_pending_commit(&group_id) {
+    let group_id = creation.group.id.clone();
+    if let Err(e) = agents[0].engine.merge_pending_commit(&group_id).await {
         anomalies.push(format!("creator merge_pending_commit: {e}"));
     }
     let creator = std::mem::replace(&mut agents[0], new_agent());
@@ -357,7 +379,11 @@ async fn run_step(
     let mut added = first_wave;
     while added < kps.len() {
         let chunk = &kps[added..(added + batch).min(kps.len())];
-        let update = match agents[0].engine.add_members(&group_id, chunk.to_vec()) {
+        let update = match agents[0]
+            .engine
+            .add_members(&group_id, chunk.to_vec())
+            .await
+        {
             Ok(u) => u,
             Err(e) => {
                 anomalies.push(format!("add_members(at {added}): {e}"));
@@ -380,10 +406,15 @@ async fn run_step(
         );
         agents[0] = creator;
         if update.requires_commit_merge {
-            if let Err(e) = agents[0].engine.merge_pending_commit(&group_id) {
+            if let Err(e) = agents[0].engine.merge_pending_commit(&group_id).await {
                 anomalies.push(format!("merge_pending_commit(at {added}): {e}"));
             }
         }
+        // MDK 0.9 leaves kind-445 commits Buffered until the MIP-03
+        // quiescence window closes. Existing members ingested the commit
+        // above; apply it before the next batch or the roster stays at
+        // the founding size (N=50 was failing here).
+        settle_buffered_commits(&mut agents, &group_id, &mut anomalies).await;
         added += chunk.len();
     }
     let build_ms = t_build.elapsed().as_millis();
@@ -430,6 +461,7 @@ async fn run_step(
             match agent
                 .engine
                 .create_and_process_text_message(&group_id, &text)
+                .await
             {
                 Ok((ev, _)) => ev,
                 Err(e) => {
@@ -474,8 +506,8 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
 
     let fresh_a = new_agent();
     let fresh_b = new_agent();
-    let kp_a = fresh_a.engine.key_package_event(relays.clone());
-    let kp_b = fresh_b.engine.key_package_event(relays);
+    let kp_a = fresh_a.engine.key_package_event(relays.clone()).await;
+    let kp_b = fresh_b.engine.key_package_event(relays).await;
     let (Ok(kp_a), Ok(kp_b)) = (kp_a, kp_b) else {
         return ChaosResult {
             n,
@@ -492,10 +524,12 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
     let (committer_a, committer_b) = if agents.len() >= 3 { (1, 2) } else { (0, 1) };
     let update_a = agents[committer_a]
         .engine
-        .add_members(&group_id, vec![kp_a]);
+        .add_members(&group_id, vec![kp_a])
+        .await;
     let update_b = agents[committer_b]
         .engine
-        .add_members(&group_id, vec![kp_b]);
+        .add_members(&group_id, vec![kp_b])
+        .await;
     let (Ok(update_a), Ok(update_b)) = (update_a, update_b) else {
         return ChaosResult {
             n,
@@ -521,11 +555,18 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
             }
         }
         if update.requires_commit_merge {
-            if let Err(e) = agents[committer].engine.merge_pending_commit(&group_id) {
+            if let Err(e) = agents[committer]
+                .engine
+                .merge_pending_commit(&group_id)
+                .await
+            {
                 outcomes.push(format!("{label} committer merge: {e}"));
             }
         }
     }
+    let mut settle_anomalies = Vec::new();
+    settle_buffered_commits(&mut agents, &group_id, &mut settle_anomalies).await;
+    outcomes.extend(settle_anomalies);
     // Deliver each committer's welcome to ITS invitee and fold both into the
     // swarm: fresh_a joins via the winning commit, fresh_b via the stale one.
     // Without this, an invitee stranded on the losing branch is silently dropped
@@ -600,6 +641,7 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
     let (broken, sender_failed) = match agents[committer_a]
         .engine
         .create_and_process_text_message(&group_id, "post-race probe")
+        .await
     {
         Ok((ev, _)) => (
             fan_out(&mut agents, sender_pk, &ev, true, &mut post_errors).await,

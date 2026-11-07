@@ -651,7 +651,10 @@ final class BLEService: NSObject {
         // Public broadcast
         // Create packet with explicit fields so we can sign it
         let sendDate = timestamp ?? Date()
-        let sendTimestampMs = UInt64(sendDate.timeIntervalSince1970 * 1000)
+        // An explicit timestamp (a resend keeping its time) stays as given;
+        // a new send takes the unique per-sender clock.
+        let sendTimestampMs = timestamp.map { UInt64($0.timeIntervalSince1970 * 1000) }
+            ?? PacketSendClock.shared.next(now: sendDate)
         let basePacket = BitchatPacket(
             type: MessageType.message.rawValue,
             senderID: Data(hexString: myPeerID.id) ?? Data(),
@@ -744,7 +747,7 @@ final class BLEService: NSObject {
             type: MessageType.leave.rawValue,
             senderID: myPeerIDData,
             recipientID: nil,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            timestamp: PacketSendClock.shared.next(),
             payload: Data(),
             signature: nil,
             ttl: messageTTL
@@ -1028,7 +1031,7 @@ final class BLEService: NSObject {
                 type: MessageType.fileTransfer.rawValue,
                 senderID: self.myPeerIDData,
                 recipientID: nil,
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                timestamp: PacketSendClock.shared.next(),
                 payload: payload,
                 signature: nil,
                 ttl: self.messageTTL,
@@ -1101,7 +1104,7 @@ final class BLEService: NSObject {
                 type: MessageType.fileTransfer.rawValue,
                 senderID: self.myPeerIDData,
                 recipientID: recipientData,
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                timestamp: PacketSendClock.shared.next(),
                 payload: payload,
                 signature: nil,
                 ttl: self.messageTTL,
@@ -1137,7 +1140,7 @@ final class BLEService: NSObject {
                 type: MessageType.noiseEncrypted.rawValue,
                 senderID: myPeerIDData,
                 recipientID: recipientData,
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                timestamp: PacketSendClock.shared.next(),
                 payload: encrypted,
                 signature: nil,
                 ttl: messageTTL,
@@ -1166,7 +1169,7 @@ final class BLEService: NSObject {
                     type: MessageType.noiseEncrypted.rawValue,
                     senderID: myPeerIDData,
                     recipientID: Data(hexString: peerID.id),
-                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                    timestamp: PacketSendClock.shared.next(),
                     payload: encrypted,
                     signature: nil,
                     ttl: messageTTL
@@ -1851,7 +1854,7 @@ final class BLEService: NSObject {
                     type: MessageType.noiseEncrypted.rawValue,
                     senderID: myPeerIDData,
                     recipientID: Data(hexString: peerID.id),
-                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                    timestamp: PacketSendClock.shared.next(),
                     payload: encrypted,
                     signature: nil,
                     ttl: messageTTL
@@ -2161,7 +2164,7 @@ final class BLEService: NSObject {
             type: MessageType.announce.rawValue,
             senderID: myPeerIDData,
             recipientID: nil,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            timestamp: PacketSendClock.shared.next(),
             payload: payload,
             signature: nil, // Will be set by signPacket below
             ttl: messageTTL
@@ -2210,7 +2213,7 @@ final class BLEService: NSObject {
             type: SonarAnnouncePacket.packetType,
             senderID: myPeerIDData,
             recipientID: nil,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            timestamp: PacketSendClock.shared.next(),
             payload: payload,
             signature: nil, // Will be set by signPacket below
             ttl: messageTTL
@@ -3676,7 +3679,7 @@ extension BLEService {
                 type: MessageType.noiseEncrypted.rawValue,
                 senderID: myPeerIDData,
                 recipientID: Data(hexString: peerID.id),
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                timestamp: PacketSendClock.shared.next(),
                 payload: encrypted,
                 signature: nil,
                 ttl: messageTTL
@@ -3980,7 +3983,7 @@ extension BLEService {
                         type: MessageType.noiseEncrypted.rawValue,
                         senderID: myPeerIDData,
                         recipientID: recipientData,
-                        timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                        timestamp: PacketSendClock.shared.next(),
                         payload: encrypted,
                         signature: nil,
                         ttl: messageTTL
@@ -4032,7 +4035,7 @@ extension BLEService {
                     type: MessageType.noiseEncrypted.rawValue,
                     senderID: myPeerIDData,
                     recipientID: Data(hexString: recipientID.id),
-                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                    timestamp: PacketSendClock.shared.next(),
                     payload: encrypted,
                     signature: nil,
                     ttl: messageTTL
@@ -4079,7 +4082,7 @@ extension BLEService {
                 type: MessageType.noiseHandshake.rawValue,
                 senderID: myPeerIDData,
                 recipientID: Data(hexString: peerID.id),
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                timestamp: PacketSendClock.shared.next(),
                 payload: handshakeData,
                 signature: nil,
                 ttl: messageTTL
@@ -4122,7 +4125,7 @@ extension BLEService {
                         type: MessageType.noiseEncrypted.rawValue,
                         senderID: myPeerIDData,
                         recipientID: Data(hexString: peerID.id),
-                        timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                        timestamp: PacketSendClock.shared.next(),
                         payload: encrypted,
                         signature: nil,
                         ttl: messageTTL
@@ -5089,7 +5092,7 @@ extension BLEService {
                 type: MessageType.noiseEncrypted.rawValue,
                 senderID: myPeerIDData,
                 recipientID: Data(hexString: peerID.id),
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                timestamp: PacketSendClock.shared.next(),
                 payload: encrypted,
                 signature: nil,
                 ttl: messageTTL
@@ -5257,7 +5260,7 @@ extension BLEService {
                         type: MessageType.noiseHandshake.rawValue,
                         senderID: myPeerIDData,
                         recipientID: Data(hexString: peerID.id),
-                        timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                        timestamp: PacketSendClock.shared.next(),
                         payload: response,
                         signature: nil,
                         ttl: messageTTL
@@ -5459,7 +5462,7 @@ extension BLEService {
                     type: MessageType.noiseEncrypted.rawValue,
                     senderID: myPeerIDData,
                     recipientID: Data(hexString: peerID.id),
-                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                    timestamp: PacketSendClock.shared.next(),
                     payload: encrypted,
                     signature: nil,
                     ttl: messageTTL

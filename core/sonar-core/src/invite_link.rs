@@ -4,7 +4,7 @@
 //! gift-wrapped to that admin only. This serializes MLS commits and avoids
 //! conflicting epoch transitions when multiple admins could approve concurrently.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -109,7 +109,7 @@ impl InviteLinkState {
         let mut requests: HashMap<Vec<u8>, Vec<JoinRequest>> = HashMap::new();
         for request in disk.requests {
             let group_id_bytes = hex_vec("join request group id", &request.group_id_hex)?;
-            let group_id = GroupId::from_slice(&group_id_bytes);
+            let group_id = GroupId::new(group_id_bytes.clone());
             let key_package_event_id = request
                 .key_package_event_id_hex
                 .as_deref()
@@ -289,12 +289,7 @@ impl InviteLinkStore {
     }
 
     pub fn active_links(&self, group_id: &GroupId) -> Vec<InviteLinkMeta> {
-        let state = self.state.lock().unwrap();
-        state
-            .links
-            .get(group_id.as_slice())
-            .map(|v| v.iter().filter(|l| !l.revoked).cloned().collect())
-            .unwrap_or_default()
+        self.active_links_for(std::slice::from_ref(group_id))
     }
 
     pub fn validate_secret(&self, group_id: &GroupId, secret_hash: &[u8; 32]) -> bool {
@@ -326,9 +321,9 @@ impl InviteLinkStore {
         // than evict a genuine requester the admin has not seen yet — and refuse
         // without touching disk, so a flood cannot force a rewrite per attempt.
         while group_requests.len() >= MAX_PENDING_JOIN_REQUESTS_PER_GROUP {
-            let evictable = group_requests
-                .iter()
-                .position(|r| request.received_at.saturating_sub(r.received_at) >= JOIN_REQUEST_PROTECT_SECS);
+            let evictable = group_requests.iter().position(|r| {
+                request.received_at.saturating_sub(r.received_at) >= JOIN_REQUEST_PROTECT_SECS
+            });
             match evictable {
                 Some(pos) => {
                     group_requests.remove(pos);
@@ -341,12 +336,68 @@ impl InviteLinkStore {
     }
 
     pub fn pending_join_requests(&self, group_id: &GroupId) -> Vec<JoinRequest> {
+        self.pending_join_requests_for(std::slice::from_ref(group_id))
+    }
+
+    /// Union pending requests across recovered and live MLS ids.
+    pub fn pending_join_requests_for(&self, group_ids: &[GroupId]) -> Vec<JoinRequest> {
         let state = self.state.lock().unwrap();
-        state
-            .requests
-            .get(group_id.as_slice())
-            .cloned()
-            .unwrap_or_default()
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for id in group_ids {
+            let Some(reqs) = state.requests.get(id.as_slice()) else {
+                continue;
+            };
+            for req in reqs {
+                if seen.insert(req.requester) {
+                    out.push(req.clone());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn active_links_for(&self, group_ids: &[GroupId]) -> Vec<InviteLinkMeta> {
+        let state = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for id in group_ids {
+            let Some(links) = state.links.get(id.as_slice()) else {
+                continue;
+            };
+            for link in links.iter().filter(|link| !link.revoked) {
+                if seen.insert(link.secret_hash) {
+                    out.push(link.clone());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn validate_secret_for(&self, group_ids: &[GroupId], secret_hash: &[u8; 32]) -> bool {
+        group_ids
+            .iter()
+            .any(|id| self.validate_secret(id, secret_hash))
+    }
+
+    pub fn revoke_link_for(&self, group_ids: &[GroupId], secret_hash: &[u8; 32]) -> Result<()> {
+        for id in group_ids {
+            if self.revoke_link(id, secret_hash).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(Error::InvalidInput("invite link not found".into()))
+    }
+
+    pub fn remove_join_request_for(
+        &self,
+        group_ids: &[GroupId],
+        requester: &PublicKey,
+    ) -> Result<()> {
+        for id in group_ids {
+            self.remove_join_request(id, requester)?;
+        }
+        Ok(())
     }
 
     pub fn remove_join_request(&self, group_id: &GroupId, requester: &PublicKey) -> Result<()> {
@@ -542,7 +593,7 @@ mod tests {
     fn invite_links_and_requests_survive_reload() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("invites.json");
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let admin = Identity::generate();
         let requester = Identity::generate().public_key();
 
@@ -573,8 +624,43 @@ mod tests {
     }
 
     #[test]
+    fn fold_family_unions_historical_invite_sidecar() {
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let store = InviteLinkStore::new();
+        let admin = Identity::generate();
+        let token = store
+            .create_link(&historical, "standup", &admin, Vec::new())
+            .expect("create link");
+        let decoded = decode_invite_token(&token).expect("decode");
+        let requester = Identity::generate().public_key();
+        store
+            .add_join_request(JoinRequest {
+                requester,
+                group_id: historical.clone(),
+                secret_hash: sha256(&decoded.invite_secret),
+                key_package_event_id: None,
+                key_package_d_tag: None,
+                received_at: 1,
+            })
+            .expect("add request");
+        let family = [historical.clone(), live.clone()];
+        assert_eq!(store.pending_join_requests_for(&family).len(), 1);
+        assert_eq!(store.active_links_for(&family).len(), 1);
+        assert!(store.validate_secret_for(&family, &sha256(&decoded.invite_secret)));
+        store
+            .remove_join_request_for(&family, &requester)
+            .expect("remove");
+        assert!(store.pending_join_requests_for(&family).is_empty());
+        store
+            .revoke_link_for(&family, &sha256(&decoded.invite_secret))
+            .expect("revoke via live sibling");
+        assert!(store.active_links_for(&family).is_empty());
+    }
+
+    #[test]
     fn pending_join_requests_are_capped_against_a_sybil_flood() {
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let store = InviteLinkStore::new();
         let secret_hash = [9u8; 32];
 
@@ -614,7 +700,7 @@ mod tests {
 
     #[test]
     fn pending_join_requests_recycle_once_the_protection_window_passes() {
-        let group_id = GroupId::from_slice(&[8u8; 32]);
+        let group_id = GroupId::new([8u8; 32]);
         let store = InviteLinkStore::new();
         let secret_hash = [9u8; 32];
 
@@ -678,7 +764,10 @@ mod tests {
         assert_eq!(normalize_invite_token(&scheme).unwrap(), token);
         assert_eq!(normalize_invite_token(&universal).unwrap(), token);
         // And each still decodes to the original token contents.
-        assert_eq!(decode_invite_token(&universal).unwrap().group_name, "field team");
+        assert_eq!(
+            decode_invite_token(&universal).unwrap().group_name,
+            "field team"
+        );
     }
 
     #[test]
@@ -740,7 +829,11 @@ mod tests {
         }
 
         // No duplicates (case-insensitive)
-        let lowercased: Vec<String> = decoded.relays.iter().map(|r| r.to_ascii_lowercase()).collect();
+        let lowercased: Vec<String> = decoded
+            .relays
+            .iter()
+            .map(|r| r.to_ascii_lowercase())
+            .collect();
         let unique: std::collections::HashSet<_> = lowercased.iter().collect();
         assert_eq!(unique.len(), 8);
 

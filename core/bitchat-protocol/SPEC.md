@@ -49,6 +49,17 @@ MUST try the frame as-is before stripping padding. Decoders MUST enforce the
 per-type payload ceilings of §11 and the compression ratio bound of §3 before
 allocating for the payload.
 
+**Timestamps are unique per sender.** Receivers drop a packet whose
+`<senderID>-<timestamp>-<type>` they have seen (both reference clients and
+Sonar iOS; the Sonar engine keys public messages on `<senderID>-<timestamp>`).
+A sender that stamps two packets with the same millisecond therefore loses
+all but the first: a burst such as the capability proof (§8.5) and the
+payloads queued during a handshake, flushed back to back. Sonar senders (iOS
+`PacketSendClock`, the engine's `Engine::wall`) keep their own timestamps
+strictly increasing: wall-clock milliseconds, a collision bumped by 1 ms. The
+format is unchanged and every reference decoder accepts it; the value stays
+within milliseconds of the clock, far inside every freshness window.
+
 v1 cannot carry a payload whose *decompressed* length exceeds 65 535 bytes:
 the reference encoders refuse rather than silently compress it, so this crate
 does too. v2 is used for routes and for file transfers above that size.

@@ -64,7 +64,8 @@ cost.
 
 ## The harness (`scripts/bench/`)
 
-- `build-sim.sh` — Debug, arm64, **unsigned** build; prints the `.app` path.
+- `build-sim.sh` — Debug, arm64, simulator-signed build (the App Group needs
+  it); prints the `.app` path.
 - `cold-start-bench.sh` — terminate→relaunch loop; parses the markers; prints a
   per-phase min/median/max table. Stands alone (freshly-generated identity →
   `woke=0`, useful for the identity-independent phase breakdown).
@@ -114,13 +115,19 @@ Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
 - **arm64-only** — the Arti (`libarti_bitchat.a`) and `sonarffi` simulator slices
   are arm64 (Apple Silicon); `generic/platform=iOS Simulator` also tries x86_64
   and fails to link. The build pins `ARCHS=arm64`.
-- **Unsigned + Keychain-independent bench path.** CLI builds of this app sign
-  ad-hoc with empty entitlements (the `sh.hedwig.sonar` bundle id is Hedwig's
-  team; a local personal team can't provision it), so Keychain returns
-  `errSecMissingEntitlement` (-34018) and `performConnect` would early-return
-  before the relay-sync path ever starts. Re-signing breaks launch ("denied by
-  service delegate"). So the benchmark provisioning path is **Keychain-free**
-  (all `#if DEBUG` + gated on the `SONAR_BENCH_NSEC` env var):
+- **Signed build, Keychain-independent bench path.** `build-sim.sh` signs for
+  the simulator, like `scripts/qa/ios-setup.sh`. It used to build unsigned,
+  but since #362 the Marmot store lives only in the App Group container and
+  the app refuses to open it without one: an unsigned build stops at "Marmot
+  local open failed: App Group group.sh.hedwig.sonar unavailable" before
+  `t1_local_paint`, never publishes a KeyPackage, and `provision-and-bench.sh`
+  fails with "A's KeyPackage never found" (found 2026-11-07; the script now
+  names the store-open error instead). A simulator build needs no device
+  provisioning; if Xcode refuses to sign, set your own `DEVELOPMENT_TEAM` in
+  the gitignored `ios/Configs/Local.xcconfig`. The benchmark provisioning path
+  stays **Keychain-free**, so a keychain entry left by an earlier launch does
+  not change which store opens (all `#if DEBUG` + gated on the
+  `SONAR_BENCH_NSEC` env var):
   - `BitchatApp.init` force-completes onboarding so the connect path runs headless.
   - `MarmotChatModel.performConnect` adopts the env identity directly.
   - `MarmotService.databaseConfig` derives the encrypted-DB key as `SHA256(nsec)`
@@ -234,6 +241,30 @@ Marmot group · live relays · `woke=1` every run:
 | **TOTAL launch → t4 (cold → synced)** | **≈ 1.55 s** |
 
 (`t1→t2` is effectively zero here — see findings.)
+
+### MDK v0.14 bump A/B (2026-11-07, PR #683)
+
+`provision-and-bench.sh --runs 5 --msgs-per-run 3`, one dedicated simulator
+(iOS 26.5), `main` (`fdf091cbb`, MDK 0.8) and the branch run back to back,
+5 runs each, all `woke=1`; medians in ms:
+
+| phase | main | branch, passphrase key | branch, final |
+|---|---|---|---|
+| launch → t0 | 488 | 491 | 489 |
+| **t0 → t1 (open DB + local paint)** | **202** | **300** | **211** |
+| t1 → t2 | 249 | 153 | 242 |
+| t2 → t3 | 130 | 228 | 135 |
+| t3 → t4 | 9 | 9 | 8 |
+| **launch → t4** | **1079** | **1181** | **1086** |
+
+The middle column is the first v0.14 build: its store was keyed with a
+passphrase, so SQLCipher ran PBKDF2 on every open, +88 ms on first paint. The
+store now uses a raw key derived from the host key (`marmot.rs::store_raw_key`);
+branch and main overlap (1083–1094 against 1069–1092 ms). Both runs also have
+SQLCipher memory security off (`sonar_storage_options`): left on, it made group
+creation ~3× slower in release (`sonar-sim group-scale`). The `main` column
+is the run paired with the final branch; the run paired with the middle
+column, 35 minutes earlier, measured t0 → t1 212 ms and launch → t4 1092 ms.
 
 ## Device result (real account — the real pain point)
 
@@ -736,15 +767,13 @@ cargo run -p sonar-sim --release -- group-scale \
   --ramp 2,5,10,25,50,100,110,120,130 --mode incremental --batch 25 --chaos --out /tmp/scale.json
 ```
 
-Headline result (MDK rev `e8cd584`, 2026-07, `--batch 25`): the group-size
-ceiling is **~120 members**, gated by the **welcome, not the relay** —
-`gift_wrap_welcome` fails with `nip44 encryption error: message too long` once the
-welcome plaintext crosses NIP-44's 65535-byte cap (the welcome carries the full
-ratchet tree, ~1 KB/member). Every relay's `max_message_length` (131 KB smallest)
-sits far above the ~77 KB wrapped welcome, so relay size never binds first. The
-ceiling shifts with the add pattern (smaller batches reach ~135). `--chaos` also
-surfaces a concurrent-commit **fork** (two same-epoch adds strand the losing
-invitee on an orphan branch that can no longer decrypt).
+Headline result (MDK v0.10.4 `fcc85edd`, wire `0xf2f1`, `--batch 25`; the same
+on the previous v0.9.14 `235c8ade` pin): the group-size ceiling is **50 members**, still gated by the **welcome, not the
+relay** — `add_members` fails with `nip44 encryption error: message too long`
+once the welcome plaintext crosses NIP-44's 65535-byte cap. The wrapped
+welcome is 38.7 KB at N=25 and 66.0 KB at N=50 (0.8 at N=25 was 27.8 KB).
+The previous 0.8 pin (`e8cd584`, `0xf2ee`) reached ~120. Full table and
+reproduce steps: [`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md).
 
 **What to assert vs report:** the **structural** outputs are deterministic and make
 good regression gates — ceiling N, `converged` yes/no, fork-heals yes/no, welcome

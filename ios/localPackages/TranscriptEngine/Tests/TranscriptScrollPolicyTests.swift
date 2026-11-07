@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import Testing
 @testable import TranscriptEngine
 
@@ -234,6 +235,46 @@ struct TranscriptScrollPolicyTests {
                 expectedNewestDate: nil, lastExpectedNewestDate: nil
             )
         )
+        #expect(
+            !TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: 7, lastContentVersion: 7,
+                unreadCountAtOpen: 3, lastUnreadCountAtOpen: 3,
+                jumpMessageId: nil, lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil,
+                familyHasOlder: false, lastFamilyHasOlder: true
+            )
+        )
+        #expect(TranscriptScrollPolicy.shouldSettleJump(parentVisible: true))
+        #expect(!TranscriptScrollPolicy.shouldSettleJump(parentVisible: false))
+        let hist = Date(timeIntervalSince1970: 50)
+        let live = Date(timeIntervalSince1970: 10)
+        #expect(
+            !TranscriptScrollPolicy.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: live,
+                expectedNewest: hist,
+                familyHasOlder: false
+            )
+        )
+        #expect(
+            !TranscriptScrollPolicy.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 80),
+                expectedNewest: hist,
+                familyHasOlder: true
+            )
+        )
+        #expect(
+            TranscriptScrollPolicy.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 80),
+                expectedNewest: hist,
+                familyHasOlder: false
+            )
+        )
     }
 
     /// A resting offset above `minY` is the blank-chat shape: with a short-feed
@@ -276,5 +317,78 @@ struct TranscriptScrollPolicyTests {
                 topInset: 324, bottomInset: 56
             ) == nil
         )
+    }
+
+    // MARK: Own send from older history (Signal scrolls to your send)
+
+    private func latchReadingHistory() -> TranscriptTailPinLatch {
+        var latch = TranscriptTailPinLatch()
+        latch.openInHistory(itemCount: 86, tailID: "m85")
+        return latch
+    }
+
+    /// Fails without the own-send case: a reader in history sent a message and
+    /// the view stayed on old rows (found by scripts/qa/ios-mdk-upgrade.sh).
+    @Test
+    func ownSendFromHistoryFollowsItsEcho() {
+        var latch = latchReadingHistory()
+        #expect(latch.ownSendRequested(at: 100) == .none)
+        let action = latch.itemsChanged(
+            itemCount: 87, tailID: "echo", isNearBottom: false,
+            userScrolling: false, isPrepending: false, now: 100.05
+        )
+        #expect(action == .animate)
+        #expect(latch.wasPinned)
+    }
+
+    /// The echo can land before the host hears about the send (two changes
+    /// in one SwiftUI update): the request follows it at once.
+    @Test
+    func ownSendAfterItsEchoLandedStillFollows() {
+        var latch = latchReadingHistory()
+        #expect(latch.itemsChanged(
+            itemCount: 87, tailID: "echo", isNearBottom: false,
+            userScrolling: false, isPrepending: false, now: 100
+        ) == .none)
+        #expect(latch.ownSendRequested(at: 100.1) == .animate)
+    }
+
+    @Test
+    func incomingAppendWhileReadingHistoryStaysPut() {
+        var latch = latchReadingHistory()
+        #expect(latch.itemsChanged(
+            itemCount: 87, tailID: "incoming", isNearBottom: false,
+            userScrolling: false, isPrepending: false, now: 100
+        ) == .none)
+        // An incoming row long before a send is not that send's echo.
+        #expect(latch.ownSendRequested(at: 110) == .none)
+    }
+
+    /// A send that appended nothing (it failed) must not yank a reader who
+    /// stayed in history when a message arrives later.
+    @Test
+    func anExpiredOwnSendRequestDoesNotFollowLaterIncoming() {
+        var latch = latchReadingHistory()
+        _ = latch.ownSendRequested(at: 100)
+        #expect(latch.itemsChanged(
+            itemCount: 87, tailID: "incoming", isNearBottom: false,
+            userScrolling: false, isPrepending: false,
+            now: 100 + TranscriptTailPinLatch.ownSendFollowSeconds + 1
+        ) == .none)
+        #expect(!latch.wasPinned)
+    }
+
+    @Test
+    func prependingDoesNotConsumeTheOwnSendRequest() {
+        var latch = latchReadingHistory()
+        _ = latch.ownSendRequested(at: 100)
+        #expect(latch.itemsChanged(
+            itemCount: 117, tailID: "m85", isNearBottom: false,
+            userScrolling: false, isPrepending: true, now: 100.1
+        ) == .none)
+        #expect(latch.itemsChanged(
+            itemCount: 118, tailID: "echo", isNearBottom: false,
+            userScrolling: false, isPrepending: false, now: 100.4
+        ) == .animate)
     }
 }

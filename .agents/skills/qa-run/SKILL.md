@@ -180,9 +180,13 @@ After setup:
 Two `ios-drive.sh` traps:
 - **A fresh account needs a fresh store.** `--nsec-file` swaps the identity,
   but not the store on disk. On a simulator that already holds another
-  account, the store cannot open (the log says "Wrong encryption key"), and
+  account, the store cannot open (the log says "Marmot local open failed: …
+  file is not a database"; MDK 0.8 builds said "Wrong encryption key"), and
   Messages shows the old account's cached rows, so every result is about the
-  wrong account. Run `ios-setup.sh --no-build --fresh` first.
+  wrong account. Run `ios-setup.sh --no-build --fresh` first: it uninstalls
+  the app and resets the simulator keychain. An uninstall alone keeps the
+  account key, so setup's own launch recovers that account and keys a new
+  store from it, which a `--nsec-file` launch again cannot open.
 - **`count:` counts elements, not rows.** A row's button and the text inside
   it both match, so one row counts 2. Count rows from the `tree` dump.
 

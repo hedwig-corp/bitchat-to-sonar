@@ -59,3 +59,13 @@ internal fun sonarRetryContent(message: SonarMsg): String? =
     message.stickerRef?.let {
         meshStickerContent(it.packCoordinate, it.shortcode, it.plaintextSha256)
     } ?: message.content.takeIf { it.isNotBlank() }
+
+/** What a screen reader says for one transcript row: author (others' group
+ *  messages), the message or its kind ("Photo"), time, and our delivery state.
+ *  The row is the node that holds the long-press menu and the Reply/Copy
+ *  actions, so it must carry a label of its own (QA-043). */
+internal fun sonarMessageRowLabel(author: String?, body: String, time: String, delivery: String?): String =
+    listOfNotNull(author, body, time, delivery)
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .joinToString(", ")
