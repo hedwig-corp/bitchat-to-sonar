@@ -64,7 +64,8 @@ cost.
 
 ## The harness (`scripts/bench/`)
 
-- `build-sim.sh` — Debug, arm64, **unsigned** build; prints the `.app` path.
+- `build-sim.sh` — Debug, arm64, simulator-signed build (the App Group needs
+  it); prints the `.app` path.
 - `cold-start-bench.sh` — terminate→relaunch loop; parses the markers; prints a
   per-phase min/median/max table. Stands alone (freshly-generated identity →
   `woke=0`, useful for the identity-independent phase breakdown).
@@ -114,13 +115,19 @@ Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
 - **arm64-only** — the Arti (`libarti_bitchat.a`) and `sonarffi` simulator slices
   are arm64 (Apple Silicon); `generic/platform=iOS Simulator` also tries x86_64
   and fails to link. The build pins `ARCHS=arm64`.
-- **Unsigned + Keychain-independent bench path.** CLI builds of this app sign
-  ad-hoc with empty entitlements (the `sh.hedwig.sonar` bundle id is Hedwig's
-  team; a local personal team can't provision it), so Keychain returns
-  `errSecMissingEntitlement` (-34018) and `performConnect` would early-return
-  before the relay-sync path ever starts. Re-signing breaks launch ("denied by
-  service delegate"). So the benchmark provisioning path is **Keychain-free**
-  (all `#if DEBUG` + gated on the `SONAR_BENCH_NSEC` env var):
+- **Signed build, Keychain-independent bench path.** `build-sim.sh` signs for
+  the simulator, like `scripts/qa/ios-setup.sh`. It used to build unsigned,
+  but since #362 the Marmot store lives only in the App Group container and
+  the app refuses to open it without one: an unsigned build stops at "Marmot
+  local open failed: App Group group.sh.hedwig.sonar unavailable" before
+  `t1_local_paint`, never publishes a KeyPackage, and `provision-and-bench.sh`
+  fails with "A's KeyPackage never found" (found 2026-11-07; the script now
+  names the store-open error instead). A simulator build needs no device
+  provisioning; if Xcode refuses to sign, set your own `DEVELOPMENT_TEAM` in
+  the gitignored `ios/Configs/Local.xcconfig`. The benchmark provisioning path
+  stays **Keychain-free**, so a keychain entry left by an earlier launch does
+  not change which store opens (all `#if DEBUG` + gated on the
+  `SONAR_BENCH_NSEC` env var):
   - `BitchatApp.init` force-completes onboarding so the connect path runs headless.
   - `MarmotChatModel.performConnect` adopts the env identity directly.
   - `MarmotService.databaseConfig` derives the encrypted-DB key as `SHA256(nsec)`
