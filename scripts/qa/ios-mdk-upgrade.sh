@@ -106,7 +106,7 @@ seed() { # seed <peer> <n> <prefix>: per-message retries for public-relay hiccup
   done
 }
 seed "$P" "$SEED_N" "p v1 $RUN" || { echo "v1 baseline: seeding $P failed" >&2; exit 2; }
-seed "$Q" 2 "q v1 $RUN" || { echo "v1 baseline: seeding $Q failed" >&2; exit 2; }
+seed "$Q" 1 "q v1 $RUN" || { echo "v1 baseline: seeding $Q failed" >&2; exit 2; }
 TARGET="$("$M" id-of "$P" "p v1 $RUN 1/$SEED_N" 2>/dev/null)"
 reacted=0
 for t in 1 2 3 4; do
@@ -115,14 +115,14 @@ for t in 1 2 3 4; do
   sleep $((t * 3))
 done
 (( reacted )) || { echo "v1 baseline: the peer's 👍 never published" >&2; exit 2; }
-drive v1-seeded "activate;expect:p v1 $RUN $SEED_N/$SEED_N@180;expect:q v1 $RUN 2/2@180" \
+drive v1-seeded "activate;expect:p v1 $RUN $SEED_N/$SEED_N@180;expect:q v1 $RUN 1/1@180" \
   || { echo "v1 baseline: history never reached the app" >&2; exit 2; }
 
 # --- upgrade in place -------------------------------------------------------
 xcrun simctl terminate "$QA_UDID" "$BUNDLE" >/dev/null 2>&1
 xcrun simctl install "$QA_UDID" "$V2_APP" || { echo "v2 install failed — stop, do not uninstall" >&2; exit 2; }
 mark="$(date '+%Y-%m-%d %H:%M:%S')"
-if drive v2-launch "launch;expect:MESSAGES@90;expect:p v1 $RUN $SEED_N/$SEED_N@60;expect:q v1 $RUN 2/2@30;tree:home"; then
+if drive v2-launch "launch;expect:MESSAGES@90;expect:p v1 $RUN $SEED_N/$SEED_N@60;expect:q v1 $RUN 1/1@30;tree:home"; then
   paint="$(xcrun simctl spawn "$QA_UDID" log show --info --start "$mark" --style compact \
     --predicate 'subsystem == "chat.bitchat" AND eventMessage CONTAINS "SONAR_BENCH t"' 2>/dev/null \
     | python3 -c '
@@ -185,7 +185,7 @@ drive reopen "activate;tapc:p v2 reply $RUN;expect:Verify@15;expect:p v1 $RUN $S
 "$M" upgrade-peer "$Q" >/dev/null 2>&1
 sleep 15  # the peer's v2 KeyPackage must reach the relays first
 peer_send "$Q" "q v2 first $RUN"
-drive q-first "activate;expect:q v2 first $RUN@180;tapc:q v2 first $RUN;expect:q v1 $RUN 1/2@20;expect:q v2 first $RUN@10;tap:Back;expect:MESSAGES@15" \
+drive q-first "activate;expect:q v2 first $RUN@180;tapc:q v2 first $RUN;expect:q v1 $RUN 1/1@20;expect:q v2 first $RUN@10;tap:Back;expect:MESSAGES@15" \
   && pass QA-194 "a peer that updates and writes first folds onto its v1 chat" \
   || fail QA-194 "the updated peer's first v2 message did not fold onto its v1 chat"
 

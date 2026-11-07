@@ -127,7 +127,9 @@ seed_v1() { # seed_v1 <peer> <n> <prefix>
     done
   done
 }
-seed_v1 "up-q-$RUN" 2 "q v1 $RUN"
+# One message: the baseline only needs this chat to exist on v1, and main's
+# 0.8 app sometimes never shows a second message sent seconds later.
+seed_v1 "up-q-$RUN" 1 "q v1 $RUN"
 peer_send() { # peer_send <peer> <text> on the peer's current CLI, retried
   local t
   for t in 1 2 3 4; do
@@ -140,7 +142,7 @@ seed_v1 "up-p-$RUN" "$SEED_N" "p v1 $RUN"
 "$UI" wait "p v1 $RUN $SEED_N/$SEED_N" 120 >/dev/null || { echo "v1 baseline: history never painted" >&2; exit 2; }
 back_home
 # Both chats must exist on v1, or QA-190/QA-194 would test a chat that never was.
-"$UI" wait "q v1 $RUN 2/2" 180 >/dev/null || { echo "v1 baseline: the second peer's chat never painted" >&2; exit 2; }
+"$UI" wait "q v1 $RUN 1/1" 180 >/dev/null || { echo "v1 baseline: the second peer's chat never painted" >&2; exit 2; }
 back_home
 
 # --- upgrade in place -------------------------------------------------------
@@ -152,7 +154,7 @@ mlock="$(adbs logcat -d -T "$mark" 2>/dev/null | grep -c 'sqlcipher_mlock')"
   || fail QA-211 "first v2 launch flooded logcat with $mlock failed-mlock lines"
 "$UI" shot "mdk-upgrade-$RUN-home" >/dev/null 2>&1
 sleep 4
-if home_rows | grep -c "p v1 $RUN $SEED_N/$SEED_N" >/dev/null && home_rows | grep -c "q v1 $RUN 2/2" >/dev/null; then
+if home_rows | grep -c "p v1 $RUN $SEED_N/$SEED_N" >/dev/null && home_rows | grep -c "q v1 $RUN 1/1" >/dev/null; then
   pass QA-190 "upgrade kept both v1 chats (Messages painted ${painted}s after launch, dump-polled)"
 else
   fail QA-190 "v1 chats missing after the upgrade"
@@ -228,7 +230,7 @@ sleep 15  # the peer's v2 KeyPackage must reach the relays first
 peer_send "up-q-$RUN" "q v2 first $RUN"
 if "$UI" wait "q v2 first $RUN" 180 >/dev/null; then
   open_row "q v2 first $RUN"
-  if "$UI" dump | grep -c "q v1 $RUN 2/2" >/dev/null && "$UI" dump | grep -c "q v2 first $RUN" >/dev/null; then
+  if "$UI" dump | grep -c "q v1 $RUN 1/1" >/dev/null && "$UI" dump | grep -c "q v2 first $RUN" >/dev/null; then
     pass QA-194 "a peer that updates and writes first folds onto its v1 chat"
   else
     fail QA-194 "the peer's v2 welcome did not fold onto its v1 chat"
