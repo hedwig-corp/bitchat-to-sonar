@@ -17,6 +17,7 @@ pub mod marmot;
 pub(crate) mod mdk08_migrate;
 pub(crate) mod mdk_nostr;
 pub mod media_crypto;
+mod media_dimensions;
 pub mod media_staging;
 pub mod mention;
 pub mod mesh;

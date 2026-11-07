@@ -259,7 +259,14 @@ pub fn encrypt_with_scheme(
         encrypted_hash,
         mime_type: mime.to_owned(),
         filename: filename.to_owned(),
-        dimensions: None,
+        // MIP-04 `dim`, read from the image header so receivers can size the
+        // bubble before the blob arrives (MDK 0.8 decoded the image for it;
+        // v2 left it out and every photo arrived letterboxed, QA-106).
+        // `blurhash` stays out: MIP-04 v2 rejects it.
+        dimensions: mime
+            .starts_with("image/")
+            .then(|| crate::media_dimensions::image_dimensions(data))
+            .flatten(),
         blurhash: None,
         thumbhash: None,
         duration_ms: None,

@@ -182,6 +182,14 @@ async fn media_sends_over_white_noise_end_to_end() {
     assert!(!media_msg.mine);
     assert_eq!(media_msg.content, "from iOS");
     assert_eq!(media_msg.media[0].mime_type, "image/png");
+    // QA-106: the photo carries its size (MIP-04 `dim`), so the receiver sizes
+    // the bubble before the blob arrives instead of letterboxing it in the
+    // largest box. The v2 port sent every image without it.
+    assert_eq!(
+        (media_msg.media[0].width, media_msg.media[0].height),
+        (Some(1), Some(1)),
+        "the sender's image size reaches the receiver"
+    );
     let url = media_msg.media[0].url.clone();
     assert!(
         url.starts_with(&blossom),
