@@ -123,6 +123,38 @@ struct BLEServicePrivateMediaTests {
                 "no encrypted copy may be sent alongside the fallback")
     }
 
+    /// A burst of sends to one peer leaves with distinct timestamps. Receivers
+    /// drop a repeat of `<sender>-<timestamp>-<type>`, and packets stamped from
+    /// `Date()` in the same millisecond collided: payloads queued during a
+    /// handshake and flushed back to back reached the peer as only the first.
+    /// Twenty sends fit in a few milliseconds, so without the per-sender send
+    /// clock several share one.
+    @Test
+    func backToBackSendsToOnePeerNeverShareATimestamp() async throws {
+        let ble = makeService()
+        ble.delegate = CaptureDelegate()
+        let outbound = OutboundCapture()
+        ble._test_outboundObserver = { outbound.append($0) }
+
+        let (peer, peerID) = try await announcedPeer(to: ble)
+        try await completeHandshake(peer: peer, peerID: peerID, with: ble, outbound: outbound)
+        ble._test_drainMessageQueue()
+        outbound.reset()
+
+        let sends = 20
+        for i in 0..<sends {
+            ble.sendPrivateMessage("burst \(i)", to: peerID, recipientNickname: "Peer", messageID: "burst-\(i)")
+        }
+        let arrived = await TestHelpers.waitUntil({
+            outbound.snapshot().filter { $0.type == MessageType.noiseEncrypted.rawValue }.count >= sends
+        }, timeout: TestConstants.defaultTimeout)
+        #expect(arrived, "every send leaves as a Noise frame")
+        let stamps = outbound.snapshot()
+            .filter { $0.type == MessageType.noiseEncrypted.rawValue }
+            .map(\.timestamp)
+        #expect(Set(stamps).count == stamps.count, "timestamps repeat: \(stamps)")
+    }
+
     // MARK: - Fixtures and drivers
 
     /// SOI + APP0 header, filler, EOI: passes the image/jpeg magic check.
@@ -133,7 +165,12 @@ struct BLEServicePrivateMediaTests {
         return d
     }()
 
-    private func now() -> UInt64 { UInt64(Date().timeIntervalSince1970 * 1000) }
+    /// Packets the test's peer sends must not share a millisecond: the service
+    /// drops a repeat of `<sender>-<timestamp>-<type>`, and `Date()` stamped
+    /// the capability proof and the file right after it alike, so the file was
+    /// dropped and never surfaced (main failed that way by its 3rd of 25
+    /// repeats). The peer stamps like a real sender: the unique send clock.
+    private func now() -> UInt64 { PacketSendClock.shared.next() }
 
     /// A reference-style peer (bare Noise service) that has announced itself
     /// to `ble` with a signed full-TTL announce, so its keys are pinned and it
