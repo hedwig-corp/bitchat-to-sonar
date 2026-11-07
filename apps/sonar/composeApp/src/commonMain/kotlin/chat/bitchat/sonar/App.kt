@@ -3227,11 +3227,25 @@ internal fun ReplyDecorated(
         }
     }
     val progress = sonarSwipeReplyProgress(abs(offsetPx.value), triggerPx)
+    // QA-043: the row is the actionable node (long-press menu, Reply/Copy),
+    // so it carries its own label, as Signal's conversation rows do. It used
+    // to borrow one from its bubble, and when the list clipped the bubble
+    // off-screen while a sliver of the row stayed visible, TalkBack and the
+    // a11y sweep met an actionable node with nothing to read.
+    val rowLabel = sonarMessageRowLabel(
+        author = if (!m.mine && isGroup) state.groupAuthorName(m, isGroup) else null,
+        body = copyText ?: replyPreview,
+        time = remember(m.tsSecs) { SonarClock.hourMinute(m.tsSecs) },
+        delivery = if (m.mine) sonarDeliveryLabel(m.state) else null,
+    )
     Column(
         Modifier
             .fillMaxWidth()
             .onGloballyPositioned { anchorTopPx = it.boundsInWindow().top }
-            .semantics { customActions = accessibilityActions }
+            .semantics {
+                customActions = accessibilityActions
+                contentDescription = rowLabel
+            }
             .combinedClickable(
                 interactionSource = interaction,
                 indication = null,
