@@ -1569,8 +1569,18 @@ pub fn abort_staged_account_restore(db_path: &Path) {
     clear_restore_intent(db_path);
 }
 
-fn sqlcipher_key_pragmas(db_key_hex: &str) -> [String; 2] {
+/// Every way a store under this host key can be keyed, cheapest first: the
+/// Marmot v2 store's derived raw key, the host key raw (the conversation
+/// index, a v1 store), and the host key's hex as a passphrase (a v2 store from
+/// the first v0.14 builds, the only form that pays PBKDF2).
+fn sqlcipher_key_pragmas(db_key_hex: &str) -> [String; 3] {
+    let store_key = hex::decode(db_key_hex)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(|key| hex::encode(crate::marmot::store_raw_key(&key)))
+        .unwrap_or_default();
     [
+        format!("PRAGMA key = \"x'{store_key}'\";"),
         format!("PRAGMA key = \"x'{db_key_hex}'\";"),
         format!("PRAGMA key = '{db_key_hex}';"),
     ]

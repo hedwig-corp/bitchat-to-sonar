@@ -165,11 +165,269 @@ mod storage_options_tests {
     }
 }
 
-/// Documented encoding of the host's 32-byte SQLCipher key for MDK 0.9.
-/// MDK 0.9 applies the string via `PRAGMA key = '<passphrase>'`, not the 0.8
-/// raw-key form `PRAGMA key = "x'HEX'"`.
+#[cfg(test)]
+mod store_key_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    enum Key<'a> {
+        Raw(&'a [u8; 32]),
+        Passphrase(&'a str),
+    }
+
+    fn keyed(path: &Path, key: Key<'_>) -> Connection {
+        let conn = Connection::open(path).expect("open");
+        conn.pragma_update(None, "cipher_compatibility", 4).expect("compat");
+        match key {
+            Key::Raw(raw) => conn
+                .execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(raw)))
+                .expect("raw key"),
+            Key::Passphrase(pass) => conn.pragma_update(None, "key", pass).expect("passphrase"),
+        }
+        conn
+    }
+
+    /// Ledger rows when `path` decrypts under `key` as a v2 store.
+    fn opens_as_v2(path: &Path, key: Key<'_>) -> Option<i64> {
+        v2_ledger_rows(&keyed(path, key), "main")
+    }
+
+    /// Re-encrypt the v2 store at `path` under the passphrase, the way the
+    /// first v0.14 builds keyed it.
+    fn key_with_the_old_passphrase(path: &Path, host_key: &[u8; 32]) {
+        let conn = keyed(path, Key::Raw(&store_raw_key(host_key)));
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).unwrap();
+        let old = path.with_extension("old");
+        conn.execute(
+            "ATTACH DATABASE ?1 AS old KEY ?2",
+            rusqlite::params![old.to_string_lossy(), sqlcipher_passphrase(host_key)],
+        )
+        .unwrap();
+        conn.query_row("SELECT sqlcipher_export('old')", [], |_| Ok(())).unwrap();
+        conn.execute_batch(&format!("PRAGMA old.user_version = {user_version}; DETACH DATABASE old;"))
+            .unwrap();
+        drop(conn);
+        remove_sqlite_files(path);
+        std::fs::rename(&old, path).unwrap();
+    }
+
+    /// A store `persistent` creates is keyed with the derived raw key: no
+    /// PBKDF2 on open (the passphrase cost +88 ms of first paint on the iOS
+    /// bench) and not the raw host key, which a v1 store opens under.
+    #[tokio::test]
+    async fn a_new_v2_store_is_keyed_with_the_derived_raw_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("marmot.sqlite");
+        let host_key = [9u8; 32];
+        drop(MarmotEngine::persistent(Identity::generate(), &path, host_key).expect("create"));
+
+        assert!(
+            opens_as_v2(&path, Key::Raw(&store_raw_key(&host_key))).is_some(),
+            "the v2 store must open under its derived raw key"
+        );
+        assert!(
+            opens_as_v2(&path, Key::Passphrase(&sqlcipher_passphrase(&host_key))).is_none(),
+            "a passphrase-keyed store pays PBKDF2 on every open"
+        );
+        assert!(
+            opens_as_v2(&path, Key::Raw(&host_key)).is_none(),
+            "the raw host key keys v1 stores; a v2 store under it would hide v1 detection"
+        );
+    }
+
+    /// The first v0.14 builds keyed the store with the passphrase. The next
+    /// open moves it to the raw key once, keeping what it holds.
+    #[tokio::test]
+    async fn a_passphrase_keyed_v2_store_moves_to_the_raw_key_and_keeps_its_groups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("marmot.sqlite");
+        let host_key = [5u8; 32];
+        let identity = Identity::generate();
+        let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+        let peer = MarmotEngine::in_memory(Identity::generate());
+        let group_id = {
+            let engine = MarmotEngine::persistent(identity.clone(), &path, host_key).expect("create");
+            let kp = peer.key_package_event(vec![relay.clone()]).await.expect("peer kp");
+            let creation = engine
+                .create_group("dm", vec![kp], vec![relay])
+                .await
+                .expect("create group");
+            engine
+                .merge_pending_commit(&creation.group.id)
+                .await
+                .expect("merge");
+            creation.group.id
+        };
+        key_with_the_old_passphrase(&path, &host_key);
+        assert!(
+            opens_as_v2(&path, Key::Raw(&store_raw_key(&host_key))).is_none(),
+            "precondition: the store is passphrase-keyed"
+        );
+
+        let engine = MarmotEngine::persistent(identity, &path, host_key).expect("reopen");
+        assert!(
+            engine.groups().expect("groups").iter().any(|g| g.id == group_id),
+            "the moved store keeps its groups"
+        );
+        drop(engine);
+        assert!(opens_as_v2(&path, Key::Raw(&store_raw_key(&host_key))).is_some());
+        assert!(opens_as_v2(&path, Key::Passphrase(&sqlcipher_passphrase(&host_key))).is_none());
+        let mut staged = path.as_os_str().to_owned();
+        staged.push(".rekey");
+        assert!(!Path::new(&staged).exists(), "no staged export is left behind");
+    }
+
+    /// A file that is no v2 store under the passphrase is left untouched, so
+    /// `persistent` goes on to v1 detection.
+    #[test]
+    fn rekey_leaves_a_store_it_cannot_read_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("marmot.sqlite");
+        let other = keyed(&path, Key::Raw(&[1u8; 32]));
+        other.execute_batch("CREATE TABLE groups (id BLOB);").unwrap();
+        drop(other);
+        let before = std::fs::read(&path).unwrap();
+        assert!(!rekey_passphrase_store(&path, &[2u8; 32]).expect("probe"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+/// HKDF-SHA256 label for the v2 store's raw SQLCipher key. Changing it
+/// orphans every v2 store on disk.
+const STORE_KEY_HKDF_INFO: &[u8] = b"sonar/marmot-v2-store/sqlcipher-raw-key";
+
+/// Bytes of the MDK v2 store's SQLCipher key: HKDF-SHA256 of the host's
+/// 32-byte key under [`STORE_KEY_HKDF_INFO`], applied as a raw key.
+///
+/// Raw, because a passphrase makes SQLCipher run PBKDF2-HMAC-SHA512 (256,000
+/// iterations) on every open. The iOS simulator cold-start bench measured it
+/// as +88 ms of first local paint against `main` (t0 -> t1 212 -> 300 ms,
+/// 2026-11-07), and every NSE wake opens the store too. The host key is
+/// already 32 random bytes, so the stretching protected nothing.
+///
+/// Derived, not the host key itself: v1 (MDK 0.8) keyed its store with the
+/// raw host key, so that key would decrypt a v1 file and MDK v2 would run its
+/// migrations over the v1 schema. Under its own label, a v2 open of a v1 file
+/// still fails as "not a database", which is how [`MarmotEngine::persistent`]
+/// finds a v1 store to migrate.
+pub(crate) fn store_raw_key(key: &[u8; 32]) -> [u8; 32] {
+    let mut okm = [0u8; 32];
+    ::hkdf::Hkdf::<::sha2::Sha256>::new(None, key)
+        .expand(STORE_KEY_HKDF_INFO, &mut okm)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
+}
+
+/// How the first MDK v0.14 builds keyed the v2 store: the host key's hex as
+/// a SQLCipher passphrase (`PRAGMA key = '<hex>'`). Only read now, to move
+/// such a store to [`store_raw_key`] once ([`rekey_passphrase_store`]).
 fn sqlcipher_passphrase(key: &[u8; 32]) -> String {
     hex::encode(key)
+}
+
+/// MDK v2's migration ledger; its presence marks a decrypted v2 store.
+const V2_LEDGER_TABLE: &str = "cgka_schema_migrations";
+
+fn v2_ledger_rows(conn: &rusqlite::Connection, schema: &str) -> Option<i64> {
+    let present: i64 = conn
+        .query_row(
+            &format!("SELECT count(*) FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"),
+            [V2_LEDGER_TABLE],
+            |row| row.get(0),
+        )
+        .ok()?;
+    if present != 1 {
+        return None;
+    }
+    conn.query_row(&format!("SELECT count(*) FROM {schema}.{V2_LEDGER_TABLE}"), [], |row| {
+        row.get(0)
+    })
+    .ok()
+}
+
+/// Move a v2 store keyed with [`sqlcipher_passphrase`] to [`store_raw_key`].
+///
+/// `Ok(false)` when `path` is not such a store (a v1 store, a store that
+/// failed to open for another reason, a wrong host key); the file is then
+/// untouched. Otherwise the WAL is folded in, the content is exported into a
+/// sibling file under the raw key, the export is checked to carry the same
+/// migration ledger, and it replaces `path` by rename: a crash leaves the old
+/// store or the new one, never a mix. It runs once per such store, and only
+/// on an open that already failed, so PBKDF2 is paid here and nowhere else.
+fn rekey_passphrase_store(path: &Path, key: &[u8; 32]) -> Result<bool> {
+    use rusqlite::{params, Connection};
+    let fail = |what: &str, e: rusqlite::Error| Error::Storage(format!("v2 store rekey, {what}: {e}"));
+
+    let conn = Connection::open(path).map_err(|e| fail("open", e))?;
+    conn.pragma_update(None, "cipher_compatibility", 4)
+        .map_err(|e| fail("cipher_compatibility", e))?;
+    conn.pragma_update(None, "key", sqlcipher_passphrase(key))
+        .map_err(|e| fail("key", e))?;
+    // Under a wrong key the first read fails ("file is not a database").
+    let Some(ledger) = v2_ledger_rows(&conn, "main") else {
+        return Ok(false);
+    };
+    let busy: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(|e| fail("wal_checkpoint", e))?;
+    if busy != 0 {
+        return Err(Error::Storage(
+            "v2 store rekey: WAL checkpoint busy, another connection holds the store".into(),
+        ));
+    }
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|e| fail("user_version", e))?;
+
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".rekey");
+    let staged = PathBuf::from(staged);
+    remove_sqlite_files(&staged);
+    let raw = format!("x'{}'", hex::encode(store_raw_key(key)));
+    conn.execute(
+        "ATTACH DATABASE ?1 AS rekeyed KEY ?2",
+        params![staged.to_string_lossy(), raw],
+    )
+    .map_err(|e| fail("attach", e))?;
+    let exported = conn
+        .query_row("SELECT sqlcipher_export('rekeyed')", [], |_| Ok(()))
+        .and_then(|()| conn.execute_batch(&format!("PRAGMA rekeyed.user_version = {user_version};")))
+        .map_err(|e| fail("export", e))
+        .and_then(|()| match v2_ledger_rows(&conn, "rekeyed") {
+            Some(rows) if rows == ledger => Ok(()),
+            other => Err(Error::Storage(format!(
+                "v2 store rekey: export carries {other:?} ledger rows, the store {ledger}"
+            ))),
+        });
+    let _ = conn.execute_batch("DETACH DATABASE rekeyed;");
+    drop(conn);
+    if let Err(e) = exported {
+        remove_sqlite_files(&staged);
+        return Err(e);
+    }
+    // The WAL is empty after the TRUNCATE checkpoint; drop it with the shm so
+    // the new file never meets the old one's sidecars.
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
+    std::fs::rename(&staged, path).map_err(|e| {
+        remove_sqlite_files(&staged);
+        Error::Storage(format!("v2 store rekey, replace the store: {e}"))
+    })?;
+    Ok(true)
+}
+
+/// Remove a SQLite file and its journal sidecars, ignoring absent ones.
+fn remove_sqlite_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
 }
 
 /// Result of creating a group: the group plus already-wrapped welcomes that
@@ -1049,9 +1307,10 @@ impl MarmotEngine {
 
     /// Persistent engine backed by an encrypted SQLCipher database at `db_path`.
     ///
-    /// `key` is the 32-byte host key. It is encoded as lowercase hex and passed
-    /// to MDK 0.9 as a SQLCipher passphrase (`PRAGMA key = '<hex>'`), not the
-    /// 0.8 raw-key form `x'<hex>'`.
+    /// `key` is the 32-byte host key. The store is keyed with a raw SQLCipher
+    /// key derived from it ([`store_raw_key`]); v1 used the host key itself as
+    /// the raw key, and the first v0.14 builds its hex as a passphrase, which
+    /// is moved to the raw key on the first open that meets it.
     ///
     /// An existing 0.8 store is **not** wiped. Plaintext chat rows are copied
     /// into the host transcript sidecar, the 0.8 file is quarantined as
@@ -1089,7 +1348,19 @@ impl MarmotEngine {
                 );
                 Ok(engine)
             }
-            Err(e) if path.exists() => Self::migrate_mdk08_or_fail(identity, path, key, e),
+            // A store the first v0.14 builds keyed with the passphrase: move it
+            // to the raw key once, then open it like any other.
+            Err(e) if path.exists() => match rekey_passphrase_store(path, &key) {
+                Ok(true) => {
+                    tracing::info!("marmot: moved a passphrase-keyed v2 store to its raw key");
+                    Self::open_session(identity, path, key, true)
+                }
+                Ok(false) => Self::migrate_mdk08_or_fail(identity, path, key, e),
+                Err(rekey_err) => Err(Error::Storage(format!(
+                    "{e}; moving a passphrase-keyed v2 store to its raw key failed \
+                     (store left intact): {rekey_err}"
+                ))),
+            },
             Err(e) => Err(e),
         }
     }
@@ -1146,8 +1417,7 @@ impl MarmotEngine {
     ) -> Result<Self> {
         let keys = identity.keys().clone();
         let peeler = Box::new(SonarWelcomePeeler::new(keys.clone()));
-        let sqlcipher_key = SqlCipherKey::new(sqlcipher_passphrase(&key))
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let sqlcipher_key = SqlCipherKey::raw(store_raw_key(&key));
         let mut config = SessionConfig::new(
             db_path.to_path_buf(),
             sqlcipher_key,

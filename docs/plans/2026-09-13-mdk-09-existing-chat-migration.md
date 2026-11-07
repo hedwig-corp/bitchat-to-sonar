@@ -58,7 +58,7 @@ SQLCipher keying also changed:
 | Store | `PRAGMA key` | Schema |
 | --- | --- | --- |
 | MDK 0.8 (`mdk-sqlite-storage`) | `"x'<hex>'"` raw key | `groups` / `messages` / OpenMLS tables |
-| MDK 0.9 (`storage-sqlite`) | `'<hex>'` passphrase | account-device session |
+| MDK 0.9+ (`storage-sqlite`) | `"x'<HKDF-SHA256(host key)>'"` raw key (`store_raw_key`); the first v0.14 builds used a `'<hex>'` passphrase | account-device session |
 
 `storage-sqlite` cannot open or upgrade a 0.8 file. Treating the open error as
 "wipe and recreate" is forbidden by the Account Key Durability Rule.
@@ -119,7 +119,9 @@ What the user does **not** keep automatically:
 
 `MarmotEngine::persistent`:
 
-1. Try MDK 0.9 open (passphrase key, `defer_group_hydration`).
+1. Try MDK 0.9 open (derived raw key, `defer_group_hydration`). If that
+   fails and the file is a v2 store under the old passphrase, re-encrypt it
+   under the raw key once (`rekey_passphrase_store`) and open again.
 2. If the file is plaintext `SQLite format 3`, wipe + recreate (existing
    self-heal).
 3. If 0.9 open fails and the file exists:
@@ -299,10 +301,10 @@ the sidecars next to the DB, including the staged-restore rename path.
 A restore that omits a sidecar deletes the leftover outgoing file so the
 previous account's transcript cannot leak across nsec restore.
 
-SQLCipher open for seal/verify tries the 0.8 raw key (`x'<hex>'`) and the
-0.9 passphrase (`'<hex>'`) and requires at least one user table. The
-conversation index stays on the raw key; the live Marmot file is
-passphrase-keyed after migrate.
+SQLCipher open for seal/verify tries the v2 store's derived raw key, the
+host key raw (`x'<hex>'`: the conversation index and a 0.8 store) and the
+old v2 passphrase (`'<hex>'`), and requires at least one user table. The
+live Marmot file is keyed with the derived raw key after migrate.
 
 A **v1 backup taken before upgrade** is only the 0.8 SQLCipher file.
 Restore writes those bytes; `MarmotEngine::persistent` runs decrypt-and-move

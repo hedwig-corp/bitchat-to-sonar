@@ -164,15 +164,25 @@ a lockfile bump:
   Kind-445 `#h` is the 32-byte `nostr_group_id` from the founding routing
   component, not the 16-byte MLS group id hosts use as a conversation id.
 - **Existing 0.8 SQLCipher stores cannot be opened in place as MLS state.**
-  MDK 0.9 applies the key as a passphrase (`PRAGMA key = '<hex>'`), not the
-  0.8 raw-key form `PRAGMA key = "x'HEX'"`, and the Marmot wire format moved
-  `0xf2ee` → `0xf2f1`. `MarmotEngine::persistent` must **not** wipe that file.
+  The v2 store is keyed with a raw key derived from the host key
+  (HKDF-SHA256, `marmot.rs::store_raw_key`), not the host key the 0.8 store
+  uses (`PRAGMA key = "x'HEX'"`), so a 0.8 file never decrypts as a v2 store,
+  and the Marmot wire format moved `0xf2ee` → `0xf2f1`. (The first v0.14
+  builds used the host key's hex as a passphrase, `PRAGMA key = '<hex>'`,
+  which made SQLCipher run PBKDF2 on every open; the next open moves such a
+  store to the raw key.) `MarmotEngine::persistent` must **not** wipe that file.
   It decrypts the 0.8 `messages` table with the raw key, copies plaintext
   chat onto the host transcript sidecar, quarantines the 0.8 file as
   `*.mdk08.bak`, and creates a fresh 0.9 store. Wrong-key opens stay a hard
   error and must not delete or quarantine the store. Only a proven
   unencrypted sqlite file is self-healed. MLS membership is not imported —
   see `docs/plans/2026-09-13-mdk-09-existing-chat-migration.md`.
+- **SQLCipher memory security stays off.** MDK v0.14 turns
+  `cipher_memory_security` on by default; Sonar turns it off on every
+  platform, as v1 always ran (`marmot.rs::sonar_storage_options`). The store
+  stays encrypted at rest; what is not done is wiping freed SQLite heap and
+  pinning it out of swap. It is process-wide and cost an `mlock`/`munlock`
+  pair per SQLite allocation: about 3× on group creation in release.
 - **Stage 1 of this port** keeps the host-facing `MarmotEngine` / `SonarClient`
   API (hex group ids, publish-then-`confirm_published`). Multi-device (Stage 2)
   is not in this change.
