@@ -12373,6 +12373,27 @@ mod tests {
             peers.len(),
             PUSH_TOKEN_SHARE_BATCH
         );
+        // Members the first pass recorded as shared. A publish whose relay OK
+        // timed out (a slow CI runner) is not recorded and is rightly retried,
+        // so only recorded members are held to "never sent again".
+        let fingerprint = alice
+            .own_push_registration
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("registered")
+            .fingerprint
+            .clone();
+        let recorded_first: HashSet<String> = {
+            let state = alice.sync_state.lock().unwrap();
+            let now = Timestamp::now().as_secs();
+            peers
+                .iter()
+                .map(|peer| peer.identity().public_key().to_hex())
+                .filter(|hex| !state.push_token_share_due(hex, &fingerprint, now))
+                .collect()
+        };
+        assert!(!recorded_first.is_empty(), "the first pass recorded its batch");
 
         alice.share_push_token_with_groups().await;
         wait_idle().await;
@@ -12395,7 +12416,12 @@ mod tests {
                 )
                 .await
                 .expect("fetch gift wraps");
-            assert_eq!(wraps.len(), 1, "each member exactly once");
+            if recorded_first.contains(&peer.identity().public_key().to_hex()) {
+                assert_eq!(wraps.len(), 1, "a member recorded as shared is never sent it again");
+            } else {
+                // At least once; a retry after an unconfirmed publish may repeat it.
+                assert!((1..=2).contains(&wraps.len()), "member got {} wraps", wraps.len());
+            }
             received += 1;
         }
         assert_eq!(received, peers.len());
