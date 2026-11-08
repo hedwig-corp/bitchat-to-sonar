@@ -106,7 +106,7 @@ async fn main() {
             reply_peers.push(peer);
         } else {
             let peer = MarmotEngine::in_memory(Identity::generate());
-            let kp = peer.key_package_event(relays.clone()).expect("peer key package");
+            let kp = peer.key_package_event(relays.clone()).await.expect("peer key package");
             publisher.send_event(&kp).await.expect("publish peer key package");
             silent_peers.push(peer);
         }
@@ -142,7 +142,7 @@ async fn main() {
 
     // A second 1:1 group with some peers (a later duplicate of the same chat).
     for (i, peer) in silent_peers.iter().take(dup_n).enumerate() {
-        let kp = peer.key_package_event(relays.clone()).expect("second key package");
+        let kp = peer.key_package_event(relays.clone()).await.expect("second key package");
         let group = me
             .start_dm_with_key_package(kp, &format!("dup {i}"))
             .await
@@ -160,7 +160,7 @@ async fn main() {
         let mut members = Vec::new();
         for _ in 0..3 {
             let peer = MarmotEngine::in_memory(Identity::generate());
-            let kp = peer.key_package_event(relays.clone()).expect("member key package");
+            let kp = peer.key_package_event(relays.clone()).await.expect("member key package");
             publisher.send_event(&kp).await.expect("publish member key package");
             members.push(peer.identity().public_key());
         }
@@ -181,7 +181,7 @@ async fn main() {
         for _ in 0..40 {
             let _ = peer.sync().await;
             if let Some(group) = peer.groups().ok().and_then(|g| g.into_iter().next()) {
-                joined = Some(group.mls_group_id);
+                joined = Some(group.id);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -196,11 +196,9 @@ async fn main() {
         .groups()
         .expect("groups")
         .into_iter()
-        .map(|g| {
-            (
-                hex::encode(g.mls_group_id.as_slice()),
-                hex::encode(g.nostr_group_id),
-            )
+        .filter_map(|g| {
+            let h = me.nostr_group_id_hex(&g.id)?;
+            Some((hex::encode(g.id.as_slice()), h))
         })
         .collect();
     for entry in &mut manifest_groups {

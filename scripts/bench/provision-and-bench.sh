@@ -27,6 +27,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUNDLE_ID="sh.hedwig.sonar"
+APP_GROUP="group.sh.hedwig.sonar"
 APP_PATH=""
 DEVICE=""
 RUNS=5
@@ -84,6 +85,13 @@ UDID="$(resolve_device)"; [[ -n "$UDID" ]] || { echo "no device" >&2; exit 1; }
 log "device: $UDID"
 xcrun simctl bootstatus "$UDID" -b >/dev/null 2>&1 || xcrun simctl boot "$UDID" || true
 log "clean install (wipe any prior identity/onboarding state)…"
+# The Marmot store lives in the App Group container, which an uninstall can
+# leave behind; identity A derives a new DB key and could not open an earlier
+# run's store. Clear it while the installed app still resolves the container.
+if group="$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" "$APP_GROUP" 2>/dev/null)" &&
+   [[ -n "$group" && -d "$group" ]]; then
+  find "$group" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+fi
 xcrun simctl uninstall "$UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl install "$UDID" "$APP_PATH"
 
@@ -91,20 +99,33 @@ xcrun simctl install "$UDID" "$APP_PATH"
 # simctl launch passes env vars prefixed with SIMCTL_CHILD_ to the app.
 log "launching sim as identity A to publish KeyPackage…"
 xcrun simctl terminate "$UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
-SIMCTL_CHILD_SONAR_BENCH_NSEC="$NSEC_A" xcrun simctl launch "$UDID" "$BUNDLE_ID" >/dev/null
+launched="$(SIMCTL_CHILD_SONAR_BENCH_NSEC="$NSEC_A" xcrun simctl launch "$UDID" "$BUNDLE_ID")"
+APP_PID="${launched##*: }"
+[[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "ERROR: could not read the app pid from: $launched" >&2; exit 1; }
 
-# Poll the unified log until the sim reports relay-connected (KeyPackage publish
-# follows immediately after). --info because SecureLogger markers are info level.
-log "waiting for sim relay-connect (t3)…"
+# Poll the unified log until THIS launch reports relay-connected (KeyPackage
+# publish follows immediately after). --info because SecureLogger markers are
+# info level. Filtering on the pid matters: a marker from an earlier launch
+# inside the window used to pass this wait while the new app was stuck.
+log "waiting for sim relay-connect (t3, pid $APP_PID)…"
+connected=0
 for _ in $(seq 1 40); do
-  if xcrun simctl spawn "$UDID" log show --last 2m --info --debug --style compact \
-       --predicate 'eventMessage CONTAINS "SONAR_BENCH t3_relay_connected"' 2>/dev/null \
-       | grep -q t3_relay_connected; then
+  seen="$(xcrun simctl spawn "$UDID" log show --last 2m --info --debug --style compact \
+       --predicate "processID == $APP_PID AND (eventMessage CONTAINS \"SONAR_BENCH t3_relay_connected\" OR eventMessage CONTAINS \"local open failed\")" \
+       2>/dev/null || true)"
+  if grep -q t3_relay_connected <<<"$seen"; then
+    connected=1
     log "  relay connected."
     break
   fi
+  if open_err="$(grep -o 'local open failed: .*' <<<"$seen" | tail -1)" && [[ -n "$open_err" ]]; then
+    echo "ERROR: the app could not open its Marmot store (${open_err#local open failed: })." >&2
+    echo "   An unsigned build has no App Group; build with scripts/bench/build-sim.sh." >&2
+    exit 1
+  fi
   sleep 2
 done
+(( connected )) || { echo "ERROR: the app (pid $APP_PID) never reported t3_relay_connected" >&2; exit 1; }
 sleep 6  # let publishKeyPackage land on the relays
 
 # --- 4. provisioning DM (auto-joins on the sim) ------------------------------

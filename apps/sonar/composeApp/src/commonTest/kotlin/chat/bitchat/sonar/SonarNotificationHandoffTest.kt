@@ -89,6 +89,118 @@ class SonarNotificationHandoffTest {
     }
 
     @Test
+    fun resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling() {
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("group-09"),
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "group-08",
+                knownChatIds = setOf("group-09"),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("missing-live"),
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "group-08",
+                knownChatIds = setOf("group-09"),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = mapOf("group-08" to "missing-live"),
+            ),
+        )
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("group-09"),
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "group-08",
+                knownChatIds = emptySet(),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = mapOf("group-08" to "group-09"),
+            ),
+        )
+    }
+
+    @Test
+    fun notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown() {
+        val fromBlob = SonarNotificationHandoff.notificationLiveFoldTargets(
+            conversationId = "marmot:group-08",
+            persistedFolds = mapOf("group-08" to "group-09"),
+            ffiLiveFoldTarget = null,
+        )
+        assertEquals("group-09", fromBlob["group-08"])
+        assertEquals("group-09", fromBlob["marmot:group-08"])
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("group-09"),
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "marmot:group-08",
+                knownChatIds = setOf("group-09"),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = fromBlob,
+            ),
+        )
+    }
+
+    @Test
+    fun notificationLiveFoldTargetsPrefersFfiOverStaleBlob() {
+        val fromFfi = SonarNotificationHandoff.notificationLiveFoldTargets(
+            conversationId = "group-08",
+            persistedFolds = mapOf("group-08" to "stale-09"),
+            ffiLiveFoldTarget = "group-09",
+        )
+        assertEquals("group-09", fromFfi["group-08"])
+        assertEquals(
+            emptyMap(),
+            SonarNotificationHandoff.notificationLiveFoldTargets(
+                conversationId = "group-08",
+                persistedFolds = emptyMap(),
+                ffiLiveFoldTarget = null,
+            ),
+        )
+        val fromRemount = SonarNotificationHandoff.notificationLiveFoldTargets(
+            conversationId = "marmot:group-08",
+            persistedFolds = emptyMap(),
+            ffiLiveFoldTarget = null,
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("group-09", fromRemount["group-08"])
+        assertEquals("group-09", fromRemount["marmot:group-08"])
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("group-09"),
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "marmot:group-08",
+                knownChatIds = setOf("group-09"),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = fromRemount,
+            ),
+        )
+        assertEquals(
+            "stale-09",
+            SonarNotificationHandoff.notificationLiveFoldTargets(
+                conversationId = "group-08",
+                persistedFolds = mapOf("group-08" to "stale-09"),
+                ffiLiveFoldTarget = null,
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            )["group-08"],
+            "persist-folds win over remount pair",
+        )
+        val fromUnrelatedPersist = SonarNotificationHandoff.notificationLiveFoldTargets(
+            conversationId = "marmot:group-08",
+            persistedFolds = mapOf("other-08" to "other-09"),
+            ffiLiveFoldTarget = null,
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("group-09", fromUnrelatedPersist["group-08"])
+        assertEquals("group-09", fromUnrelatedPersist["marmot:group-08"])
+    }
+
+    @Test
     fun normalizeJumpMessageIdTrimsAndDropsBlanks() {
         assertEquals("msg-1", SonarNotificationHandoff.normalizeJumpMessageId(" msg-1 "))
         assertNull(SonarNotificationHandoff.normalizeJumpMessageId("   "))
