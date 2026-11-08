@@ -230,6 +230,48 @@ send; the apps replace the composer. Design and bounds:
   `MarmotProtocolGateTests.aLiveBluetoothLinkKeepsAMeshFoldedChatOpen`.
 - **Origin:** 2026-11-08, same release as QA-216.
 
+### QA-218 — A NEW chat with someone already on Marmot v2 shows "Update Sonar", not a setup error
+- **Platforms:** both (Android scripted; iOS driven by `ios-drive.sh`). The
+  v2 side is a `sonar-cli` built from #683's branch (`SONAR_CLI_V2`).
+- **Steps:** a fresh peer (`peers.sh new`) moves to v2 before the app ever
+  chats with it: `"$SONAR_CLI_V2" --home $QA_HOME/peers/<peer> publish`
+  republishes its KeyPackage as v2 into the same slot. In the app, start a
+  chat with the peer's npub (Search → Start secure chat, or Start a chat →
+  key). Variants: (b) the peer also has an install still on v1 ("Mixed",
+  e.g. a phone on v1 and a Mac on v2 with the same account) and the v2 one
+  published last; (c) a mesh chat with a v2 peer that goes out of Bluetooth
+  range and falls back to the internet.
+- **Expect:** the pending chat paints at once with its composer (no wait on
+  the relays). Within a few seconds the composer is replaced by "<name> has
+  updated Sonar. Update the app to keep chatting" with an **Update Sonar**
+  button, and the user stays in the chat: no "couldn't start secure chat"
+  error, and the Mac pane is not sent back to the radar. A message typed
+  before the answer shows "Couldn't send". (b) The chat is created and works:
+  the v1 install receives the welcome and the messages, even though the v2
+  package is newer. (c) Out of range the mesh chat shows the update panel; in
+  range it keeps its composer and sends over Bluetooth.
+  - Performance: one KeyPackage REQ for the new chat, in the background setup
+    after the pending chat painted, and none when the chat then opens (the
+    answer is stored for the gate; the open-chat recheck finds it fresh).
+- **How:** `android-smoke.sh` QA-218 (needs `SONAR_CLI_V2`; SKIP without it).
+  iOS: the same peer steps, then type the npub in the home search with
+  `ios-drive.sh` (`type:<npub>`), `tapc:Start secure chat`,
+  `expect:has updated Sonar@45`, `absent:Message`, `tree:`, `shot:`. (b) and
+  (c) are manual.
+- **Guard:** core `marmot_protocol_gate_tests::starting_a_chat_with_a_contact_on_marmot_v2_fails_with_the_update_error`
+  (`start_dm` and `start_group` refuse, no group left behind, the contact is
+  stored as V2Only), `starting_a_chat_with_a_mixed_contact_invites_their_v1_install`
+  (the phone gets the welcome although the v2 package is newer, and the
+  chat's first recheck queues no second REQ; both go red on the old
+  newest-only lookup), `marmot_protocol::tests::a_new_chat_*`;
+  Compose `PendingChatPeerUpdatedTest` (`SonarAppState.startChat` → pending
+  setup → `composerGate`, red without the change); iOS
+  `PendingChatPeerUpdatedTests` (`SonarAppStore.startSecureChat` → setup →
+  `composerGate`, no route failure). The mesh fallback (c) has no host test.
+- **Origin:** 2026-11-08, follow-up to QA-216 (#684): a new chat from a v1
+  build with a v2-only npub reached MDK 0.8 `create_group` with the v2
+  KeyPackage and failed with an opaque error.
+
 ## Cross-client Bluetooth mesh (#671)
 
 The codec half of mesh interop is proved in CI: `scripts/bitchat-vectors/cross-replay.sh`

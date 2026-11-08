@@ -963,6 +963,29 @@ qa216() { # a contact who moved to Marmot v2 (MDK v0.14): composer → "Update S
   ui key 4
 }
 
+qa218() { # a NEW chat with someone already on Marmot v2: "Update Sonar" in the pending chat, not a setup error
+  [[ -x "${SONAR_CLI_V2:-}" ]] || {
+    record QA-218 SKIP "set SONAR_CLI_V2 to a sonar-cli built from the MDK v0.14 branch (#683)"; return; }
+  local peer="v2new-$RUN" npub t0 generic
+  npub="$("$PEERS" new "$peer")" || { record QA-218 FAIL "peer init failed"; return; }
+  # They moved to v2 before we ever chatted: their one slot now holds a v2 package.
+  "$SONAR_CLI_V2" --home "$QA_HOME/peers/$peer" publish >/dev/null 2>&1 ||
+    { record QA-218 FAIL "v2 sonar-cli could not publish from the v1 home"; return; }
+  t0=$SECONDS
+  open_chat_by_npub "$npub" || { record QA-218 FAIL "the pending chat did not open by npub"; return; }
+  if ! "$UI" wait "has updated Sonar" 45 >/dev/null; then
+    generic="$("$UI" find "start secure chat:" 2>/dev/null)"
+    record QA-218 FAIL "no update panel $((SECONDS - t0))s after opening${generic:+ (generic setup error shown)}"
+    ui key 4; return
+  fi
+  if hasx "Update Sonar" && ! hasx "Add to your message"; then
+    record QA-218 PASS "pending chat showed the update panel $((SECONDS - t0))s after opening"
+  else
+    record QA-218 FAIL "update text shown but the composer controls are still there"
+  fi
+  ui key 4
+}
+
 qa187() { # cold launch on slow mobile data: first frame never waits for push's relay attach (#665)
   if [[ "$QA_SERIAL" != emulator-* ]]; then
     record QA-187 SKIP "needs an emulator: the link is shaped through its console"; return
@@ -1039,7 +1062,7 @@ sleep 3
 # so it runs after the UI scenarios and restores Wi-Fi before QA-050 measures
 # idle CPU. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa189 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa216 qa187 qa050 qa118; do
+for s in qa001 qa002 qa189 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa216 qa218 qa187 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"
