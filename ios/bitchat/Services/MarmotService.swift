@@ -85,6 +85,21 @@ final class MarmotService: @unchecked Sendable {
         let memberNpubs: [String]
     }
 
+    /// Marmot v1 → v2 flag day: whether a chat's other members can still read
+    /// what this MDK 0.8 build sends (core folds each contact's KeyPackages;
+    /// see `core/sonar-core/src/marmot_protocol.rs`).
+    enum MarmotChatGate: Sendable, Equatable, Hashable {
+        /// Send normally (nobody moved, or Mixed / Unknown).
+        case open
+        /// Every other member moved to Marmot v2: core refuses the send.
+        case blocked(updatedMemberHexes: [String])
+        /// Some group members moved and will not read new messages.
+        case partlyUpdated(updatedMemberHexes: [String])
+    }
+
+    /// Substring of core's refusal when every other member moved to Marmot v2.
+    static let peerUpdatedSonarMarker = "peer has updated Sonar"
+
     struct PeerTimezone: Sendable, Equatable {
         let senderNpub: String
         /// MLS group the zone was shared into; sharing is per chat.
@@ -1446,6 +1461,31 @@ final class MarmotService: @unchecked Sendable {
         _ = try? await run {
             try $0.requireNode().revokeTimezoneShare(groupIdHexes: groupIdHexes)
         }
+    }
+
+    /// Local-only read of a chat's Marmot v1 → v2 gate (cache + member read,
+    /// no relay). Open on any failure: core still refuses an unreadable send.
+    func marmotChatGate(groupIds: [String]) async -> MarmotChatGate {
+        let groups = Array(Set(groupIds.filter { !$0.isEmpty }))
+        guard !groups.isEmpty else { return .open }
+        return await readOnlyNonThrowing({ node in
+            let info = node.marmotChatGate(groupIdHexes: groups)
+            switch info.state {
+            case .open: return .open
+            case .blocked: return .blocked(updatedMemberHexes: info.updatedMemberHexes)
+            case .partlyUpdated: return .partlyUpdated(updatedMemberHexes: info.updatedMemberHexes)
+            }
+        }, default: .open)
+    }
+
+    /// Recheck these groups' members' Marmot protocol from their KeyPackages:
+    /// one bounded relay fetch, skipped while fresh. On the lookup lane, never
+    /// `workQueue`, so it cannot sit in front of sync or a drain; callers run
+    /// it after local paint. Changes arrive on `conversationChanged`.
+    func refreshMarmotChatProtocol(groupIds: [String]) async {
+        let groups = Array(Set(groupIds.filter { !$0.isEmpty }))
+        guard !groups.isEmpty else { return }
+        _ = try? await lookupLane { try $0.refreshMarmotChatProtocol(groupIdHexes: groups) }
     }
 
     /// Local-only batch read of the zones members shared into these groups.

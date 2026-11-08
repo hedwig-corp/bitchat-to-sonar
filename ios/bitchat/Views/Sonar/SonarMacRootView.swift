@@ -840,9 +840,21 @@ private struct MacConversationPane: View {
         return prefix + (transport == .internet ? "Via internet" : "Waiting for Bluetooth")
     }
 
+    /// Marmot v1 → v2: every other member moved to a Sonar this build cannot
+    /// write to. A live Bluetooth link keeps the composer (BLE is unaffected).
+    private var composerGate: SNComposerGate { isChannel ? .open : store.composerGate(id) }
+
     @ViewBuilder private var banner: some View {
         if isChannel {
             SNBanner(icon: .people, tone: .publicRoom, bold: "Public channel", rest: " - anyone nearby can read")
+        } else if case .partlyUpdated(let count) = composerGate {
+            SNBanner(
+                icon: .globe, tone: .net,
+                bold: SNMarmotGateCopy.partlyUpdatedBold(count),
+                rest: SNMarmotGateCopy.partlyUpdatedRest
+            ) {
+                SNBannerButton(label: "Update") { NSWorkspace.shared.open(SNAppUpdate.url) }
+            }
         } else if isNoteToSelf {
             SNBanner(icon: .lock, tone: .enc, bold: "End-to-end encrypted", rest: " - only you can read this")
         } else if verified {
@@ -899,6 +911,16 @@ private struct MacConversationPane: View {
     }
 
     private var composer: some View {
+        SNMarmotComposerSlot(
+            gate: composerGate,
+            peerName: peer.name,
+            onUpdate: { NSWorkspace.shared.open(SNAppUpdate.url) }
+        ) {
+            composerBody
+        }
+    }
+
+    private var composerBody: some View {
         VStack(spacing: 0) {
             if !isChannel, let reply = store.composerReply(for: id) {
                 SNComposerReplyBanner(reply: reply) {
