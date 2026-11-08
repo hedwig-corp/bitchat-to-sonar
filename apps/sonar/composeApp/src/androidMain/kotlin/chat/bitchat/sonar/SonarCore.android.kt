@@ -575,6 +575,27 @@ actual object SonarCore {
         Unit
     }
 
+    actual suspend fun marmotChatGate(groupIdHexes: List<String>): SonarMarmotChatGate =
+        withContext(Dispatchers.IO) {
+            val gate = node?.marmotChatGate(groupIdHexes)
+                ?: return@withContext SonarMarmotChatGate(SonarMarmotChatGateState.Open)
+            SonarMarmotChatGate(
+                state = when (gate.state) {
+                    uniffi.sonar_ffi.MarmotChatGateState.OPEN -> SonarMarmotChatGateState.Open
+                    uniffi.sonar_ffi.MarmotChatGateState.BLOCKED -> SonarMarmotChatGateState.Blocked
+                    uniffi.sonar_ffi.MarmotChatGateState.PARTLY_UPDATED ->
+                        SonarMarmotChatGateState.PartlyUpdated
+                },
+                updatedMemberHexes = gate.updatedMemberHexes,
+            )
+        }
+
+    actual suspend fun refreshMarmotChatProtocol(groupIdHexes: List<String>): Unit =
+        withContext(Dispatchers.IO) {
+            node?.refreshMarmotChatProtocol(groupIdHexes)
+            Unit
+        }
+
     actual suspend fun messagesCursorPage(
         chatId: String,
         beforeSecs: Long?,
