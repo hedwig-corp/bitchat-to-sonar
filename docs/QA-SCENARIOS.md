@@ -217,8 +217,16 @@ send; the apps replace the composer. Design and bounds:
   v1 users are protected when their contacts update.
 
 ### QA-217 — Groups and Bluetooth around the v2 check
-- **Platforms:** both (manual: the CLI peers cannot accept group invites
-  headlessly, and Bluetooth needs two devices).
+- **Platforms:** both. (a) and (b) run with CLI peers (`sonar-cli accept`
+  takes a group invite); (c) needs two Bluetooth devices.
+- **How (a, b):** create two v1 peers, make a group with both from the app's
+  New group sheet, `accept` on each peer, then move one peer with
+  `"$SONAR_CLI_V2" --home <peer> publish`. Reopen the group more than
+  2 minutes after its last check (the open-chat recheck window), then move
+  the second peer and reopen again. On iOS, run it against a local relay:
+  the DEBUG hooks `SONAR_BENCH_NSEC` + `SONAR_BENCH_RELAYS` point the app
+  there, and the CLI takes `--relay`. Public relays rate-limit a busy QA
+  host, so invites and KeyPackages go missing there.
 - **Steps:** (a) a group with two other members, one moved to v2 (as in
   QA-216) and one still on v1. (b) Move the second member too. (c) A
   mesh-folded chat (`docs/CHAT-TYPES.md`) with a peer on v2, first in
