@@ -274,6 +274,19 @@ impl ConversationIndex {
         )
         .map_err(|e| crate::Error::Storage(format!("index create peer_timezone_by_group: {e}")))?;
 
+        // Each contact's Marmot protocol, folded from their KeyPackages
+        // (`marmot_protocol`). Ensured on every open like the tables above,
+        // so it needs no version bump and a branch build's stamp cannot hide
+        // it. Losing it only costs a refetch: the gate reads Unknown (open).
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS peer_marmot_protocol (
+                pubkey_hex      TEXT PRIMARY KEY,
+                protocol        INTEGER NOT NULL,
+                checked_at_secs INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .map_err(|e| crate::Error::Storage(format!("index create peer_marmot_protocol: {e}")))?;
+
         Ok(())
     }
 
@@ -592,6 +605,85 @@ impl ConversationIndex {
         Ok(())
     }
 
+    /// Every cached contact protocol. The table holds one small row per
+    /// contact ever checked, so the caller loads it once and keeps it in memory.
+    pub fn peer_marmot_protocols(
+        &self,
+    ) -> Result<Vec<(String, crate::marmot_protocol::PeerProtocolRecord)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT pubkey_hex, protocol, checked_at_secs FROM peer_marmot_protocol")
+            .map_err(|e| crate::Error::Storage(format!("index protocol prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    crate::marmot_protocol::PeerProtocolRecord {
+                        protocol: crate::marmot_protocol::PeerMarmotProtocol::from_db(
+                            row.get::<_, i64>(1)?,
+                        ),
+                        checked_at_secs: row.get::<_, i64>(2)?.max(0) as u64,
+                    },
+                ))
+            })
+            .map_err(|e| crate::Error::Storage(format!("index protocol query: {e}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::Error::Storage(format!("index protocol row: {e}")))?;
+        Ok(rows)
+    }
+
+    /// Write a refresh batch's records in ONE transaction (one fsync per
+    /// batch, never one per contact).
+    pub fn upsert_peer_marmot_protocols(
+        &self,
+        records: &[(String, crate::marmot_protocol::PeerProtocolRecord)],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Storage(format!("index protocol begin: {e}")))?;
+        for (pubkey_hex, record) in records {
+            tx.execute(
+                "INSERT INTO peer_marmot_protocol (pubkey_hex, protocol, checked_at_secs)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(pubkey_hex) DO UPDATE SET
+                    protocol = excluded.protocol,
+                    checked_at_secs = excluded.checked_at_secs",
+                params![
+                    pubkey_hex,
+                    record.protocol.to_db(),
+                    record.checked_at_secs as i64
+                ],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index protocol upsert: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| crate::Error::Storage(format!("index protocol commit: {e}")))?;
+        Ok(())
+    }
+
+    /// The most recently active conversations, newest first, whose latest
+    /// message is at or after `since_secs`. Bounded by `limit` in SQL.
+    pub fn recent_group_ids(&self, limit: usize, since_secs: u64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT group_id_hex FROM conversation_summary
+                 WHERE latest_at_secs >= ?1
+                 ORDER BY latest_at_secs DESC LIMIT ?2",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index recent prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![since_secs as i64, limit as i64], |row| row.get(0))
+            .map_err(|e| crate::Error::Storage(format!("index recent query: {e}")))?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| crate::Error::Storage(format!("index recent row: {e}")))?;
+        Ok(rows)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.db
             .query_row("SELECT COUNT(*) FROM conversation_summary", [], |row| {
@@ -653,6 +745,59 @@ pub(crate) mod tests {
         // Second repair is a no-op (row no longer brace-prefixed JSON).
         idx.repair_json_previews().unwrap();
         assert_eq!(idx.summaries_ordered().unwrap().iter().find(|s| s.group_id_hex == "g1").unwrap().latest_content, crate::client::JSON_PAYLOAD_PREVIEW_LABEL);
+    }
+
+    #[test]
+    fn peer_marmot_protocols_survive_reopen_and_a_newer_stamp() {
+        use crate::marmot_protocol::{PeerMarmotProtocol, PeerProtocolRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x42u8; 32];
+        // A newer build stamped a higher version: the table is still ensured.
+        write_foreign_v4_index(&path, key);
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        idx.db
+            .execute("INSERT INTO schema_version(version) VALUES (99)", [])
+            .unwrap();
+        drop(idx);
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        let v2 = PeerProtocolRecord {
+            protocol: PeerMarmotProtocol::V2Only,
+            checked_at_secs: 10,
+        };
+        let v1 = PeerProtocolRecord {
+            protocol: PeerMarmotProtocol::V1Only,
+            checked_at_secs: 11,
+        };
+        idx.upsert_peer_marmot_protocols(&[("aa".into(), v2), ("bb".into(), v1)])
+            .unwrap();
+        let mixed = PeerProtocolRecord {
+            protocol: PeerMarmotProtocol::Mixed,
+            checked_at_secs: 12,
+        };
+        idx.upsert_peer_marmot_protocols(&[("bb".into(), mixed)])
+            .unwrap();
+        drop(idx);
+
+        let reopened = ConversationIndex::open(&path, key).unwrap();
+        let mut rows = reopened.peer_marmot_protocols().unwrap();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(rows, vec![("aa".into(), v2), ("bb".into(), mixed)]);
+    }
+
+    #[test]
+    fn recent_group_ids_are_newest_first_bounded_and_windowed() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        for (gid, at) in [("old", 10), ("mid", 500), ("new", 900), ("newer", 950)] {
+            idx.upsert_summary(gid, "c", "hi", "p", at, false, true)
+                .unwrap();
+        }
+        assert_eq!(idx.recent_group_ids(2, 0).unwrap(), vec!["newer", "new"]);
+        assert_eq!(
+            idx.recent_group_ids(8, 400).unwrap(),
+            vec!["newer", "new", "mid"]
+        );
     }
 
     #[test]
