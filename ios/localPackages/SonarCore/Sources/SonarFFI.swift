@@ -2153,6 +2153,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func markConversationRead(groupIdHex: String)
 
     /**
+     * Whether this chat (its folded MLS group ids, hex) can still be read
+     * by its other members. Local only (cache + MLS member read), cheap
+     * enough for chat open; never touches the relays.
+     */
+    func marmotChatGate(groupIdHexes: [String])  -> MarmotChatGateInfo
+
+    /**
      * Decrypted message history for a group, oldest first.
      */
     func messages(groupIdHex: String) throws  -> [MessageInfo]
@@ -2170,6 +2177,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * rows such as commits/proposals are skipped by the core.
      */
     func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
+
+    /**
+     * A contact's cached Marmot protocol (npub or hex). Local only.
+     */
+    func peerMarmotProtocol(pubkey: String) throws  -> MarmotProtocol
 
     /**
      * Local-only batch read of the zones members shared into these MLS
@@ -2254,6 +2266,16 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * DB only and does not wait on relay sync or full-history scans.
      */
     func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) throws  -> [RecentMessagePageInfo]
+
+    /**
+     * Recheck the open chat's members' Marmot protocol from their
+     * KeyPackages: one bounded relay fetch, skipped while the cached answer
+     * is fresh. Blocking; call it in the background after first paint, never
+     * on the open/send path. A change arrives as a conversation-changed
+     * notification for these groups, after which hosts re-read
+     * `marmot_chat_gate`.
+     */
+    func refreshMarmotChatProtocol(groupIdHexes: [String]) throws
 
     /**
      * Encrypt a device push token to the transponder and cache/share it with
@@ -3121,6 +3143,20 @@ open func markConversationRead(groupIdHex: String)  {try! rustCall() {
 }
 
     /**
+     * Whether this chat (its folded MLS group ids, hex) can still be read
+     * by its other members. Local only (cache + MLS member read), cheap
+     * enough for chat open; never touches the relays.
+     */
+open func marmotChatGate(groupIdHexes: [String]) -> MarmotChatGateInfo  {
+    return try!  FfiConverterTypeMarmotChatGateInfo_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_marmot_chat_gate(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(groupIdHexes),$0
+    )
+})
+}
+
+    /**
      * Decrypted message history for a group, oldest first.
      */
 open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
@@ -3161,6 +3197,18 @@ open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws 
         FfiConverterString.lower(groupIdHex),
         FfiConverterUInt32.lower(limit),
         FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+
+    /**
+     * A contact's cached Marmot protocol (npub or hex). Local only.
+     */
+open func peerMarmotProtocol(pubkey: String)throws  -> MarmotProtocol  {
+    return try  FfiConverterTypeMarmotProtocol_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_peer_marmot_protocol(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pubkey),$0
     )
 })
 }
@@ -3335,6 +3383,22 @@ open func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32)throws  -> [R
         FfiConverterUInt32.lower(pageLimit),$0
     )
 })
+}
+
+    /**
+     * Recheck the open chat's members' Marmot protocol from their
+     * KeyPackages: one bounded relay fetch, skipped while the cached answer
+     * is fresh. Blocking; call it in the background after first paint, never
+     * on the open/send path. A change arrives as a conversation-changed
+     * notification for these groups, after which hosts re-read
+     * `marmot_chat_gate`.
+     */
+open func refreshMarmotChatProtocol(groupIdHexes: [String])throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_refresh_marmot_chat_protocol(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(groupIdHexes),$0
+    )
+}
 }
 
     /**
@@ -5196,6 +5260,63 @@ public func FfiConverterTypeJoinRequestInfo_lift(_ buf: RustBuffer) throws -> Jo
 #endif
 public func FfiConverterTypeJoinRequestInfo_lower(_ value: JoinRequestInfo) -> RustBuffer {
     return FfiConverterTypeJoinRequestInfo.lower(value)
+}
+
+
+/**
+ * The chat gate plus who moved (hex pubkeys), for the banner copy.
+ */
+public struct MarmotChatGateInfo: Equatable, Hashable {
+    public var state: MarmotChatGateState
+    public var updatedMemberHexes: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: MarmotChatGateState, updatedMemberHexes: [String]) {
+        self.state = state
+        self.updatedMemberHexes = updatedMemberHexes
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MarmotChatGateInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMarmotChatGateInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MarmotChatGateInfo {
+        return
+            try MarmotChatGateInfo(
+                state: FfiConverterTypeMarmotChatGateState.read(from: &buf),
+                updatedMemberHexes: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MarmotChatGateInfo, into buf: inout [UInt8]) {
+        FfiConverterTypeMarmotChatGateState.write(value.state, into: &buf)
+        FfiConverterSequenceString.write(value.updatedMemberHexes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarmotChatGateInfo_lift(_ buf: RustBuffer) throws -> MarmotChatGateInfo {
+    return try FfiConverterTypeMarmotChatGateInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarmotChatGateInfo_lower(_ value: MarmotChatGateInfo) -> RustBuffer {
+    return FfiConverterTypeMarmotChatGateInfo.lower(value)
 }
 
 
@@ -7702,6 +7823,180 @@ public func FfiConverterTypeCashuWalletEvent_lift(_ buf: RustBuffer) throws -> C
 #endif
 public func FfiConverterTypeCashuWalletEvent_lower(_ value: CashuWalletEvent) -> RustBuffer {
     return FfiConverterTypeCashuWalletEvent.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a chat's composer may do.
+ */
+
+public enum MarmotChatGateState: Equatable, Hashable {
+
+    /**
+     * Send normally.
+     */
+    case `open`
+    /**
+     * Every other member moved to Marmot v2: disable the composer and ask
+     * the user to update. Core refuses the send too.
+     */
+    case blocked
+    /**
+     * Some members moved and will not read new messages: show a note, keep
+     * the composer.
+     */
+    case partlyUpdated
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MarmotChatGateState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMarmotChatGateState: FfiConverterRustBuffer {
+    typealias SwiftType = MarmotChatGateState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MarmotChatGateState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .`open`
+
+        case 2: return .blocked
+
+        case 3: return .partlyUpdated
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MarmotChatGateState, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .`open`:
+            writeInt(&buf, Int32(1))
+
+
+        case .blocked:
+            writeInt(&buf, Int32(2))
+
+
+        case .partlyUpdated:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarmotChatGateState_lift(_ buf: RustBuffer) throws -> MarmotChatGateState {
+    return try FfiConverterTypeMarmotChatGateState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarmotChatGateState_lower(_ value: MarmotChatGateState) -> RustBuffer {
+    return FfiConverterTypeMarmotChatGateState.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * A contact's Marmot protocol, folded over their installs' KeyPackages.
+ * `V2Only` means every live install moved to MDK v0.14 and cannot read what
+ * this build sends; `Mixed` and `Unknown` still send.
+ */
+
+public enum MarmotProtocol: Equatable, Hashable {
+
+    case unknown
+    case v1Only
+    case mixed
+    case v2Only
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MarmotProtocol: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMarmotProtocol: FfiConverterRustBuffer {
+    typealias SwiftType = MarmotProtocol
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MarmotProtocol {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .unknown
+
+        case 2: return .v1Only
+
+        case 3: return .mixed
+
+        case 4: return .v2Only
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MarmotProtocol, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .unknown:
+            writeInt(&buf, Int32(1))
+
+
+        case .v1Only:
+            writeInt(&buf, Int32(2))
+
+
+        case .mixed:
+            writeInt(&buf, Int32(3))
+
+
+        case .v2Only:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarmotProtocol_lift(_ buf: RustBuffer) throws -> MarmotProtocol {
+    return try FfiConverterTypeMarmotProtocol.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarmotProtocol_lower(_ value: MarmotProtocol) -> RustBuffer {
+    return FfiConverterTypeMarmotProtocol.lower(value)
 }
 
 
@@ -10806,6 +11101,16 @@ public func noiseGenerateKeypair()throws  -> NoiseKeypairHex  {
 })
 }
 /**
+ * Substring of the send error core returns when every other member of a chat
+ * moved to Marmot v2. Hosts match failed-send messages against it.
+ */
+public func peerUpdatedSonarMarker() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_peer_updated_sonar_marker($0
+    )
+})
+}
+/**
  * Dry run: report what a restore would bring back, changing nothing.
  *
  * Never stages or commits, and never opens the live store — it decrypts in
@@ -11153,6 +11458,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_peer_updated_sonar_marker() != 32823) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_preview_account_backup() != 26257) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11441,6 +11749,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_mark_conversation_read() != 18250) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_marmot_chat_gate() != 29100) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages() != 63355) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11448,6 +11759,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_peer_marmot_protocol() != 57611) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_peer_timezones() != 64590) {
@@ -11487,6 +11801,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_refresh_marmot_chat_protocol() != 9722) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 63602) {
