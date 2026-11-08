@@ -3324,8 +3324,132 @@ with the wire value.* snow caps messages at 65 535 bytes while bitchat
 encrypts whole 1 MiB private files in one message, so the crate derives the
 split keys and owns the cipher state instead.
 
+## R-060 — A BLE link can speak for every mesh app on the remote device
+
+**Invariant:** On iOS, a central's link speaks for each identity whose own
+full-TTL announce verified on it, not only the first one that bound it. A
+further identity joins only when the announce decodes, its Noise key derives
+the claimed peer ID, its signature checks out, and its signing key matches the
+one already pinned for that peer. The first binding never moves. On a link
+shared by several identities, each one stays linked only while it keeps
+announcing (`bleSharedLinkIdentityTimeoutSeconds`). On the peripheral side, an
+invalidated mesh service releases the identity bound through it.
+
+**Breaks as:** a phone running Sonar beside stock bitchat (one radio, one
+central as seen from the iPhone) is seen by the iPhone as only one of the two
+apps. The other's packets, its own announce included, are dropped as "Sender ID
+spoofing" ("Android sees the iPhone, the iPhone does not see Android"). Which app
+wins depends on which announces first after a reconnect, so it comes and goes.
+After the losing app quits, the shared link stays up (the other app holds it),
+and the quit app shows as online indefinitely.
+
+**Call sites:** iOS `BLEService.swift::receiveCentralPacket` (ingress,
+`MeshLinkSenderPolicy.ingress`), `verifiesDirectAnnounce`, `linkState(for:)`,
+`snapshotSubscribedCentrals` (directed sends), `peripheral(_:didModifyServices:)`
+→ `releasePeripheralIdentity`; `RelayController.swift::MeshLinkIdentities`.
+Compose/core: not applicable as written. The Rust engine has no per-link
+sender gate, so Android sees both apps already. Its server role does keep one
+Noise session and one routing binding per connection, which is tracked under
+Unguarded.
+
+**Guarded by:** `BLEServiceSharedLinkTests.secondAppOnTheSameCentralIsSeen` (real write path; fails before the fix: the second announce is rejected), `BLEServiceSharedLinkTests.anAppThatStoppedAnnouncingDropsOffASharedLink`
+
+**Also guarded by:** `BLEServiceSharedLinkTests.aForgedSecondIdentityStaysOut`, `BLEServiceSharedLinkTests.aLinkWithOneAppVouchesWhileItIsUp`, `RelayControllerTests.linkSenderPolicy_letsASecondAppOnTheDeviceAskToJoinTheLink`, `RelayControllerTests.linkIdentities_vouchForEachAppOnlyWhileItAnnounces`
+
+**Not guarded:** `releasePeripheralIdentity` (needs a `CBPeripheral` and a
+service-invalidation callback; no seam), and the CoreBluetooth reassembly in
+`didReceiveWrite` ahead of `receiveCentralPacket`. The over-the-air case is
+QA-190.
+
+**History:** #244 (2026-07-14) let relayed announces through a bound link and
+kept the binding immutable. Live debugging on 2026-10-29 (Pixel 10 Pro running
+Sonar 0.1-alpha.15.5 beside `com.bitchat.droid`, iPhone 1.15.5) showed 4,011
+"spoofing" drops in a day, including the Pixel's own Sonar announces bound
+against stock bitchat's ID.
+
+**Rejected:**
+- *Rebinding the link to the latest verified announcer* (upstream bitchat iOS
+  does this for peer-ID rotation). With two live apps the binding flips on
+  every announce, so each app is alternately offline and directed sends go to
+  the wrong one. It also breaks #244's immutable binding.
+- *Accepting every relayed packet type through a bound link, as upstream does
+  (only REQUEST_SYNC is pinned).* This would fix the multi-app case only by
+  accident, and it widens what a neighbour can inject far beyond this bug. It
+  is a separate interop divergence, recorded in SPEC.md §12. Taken up on its
+  own as R-061, with stricter TTL and self-sender rules than upstream's.
+- *Gating liveness on fresh announces for every link.* A single-app link would
+  then flip offline whenever announces are lost, which the 135 s retention bar
+  exists to prevent. The gate applies only once a link is shared.
+
+## R-061 — Relayed traffic crosses a bound BLE link on iOS
+
+**Invariant:** On iOS, in both roles, a packet on a bound link from a sender
+the link does not speak for is handled as a relay, not dropped as spoofing,
+when it is not `REQUEST_SYNC`, its TTL is below 7, and, if it claims to be
+ours, it is a flagged sync reply (TTL 0, RSR). From there its own type's checks
+authenticate it: signatures against the pinned key, the Noise static key, the
+session, a verified leave. A flagged sync reply is validated against the
+request we sent the link peer, not its original author.
+
+**Breaks as:** multi-hop traffic does not cross a Sonar iPhone. DMs, Noise
+handshakes, public messages and sync replies relayed by a neighbour die as
+"Sender ID spoofing"; only announces get through, so the far peer shows on the
+radar while nothing it sends arrives. Seen on 2026-10-29: 1,353 drops in a day
+on one link bound to a third device ('vincent'), among them the Pixel's
+packets while the backgrounded iPhone was reachable only through that relay.
+
+**Call sites:** iOS `RelayController.swift::MeshLinkSenderPolicy`
+(`allowsRelayedPacket`, `ingress`), `BLEService.swift::receiveCentralPacket`
+(write path) and `receivePeripheralPacket` (notification path, from
+`bufferNotificationChunk`), `relayValidationPeer`. Compose/core: not
+applicable. The Rust engine has no per-link sender gate, and its handlers
+authenticate per type (`mesh_engine::tests::relayed_signed_broadcast_still_verifies`).
+Its Noise sessions are per connection (`decrypt_on_origin`); whether a DM
+handshake from a non-neighbour completes on Android is a separate question
+this entry does not cover.
+
+**Guarded by:** `BLEServiceRelayedIngressTests.aHandshakeRelayedThroughACentralIsAnswered` (real write path; fails before the fix: the handshake is dropped), `BLEServiceRelayedIngressTests.aHandshakeRelayedThroughAPeripheralIsAnswered` (real notification path minus reassembly; fails before the fix)
+
+**Also guarded by:** `BLEServiceRelayedIngressTests.aSyncReplyRelayedByTheLinkPeerWeAskedIsAccepted`, `BLEServiceRelayedIngressTests.anUnsolicitedSyncReplyStaysOut`, `RelayControllerTests.linkSenderPolicy_acceptsRelayedPacketsOfEveryTypeButRequestSync`, `RelayControllerTests.linkSenderPolicy_neverTreatsFullTtlAsRelayed`, `RelayControllerTests.linkSenderPolicy_acceptsOurOwnPacketsBackOnlyAsAFlaggedSyncReply`
+
+**Not guarded:** the peripheral path's stream reassembly ahead of
+`receivePeripheralPacket`, and the binding a direct announce sets there (the
+seam takes the binding as an argument; a test cannot make the `CBPeripheral`
+that holds it). The over-the-air case is QA-192. What this accepts that #244
+did not: a neighbour can now inject fragments under any sender ID, which can
+break that one reassembly (the reassembled packet is still authenticated by
+its type), and unsigned packets of unknown types from other senders now reach
+the relay step, bounded by its dedup and TTL. Both match upstream.
+
+**History:** inherited from the original bitchat import (d729a4799); #244
+(2026-07-14) let relayed announces and `0x53` through; R-060 (#677) let a
+second app join a bound central. Upstream bitchat iOS relaxed the same check
+to "everything but REQUEST_SYNC" (`BLEIngressLinkRegistry`, HEAD `04995f68`).
+
+**Rejected:**
+- *Upstream's rule as is.* It also accepts full-TTL packets from other
+  senders, which no relay emits, and TTL-0 packets claiming to be ours without
+  the RSR flag, which `handleMessage` would show as sent by us without a
+  signature check.
+- *Requiring the RSR flag on every TTL-0 packet from another sender.* Stock
+  bitchat-android sends its sync replies unflagged (SPEC.md §12.1), so its
+  gossip sync would stay broken toward Sonar iOS.
+- *Validating a relayed sync reply against its claimed author.* We asked the
+  link peer, so the author never has a pending request and every relayed
+  reply would fail as unsolicited.
+
 ## Unguarded
 
+- **Android's server role keeps one Noise session per connection (R-060's
+  mirror).** `core/sonar-core/src/mesh_engine.rs` `ServerConn` holds one
+  `noise` state and one `bind`, and a direct announce rebinds `bind` to the
+  latest announcer (`origin_bind` in the announce handler). A remote device
+  running two mesh apps that both connect to Android over one connection (an
+  iPhone with Sonar and stock bitchat) is seen as both apps. Their handshakes
+  share one Noise state, though, and directed sends go to whichever announced
+  last. The follow-up is per-identity Noise and binding state on server
+  connections, with an engine test that drives two identities through one
+  `conn`. iOS's centrals are fixed by R-060.
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
   #498 made core stop filtering `member_count <= 2` out of
   `pending_group_invites` so a rate-limited first-contact DM parks visibly
