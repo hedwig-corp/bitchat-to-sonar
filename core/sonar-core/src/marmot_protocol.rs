@@ -163,6 +163,62 @@ pub fn classify_peer_key_packages<'a>(
     author: &PublicKey,
     events: impl IntoIterator<Item = &'a Event>,
 ) -> PeerMarmotProtocol {
+    fold_peer_key_packages(author, events).protocol
+}
+
+/// What a v1 install may invite into a NEW group for one contact, and what
+/// their packages say about them (so the caller can record it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvitableKeyPackage<'a> {
+    pub protocol: PeerMarmotProtocol,
+    /// The package to invite: the newest LIVE v1 one when the contact still
+    /// has one (`V1Only` or `Mixed`, so a newer v2 install never shadows a
+    /// phone still on v1), or the newest package of a contact we cannot
+    /// classify (`Unknown`, left for MDK to judge, as before this check).
+    /// `None` when there is nothing to invite: no package at all, or every
+    /// live install moved to v2 (`V2Only`), whose package MDK 0.8 cannot
+    /// read.
+    pub key_package: Option<&'a Event>,
+}
+
+/// Pick the KeyPackage to invite `author` with. Uses the same per-slot fold as
+/// [`classify_peer_key_packages`], so a new chat and the chat gate never
+/// disagree about a contact.
+pub fn invitable_key_package<'a>(
+    author: &PublicKey,
+    events: impl IntoIterator<Item = &'a Event>,
+) -> InvitableKeyPackage<'a> {
+    let folded = fold_peer_key_packages(author, events);
+    let key_package = match folded.protocol {
+        PeerMarmotProtocol::V1Only | PeerMarmotProtocol::Mixed => folded.newest_live_v1,
+        PeerMarmotProtocol::Unknown => folded.newest,
+        PeerMarmotProtocol::V2Only => None,
+    };
+    InvitableKeyPackage {
+        protocol: folded.protocol,
+        key_package,
+    }
+}
+
+struct FoldedKeyPackages<'a> {
+    protocol: PeerMarmotProtocol,
+    /// Newest v1 slot that is not an abandoned install.
+    newest_live_v1: Option<&'a Event>,
+    /// Newest slot of any kind.
+    newest: Option<&'a Event>,
+}
+
+fn newer<'a>(a: Option<&'a Event>, b: &'a Event) -> &'a Event {
+    match a {
+        Some(a) if (a.created_at, a.id) >= (b.created_at, b.id) => a,
+        _ => b,
+    }
+}
+
+fn fold_peer_key_packages<'a>(
+    author: &PublicKey,
+    events: impl IntoIterator<Item = &'a Event>,
+) -> FoldedKeyPackages<'a> {
     let mut newest_per_slot: HashMap<String, &Event> = HashMap::new();
     for event in events {
         if event.pubkey != *author || event.kind != Kind::Custom(KEY_PACKAGE_KIND) {
@@ -181,24 +237,35 @@ pub fn classify_peer_key_packages<'a>(
         }
     }
 
-    let mut v1_slots: Vec<u64> = Vec::new();
+    let mut v1_slots: Vec<&Event> = Vec::new();
     let mut newest_v2: Option<u64> = None;
+    let mut newest: Option<&Event> = None;
     for event in newest_per_slot.values() {
         let at = event.created_at.as_secs();
+        newest = Some(newer(newest, event));
         match classify_key_package(event) {
-            KeyPackageProtocol::V1 => v1_slots.push(at),
+            KeyPackageProtocol::V1 => v1_slots.push(event),
             KeyPackageProtocol::V2 => newest_v2 = Some(newest_v2.map_or(at, |n| n.max(at))),
             KeyPackageProtocol::Unrecognized => {}
         }
     }
-    let live_v1 = v1_slots
-        .iter()
-        .any(|&at| newest_v2.is_none_or(|v2| v2.saturating_sub(at) <= STALE_V1_SLOT_SECS));
-    match (live_v1, newest_v2.is_some()) {
+    let newest_live_v1 = v1_slots
+        .into_iter()
+        .filter(|event| {
+            let at = event.created_at.as_secs();
+            newest_v2.is_none_or(|v2| v2.saturating_sub(at) <= STALE_V1_SLOT_SECS)
+        })
+        .fold(None, |best, event| Some(newer(best, event)));
+    let protocol = match (newest_live_v1.is_some(), newest_v2.is_some()) {
         (true, true) => PeerMarmotProtocol::Mixed,
         (true, false) => PeerMarmotProtocol::V1Only,
         (false, true) => PeerMarmotProtocol::V2Only,
         (false, false) => PeerMarmotProtocol::Unknown,
+    };
+    FoldedKeyPackages {
+        protocol,
+        newest_live_v1,
+        newest,
     }
 }
 
@@ -404,7 +471,7 @@ impl ProtocolRefreshState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Tag, TagKind, Timestamp};
+    use nostr::{EventBuilder, EventId, Keys, Tag, TagKind, Timestamp};
 
     fn key_package(
         keys: &Keys,
@@ -551,6 +618,70 @@ pub(crate) mod tests {
         assert_eq!(
             classify_peer_key_packages(&keys.public_key(), [&v2_of_stranger]),
             PeerMarmotProtocol::Unknown
+        );
+    }
+
+    fn invited(pk: &PublicKey, events: &[&Event]) -> (PeerMarmotProtocol, Option<EventId>) {
+        let choice = invitable_key_package(pk, events.iter().copied());
+        (choice.protocol, choice.key_package.map(|e| e.id))
+    }
+
+    #[test]
+    fn a_new_chat_invites_the_newest_live_v1_install_even_when_a_v2_one_is_newer() {
+        let keys = Keys::generate();
+        let pk = keys.public_key();
+        let phone = v1_key_package(&keys, "phone", NOW - 3 * DAY);
+        let ipad = v1_key_package(&keys, "ipad", NOW - DAY);
+        let mac = v2_key_package(&keys, "mac", NOW);
+        assert_eq!(
+            invited(&pk, &[&phone, &mac, &ipad]),
+            (PeerMarmotProtocol::Mixed, Some(ipad.id)),
+            "the newest package is v2, which MDK 0.8 cannot read"
+        );
+        assert_eq!(
+            invited(&pk, &[&phone, &ipad]),
+            (PeerMarmotProtocol::V1Only, Some(ipad.id))
+        );
+    }
+
+    #[test]
+    fn a_new_chat_with_a_contact_whose_every_install_moved_has_nothing_to_invite() {
+        let keys = Keys::generate();
+        let pk = keys.public_key();
+        let mac = v2_key_package(&keys, "mac", NOW);
+        assert_eq!(invited(&pk, &[&mac]), (PeerMarmotProtocol::V2Only, None));
+        // An abandoned v1 install is not invited either: it no longer reads.
+        let orphan = v1_key_package(&keys, "old-install", NOW - 40 * DAY);
+        assert_eq!(
+            invited(&pk, &[&mac, &orphan]),
+            (PeerMarmotProtocol::V2Only, None)
+        );
+        // A slot that updated in place is v2, even where a relay kept the old
+        // v1 event.
+        let old = v1_key_package(&keys, "phone", NOW - 60);
+        let new = v2_key_package(&keys, "phone", NOW);
+        assert_eq!(
+            invited(&pk, &[&old, &new]),
+            (PeerMarmotProtocol::V2Only, None)
+        );
+    }
+
+    #[test]
+    fn a_new_chat_with_an_unclassified_contact_keeps_the_newest_package() {
+        let keys = Keys::generate();
+        let pk = keys.public_key();
+        let older = key_package(&keys, "a", &["0x000a"], false, NOW - 10);
+        let newest = key_package(&keys, "b", &["0x000a"], false, NOW);
+        assert_eq!(
+            invited(&pk, &[&older, &newest]),
+            (PeerMarmotProtocol::Unknown, Some(newest.id))
+        );
+        assert_eq!(invited(&pk, &[]), (PeerMarmotProtocol::Unknown, None));
+        let stranger = v1_key_package(&Keys::generate(), "s", NOW);
+        assert_eq!(
+            invited(&pk, &[&stranger]),
+            (PeerMarmotProtocol::Unknown, None),
+            "another author's package is never invited"
         );
     }
 

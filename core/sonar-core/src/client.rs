@@ -39,9 +39,9 @@ use crate::marmot::{
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::marmot_protocol::{
-    chat_gate, classify_peer_key_packages, is_stale, merge_fetched, ChatProtocolGate,
-    PeerMarmotProtocol, PeerProtocolRecord, ProtocolRefreshState, MEMBERS_PER_CHAT, OPEN_CHAT_TTL,
-    RECENT_CHAT_LIMIT, RECENT_CHAT_TTL, RECENT_CHAT_WINDOW_SECS,
+    chat_gate, classify_peer_key_packages, invitable_key_package, is_stale, merge_fetched,
+    ChatProtocolGate, PeerMarmotProtocol, PeerProtocolRecord, ProtocolRefreshState,
+    MEMBERS_PER_CHAT, OPEN_CHAT_TTL, RECENT_CHAT_LIMIT, RECENT_CHAT_TTL, RECENT_CHAT_WINDOW_SECS,
 };
 use crate::media_staging::{
     media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
@@ -2942,6 +2942,10 @@ impl SonarClient {
         self.publish_group_creation(creation).await
     }
 
+    /// One invitable KeyPackage per member other than us, for a new group or
+    /// an added member (see [`invitable_key_package`]). A member whose every
+    /// install moved to Marmot v2 fails the whole call with
+    /// [`Error::PeerUpdatedMarmot`] before MDK sees a package it cannot read.
     async fn fetch_key_packages_for_members(&self, members: Vec<PublicKey>) -> Result<Vec<Event>> {
         let mut deduped = Vec::new();
         let mut seen = HashSet::new();
@@ -2959,11 +2963,39 @@ impl SonarClient {
             ));
         }
 
+        // Every package a member's installs published, not only the newest:
+        // a contact whose Mac moved to Marmot v2 while their phone is still on
+        // v1 must be invited through the phone, and the newest-only lookup
+        // would hand MDK 0.8 the v2 package it cannot read.
         let mut key_packages = Vec::with_capacity(deduped.len());
+        let mut learned = Vec::with_capacity(deduped.len());
+        let mut outcome = Ok(());
         for member in deduped {
-            key_packages.push(self.fetch_key_package(member).await?);
+            let events = match self.fetch_all_key_packages(member).await {
+                Ok(events) => events,
+                Err(err) => {
+                    outcome = Err(err);
+                    break;
+                }
+            };
+            let choice = invitable_key_package(&member, &events);
+            learned.push((member, choice.protocol));
+            match (choice.key_package, choice.protocol) {
+                (Some(event), _) => key_packages.push(event.clone()),
+                (None, PeerMarmotProtocol::V2Only) => {
+                    outcome = Err(Error::PeerUpdatedMarmot);
+                    break;
+                }
+                (None, _) => {
+                    outcome = Err(Error::KeyPackageNotFound(member));
+                    break;
+                }
+            }
         }
-        Ok(key_packages)
+        // The same answer the chat gate's refresh would fetch: keep it, so
+        // the new chat's first gate check needs no second REQ.
+        self.record_marmot_protocols(&learned);
+        outcome.map(|()| key_packages)
     }
 
     /// Fetch the freshest KeyPackage event for `author` from the relays.
@@ -3535,7 +3567,9 @@ impl SonarClient {
     /// group, and deliver the gift-wrapped welcome.
     ///
     /// If a 1:1 group with `peer` already exists, returns its id instead of
-    /// creating a duplicate.
+    /// creating a duplicate. Fails with [`Error::PeerUpdatedMarmot`] when every
+    /// install of `peer` moved to Marmot v2: this build could create the group
+    /// but `peer` could never read it.
     pub async fn start_dm(&self, peer: PublicKey, name: &str) -> Result<GroupId> {
         if peer == self.identity().public_key() {
             return Err(Error::InvalidInput(
@@ -7961,6 +7995,33 @@ impl SonarClient {
                 .get(peer)
                 .map_or(PeerMarmotProtocol::Unknown, |r| r.protocol)
         })
+    }
+
+    /// Store protocols learned outside the refresh queue (a new chat fetched
+    /// the contacts' KeyPackages anyway), in one index transaction. Same merge
+    /// as the refresh: an empty answer never downgrades a known protocol.
+    /// Nobody is notified: these contacts have no open chat waiting on them,
+    /// and every chat re-reads its gate when it opens.
+    fn record_marmot_protocols(&self, learned: &[(PublicKey, PeerMarmotProtocol)]) {
+        if learned.is_empty() {
+            return;
+        }
+        let now_secs = Timestamp::now().as_secs();
+        let records: Vec<(String, PeerProtocolRecord)> = self.with_marmot_protocol_cache(|cache| {
+            learned
+                .iter()
+                .map(|(pk, protocol)| {
+                    let record = merge_fetched(cache.get(pk).copied(), *protocol, now_secs);
+                    cache.insert(*pk, record);
+                    (pk.to_hex(), record)
+                })
+                .collect()
+        });
+        if let Some(ref idx) = self.conversation_index {
+            if let Err(err) = idx.lock().unwrap().upsert_peer_marmot_protocols(&records) {
+                tracing::warn!(%err, "marmot protocol records not stored");
+            }
+        }
     }
 
     /// Members of these MLS groups other than us, deduped, in group order.
@@ -14166,6 +14227,89 @@ mod marmot_protocol_gate_tests {
             .for_each(|r| r.checked_at_secs = 0);
         h.alice.refresh_marmot_chat_protocol(&[group.clone()]).await;
         assert!(h.alice.marmot_chat_gate(&[group.clone()]).is_blocked());
+    }
+
+    /// A NEW chat from this (v1) build with someone whose every install
+    /// moved to Marmot v2. Before the check, MDK 0.8 got the v2 package and
+    /// failed with an opaque error. Now core refuses with the update error,
+    /// leaves no group behind, and remembers the contact for the chat gate.
+    #[tokio::test]
+    async fn starting_a_chat_with_a_contact_on_marmot_v2_fails_with_the_update_error() {
+        let h = harness().await;
+        let bob = Identity::generate();
+        let now = Timestamp::now().as_secs();
+        publish(&h, &v2_key_package(bob.keys(), "bob-phone", now)).await;
+
+        let dm = h.alice.start_dm(bob.public_key(), "").await;
+        assert!(matches!(dm, Err(Error::PeerUpdatedMarmot)), "{dm:?}");
+        assert!(dm
+            .unwrap_err()
+            .to_string()
+            .contains(crate::error::PEER_UPDATED_SONAR_MARKER));
+        assert!(
+            h.alice.groups().expect("groups").is_empty(),
+            "no group nobody can read is left behind"
+        );
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&bob.public_key()),
+            PeerMarmotProtocol::V2Only,
+            "the fetch the new chat made is kept for the gate"
+        );
+        // A new group (and an added member) goes through the same lookup.
+        let group = h.alice.start_group(vec![bob.public_key()], "g").await;
+        assert!(matches!(group, Err(Error::PeerUpdatedMarmot)), "{group:?}");
+    }
+
+    /// Their Mac moved to v2 (and published last), their phone did not. The
+    /// new chat must invite the phone, not the newest package, and the phone
+    /// must actually get the welcome.
+    #[tokio::test]
+    async fn starting_a_chat_with_a_mixed_contact_invites_their_v1_install() {
+        let h = harness().await;
+        let bob = SonarClient::connect_in_memory(Identity::generate(), h.relays.clone())
+            .await
+            .expect("bob connects");
+        bob.publish_key_package()
+            .await
+            .expect("bob's phone publishes");
+        let bob_pk = bob.identity().public_key();
+        let later = Timestamp::now().as_secs() + 30;
+        publish(&h, &v2_key_package(bob.identity().keys(), "bob-mac", later)).await;
+
+        let group = h
+            .alice
+            .start_dm(bob_pk, "")
+            .await
+            .expect("the v1 phone is invited");
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&bob_pk),
+            PeerMarmotProtocol::Mixed
+        );
+        let chat = hex::encode(group.as_slice());
+        assert_eq!(
+            h.alice.marmot_chat_gate(&[chat.clone()]),
+            ChatProtocolGate::Open
+        );
+        // The chat opens next: its recheck finds the answer the new chat
+        // just fetched and queues nothing, so no second REQ for bob.
+        h.alice
+            .plan_marmot_protocol_refresh(&[chat], OPEN_CHAT_TTL, true);
+        assert_eq!(
+            h.alice.marmot_protocol_refresh.lock().unwrap().queued_len(),
+            0
+        );
+        for _ in 0..100 {
+            let _ = bob.sync().await;
+            if !bob.groups().expect("bob groups").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert_eq!(
+            bob.groups().expect("bob groups").len(),
+            1,
+            "bob's phone joined the chat"
+        );
     }
 
     #[tokio::test]
