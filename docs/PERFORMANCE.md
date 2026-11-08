@@ -264,6 +264,28 @@ Marmot group · live relays · `woke=1` every run:
 
 (`t1→t2` is effectively zero here — see findings.)
 
+### Harness check on `main` (2026-11-08)
+
+`provision-and-bench.sh --app "$(scripts/bench/build-sim.sh)" --runs 3
+--msgs-per-run 3`, signed `build-sim.sh` app, `main` `fd757577c` (the harness
+fix touches no app code), dedicated `Sonar Bench` simulator (iPhone 17 Pro,
+iOS 26.5), host load average ~120, all `woke=1`; ms:
+
+| phase | min | median | max |
+|---|---|---|---|
+| launch → t0 | 533 | 560 | 788 |
+| t0 → t1 (open DB + local paint) | 238 | 239 | 455 |
+| t1 → t2 | 200 | 242 | 253 |
+| t2 → t3 | 119 | 124 | 361 |
+| t3 → t4 | 6 | 7 | 11 |
+| **launch → t4** | **1151** | **1170** | **1815** |
+| t0 → t4 | 610 | 618 | 1026 |
+
+The 1815 ms maximum is run 1, the first launch after provisioning; runs 2
+and 3 were 1151 and 1170 ms. A by-hand signed build of the same commit
+measured a launch → t4 median of 1124 ms earlier that day (#684). Two more
+`cold-start-bench.sh` runs on the same account measured 1147 and 1148 ms.
+
 ## Device result (real account — the real pain point)
 
 Median of 4–5 cold starts · iPhone 14 Pro Max · **real account with 24 Marmot
