@@ -7784,6 +7784,15 @@ final class SonarAppStore: ObservableObject {
             defer { startingMarmotChats.remove(clean) }
             let groupId = await marmot.startChatReturningId(with: clean)
             if groupId == nil {
+                if marmot.newChatRefusedBecausePeerUpdatedSonar(clean) {
+                    // Out of Bluetooth range this chat can only send over
+                    // Marmot, which the contact no longer reads: show the
+                    // update panel there (in range, BLE keeps the composer).
+                    let meshChatIds = Set((pendingMarmotSends[clean] ?? []).map(\.chatId))
+                    for chatId in meshChatIds where !chatId.isEmpty {
+                        marmot.markPeerUpdatedSonar(conversationId: chatId, peerNpub: clean)
+                    }
+                }
                 failPendingMeshMarmotSends(npub: clean)
                 if let err = marmot.errorText, !err.isEmpty {
                     showToast(err)
@@ -7906,6 +7915,9 @@ final class SonarAppStore: ObservableObject {
             cancelPendingSecureChatSetup(pendingId: pendingId, npub: npub)
         }
         pendingMarmotChats[pendingId] = nil
+        // A setup refused earlier (the contact had moved to Marmot v2) left
+        // the update panel on the pending id; the real chat reads its own gate.
+        marmot.clearMarmotChatGate(conversationId: pendingId)
         let realId = Self.marmotIDPrefix + groupId
         moveComposerState(from: pendingId, to: realId)
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
@@ -7951,7 +7963,14 @@ final class SonarAppStore: ObservableObject {
     private func failPendingSecureChat(pendingId: String, npub: String, setupToken: UUID? = nil) {
         guard isActivePendingSecureChatSetup(pendingId: pendingId, npub: npub, token: setupToken) else { return }
         pendingMarmotChats[pendingId] = nil
-        pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
+        if marmot.newChatRefusedBecausePeerUpdatedSonar(npub) {
+            // Every install of this contact moved to Marmot v2: keep the user
+            // in the chat and replace its composer with the update panel, as
+            // an existing chat's gate does (the Mac pane stays open on it).
+            marmot.markPeerUpdatedSonar(conversationId: pendingId, peerNpub: npub)
+        } else {
+            pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
+        }
         let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
         let queuedIds = Set(queued.map(\.messageId))
         var messages = (pendingMarmotMessagesByChat[pendingId] ?? []).map {

@@ -2634,7 +2634,41 @@ final class MarmotChatModel: ObservableObject {
     func setMarmotChatGateForTesting(conversationId: String, _ gate: MarmotService.MarmotChatGate?) {
         marmotChatGates[conversationId] = gate
     }
+
+    /// Test seam: stands in for the relay wait plus core's `startDm` in
+    /// direct-chat setup, so a host test drives the store's real pending-chat
+    /// path. Errors are handled exactly like core's.
+    var directChatSetupOverrideForTesting: ((String) async throws -> String)?
     #endif
+
+    /// Peers (canonical npub key) whose last new-chat setup core refused
+    /// because every install moved to Marmot v2. Cleared when a new attempt
+    /// starts, so it always describes the latest one.
+    private var newChatPeersOnNewerSonar: Set<String> = []
+
+    /// Whether the latest new-chat setup with `npub` failed because they
+    /// moved to Marmot v2 (core's `PeerUpdatedMarmot`), not for any other
+    /// reason.
+    func newChatRefusedBecausePeerUpdatedSonar(_ npub: String) -> Bool {
+        newChatPeersOnNewerSonar.contains(SNMarmotProfileCache.canonicalKey(npub))
+    }
+
+    /// Gate a conversation that has no Marmot group to read a gate from (a
+    /// pending chat, or a mesh chat whose internet fallback could not be set
+    /// up) whose peer moved to Marmot v2: its composer becomes the update
+    /// panel, as an existing chat's would.
+    func markPeerUpdatedSonar(conversationId: String, peerNpub: String) {
+        let hex = SNMentions.pubkeyHex(fromNpubOrHex: peerNpub) ?? peerNpub
+        marmotChatGates[conversationId] = .blocked(updatedMemberHexes: [hex])
+    }
+
+    /// Drop a gate `markPeerUpdatedSonar` installed (the pending chat resolved
+    /// to a real one, which reads its own gate).
+    func clearMarmotChatGate(conversationId: String) {
+        if marmotChatGates[conversationId] != nil {
+            marmotChatGates[conversationId] = nil
+        }
+    }
 
     /// Conversations whose gate reads any of `changedGroupIds`.
     private func marmotGateConversations(touching changedGroupIds: Set<String>) -> [String] {
@@ -4122,11 +4156,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     private func performDirectChatSetup(with npub: String, generation: UInt64) async -> String? {
+        newChatPeersOnNewerSonar.remove(npub)
         guard !Task.isCancelled,
               generation == sendGeneration,
               !sendsSuspendedForAccountMutation
         else { return nil }
-        guard await ensureRelayConnected() else {
+        guard await relayReadyForDirectChatSetup() else {
             self.errorText = "Not connected yet — try again in a moment."
             return nil
         }
@@ -4138,7 +4173,7 @@ final class MarmotChatModel: ObservableObject {
             return existing.id
         }
         do {
-            let groupId = try await service.startDirectMessage(with: npub, name: "")
+            let groupId = try await startDirectMessageForSetup(npub)
             guard !Task.isCancelled,
                   generation == sendGeneration,
                   !sendsSuspendedForAccountMutation
@@ -4149,9 +4184,30 @@ final class MarmotChatModel: ObservableObject {
             }
             return groupId
         } catch {
+            // Core refused: every install of this contact moved to Marmot v2.
+            // The store shows the update panel in the pending chat for it.
+            if Self.isPeerUpdatedSonar(error) {
+                newChatPeersOnNewerSonar.insert(npub)
+            }
             self.errorText = Self.describe(error)
             return nil
         }
+    }
+
+    private func relayReadyForDirectChatSetup() async -> Bool {
+        #if DEBUG
+        if directChatSetupOverrideForTesting != nil { return true }
+        #endif
+        return await ensureRelayConnected()
+    }
+
+    private func startDirectMessageForSetup(_ npub: String) async throws -> String {
+        #if DEBUG
+        if let override = directChatSetupOverrideForTesting {
+            return try await override(npub)
+        }
+        #endif
+        return try await service.startDirectMessage(with: npub, name: "")
     }
 
     func send(
