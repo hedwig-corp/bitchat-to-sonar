@@ -2998,6 +2998,29 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         return "$prefix: ${error.message}"
     }
+
+    /** Toast for a failed secure-chat setup (a new chat by npub, or a mesh chat
+     *  falling back to the internet). When core refused because every install
+     *  of the contact moved to Marmot v2, [chatId]'s composer becomes the
+     *  update panel, as an existing chat's gate does, and the toast says why
+     *  instead of the generic error. Anything else: the raw error. */
+    private fun secureChatSetupFailureToast(
+        chatId: String,
+        npubHex: String,
+        prefix: String,
+        error: Throwable,
+    ): String {
+        if (!isPeerUpdatedSonarError(error.message)) return "$prefix: ${error.message}"
+        marmotChatGates[chatId] = SonarMarmotChatGate(SonarMarmotChatGateState.Blocked, listOf(npubHex))
+        val name = (screen as? Screen.Chat)?.takeIf { it.id == chatId }?.name
+            ?: profilesByNpub[canonicalProfileKey(npubHex)]?.bestName
+            ?: ""
+        return marmotUpdateRequiredText(name.ifBlank { "They" })
+    }
+
+    /** Test seam: stands in for the relay wait plus [SonarCore.startChat] in
+     *  pending 1:1 setup, so a JVM test drives the real pending-chat path. */
+    internal var pendingChatSetupForTest: (suspend (npubHex: String) -> String)? = null
     private val composerReplyByChat = mutableStateMapOf<String, SonarReplyRef>()
 
     fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
@@ -7784,14 +7807,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupToken = nextPendingMarmotSetupToken(pendingChatId)
         val setupJob = scope.launch {
             try {
-                if (!awaitRelayConnection()) return@launch
-                val chatId = runMarmotAccountOperation { SonarCore.startChat(npubHex) }
+                val chatId = pendingChatSetupForTest?.invoke(npubHex) ?: run {
+                    if (!awaitRelayConnection()) return@launch
+                    runMarmotAccountOperation { SonarCore.startChat(npubHex) }
+                }
                 finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, chatId, setupToken = setupToken)
             } catch (error: CancellationException) {
                 throw error
             } catch (t: Throwable) {
                 if (failPendingMarmotChat(npubHex, pendingChatId, setupToken)) {
-                    toast = "couldn’t start secure chat: ${t.message}"
+                    toast = secureChatSetupFailureToast(pendingChatId, npubHex, "couldn’t start secure chat", t)
                 }
             } finally {
                 clearPendingMarmotSetup(pendingChatId, npubHex, setupToken)
@@ -7811,6 +7836,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!isActivePendingMarmotSetup(pendingChatId, peerNpub, setupToken)) return
         if (setupToken == null) cancelPendingMarmotSetup(pendingChatId, npubHex)
         pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
+        // A setup refused earlier (the contact had moved to Marmot v2) left the
+        // update panel on the pending id; the real chat reads its own gate.
+        marmotChatGates.remove(pendingChatId)
         if (refreshFirst) refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
             ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
@@ -11073,7 +11101,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 throw error
             } catch (e: Throwable) {
                 failPendingMeshMarmotSends(npubHex)
-                toast = "couldn't start secure chat: ${e.message}"
+                toast = secureChatSetupFailureToast(meshChatId(peerId), npubHex, "couldn't start secure chat", e)
             } finally {
                 val owner = currentCoroutineContext()[Job]
                 if (startingMarmotChatJobs[npubHex] === owner) {
