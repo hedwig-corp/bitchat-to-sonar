@@ -233,6 +233,29 @@ send; the apps replace the composer. Design and bounds:
   `MarmotProtocolGateTests.aLiveBluetoothLinkKeepsAMeshFoldedChatOpen`.
 - **Origin:** 2026-11-08, same release as QA-216.
 
+### QA-219 — A v1 message from a contact shown as updated reopens the chat
+- **Platforms:** both (core decides; the apps repaint from the change).
+- **Steps:** as QA-216, but a COPY of the peer's CLI home moves to v2
+  (`"$SONAR_CLI_V2" --home <copy> publish`), so the v2 copy takes over the
+  KeyPackage slot while the original v1 home still runs. Open the chat and
+  wait for the update panel. Then the ORIGINAL v1 home sends a message.
+- **Expect:** the message appears, and within seconds the update panel gives
+  way to the normal composer, and a send goes through. It must not wait for
+  the 2-minute open-chat recheck. The same holds for a reply from a
+  notification or the share sheet, before the chat is ever opened. A v1
+  message proves the contact still reads v1, whatever their KeyPackages say
+  (a v1 install that has not republished for 14 days looks abandoned).
+- **How:** `android-smoke.sh` QA-219 (same preconditions as QA-216). iOS:
+  the same peer steps with `ios-drive.sh`.
+- **Guard:** core
+  `marmot_protocol_gate_tests::a_v1_message_from_a_contact_cached_as_v2_reopens_the_chat`
+  (red without the inbound hook: the contact stays V2Only),
+  `marmot_protocol::tests::a_recent_v1_message_keeps_a_contact_out_of_v2_only`.
+  A Back to the chat re-reads the gate on Compose:
+  `MarmotChatGateStateTest.backToAChatReReadsItsGateFromCore`.
+- **Origin:** 2026-11-08, the #684 review. The cached V2Only outlived the
+  contact's v1 message, so replies stayed refused for up to 6 h.
+
 ## Cross-client Bluetooth mesh (#671)
 
 The codec half of mesh interop is proved in CI: `scripts/bitchat-vectors/cross-replay.sh`

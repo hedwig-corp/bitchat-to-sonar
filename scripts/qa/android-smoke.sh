@@ -963,6 +963,38 @@ qa216() { # a contact who moved to Marmot v2 (MDK v0.14): composer → "Update S
   ui key 4
 }
 
+qa219() { # a v1 message from a contact shown as "on a newer version" brings the composer back
+  [[ -n "$APP_NPUB" ]] || { record QA-219 SKIP "needs the app npub (QA-001 or QA_APP_NPUB)"; return; }
+  [[ -x "${SONAR_CLI_V2:-}" ]] || { record QA-219 SKIP "set SONAR_CLI_V2 (see QA-216)"; return; }
+  local peer="v1back-$RUN" twin t0
+  "$PEERS" new "$peer" >/dev/null || { record QA-219 FAIL "peer init failed"; return; }
+  "$PEERS" send "$peer" "$APP_NPUB" "qa219 hello $RUN" >/dev/null
+  go_home || { record QA-219 FAIL "could not reach the chat list"; return; }
+  "$UI" wait "qa219 hello $RUN" 45 >/dev/null || { record QA-219 FAIL "the peer's chat never appeared"; return; }
+  # A copy of the peer's home moves to v2 and takes over its KeyPackage slot,
+  # so the app sees a v2-only contact while the original v1 install still runs.
+  twin="$QA_HOME/peers/$peer-twin"; rm -rf "$twin"; cp -R "$QA_HOME/peers/$peer" "$twin"
+  "$SONAR_CLI_V2" --home "$twin" publish >/dev/null 2>&1 ||
+    { record QA-219 FAIL "the v2 copy could not publish"; return; }
+  open_chat_row "qa219 hello $RUN" || { record QA-219 FAIL "could not open the chat"; return; }
+  "$UI" wait "from this version of Sonar" 30 >/dev/null ||
+    { record QA-219 FAIL "no update panel after the v2 copy took the slot"; return; }
+  # The original v1 install writes: proof the contact still reads v1.
+  t0=$SECONDS
+  "$PEERS" send "$peer" "$APP_NPUB" "qa219 still on v1 $RUN" >/dev/null
+  "$UI" wait "qa219 still on v1 $RUN" 60 >/dev/null ||
+    { record QA-219 FAIL "the v1 message never reached the open chat"; return; }
+  # Before the fix the panel stayed until the open-chat recheck (2 min TTL).
+  local i
+  for i in $(seq 1 20); do hasx "Add to your message" && break; sleep 3; done
+  if hasx "Add to your message" && ! hasx "Update Sonar" && (( SECONDS - t0 <= 75 )); then
+    record QA-219 PASS "composer back $((SECONDS - t0))s after the contact's v1 message"
+  else
+    record QA-219 FAIL "composer not back $((SECONDS - t0))s after the contact's v1 message"
+  fi
+  ui key 4
+}
+
 qa187() { # cold launch on slow mobile data: first frame never waits for push's relay attach (#665)
   if [[ "$QA_SERIAL" != emulator-* ]]; then
     record QA-187 SKIP "needs an emulator: the link is shaped through its console"; return
@@ -1039,7 +1071,7 @@ sleep 3
 # so it runs after the UI scenarios and restores Wi-Fi before QA-050 measures
 # idle CPU. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa189 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa216 qa187 qa050 qa118; do
+for s in qa001 qa002 qa189 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa216 qa219 qa187 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"
