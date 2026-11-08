@@ -163,6 +163,73 @@ is the build under test on a dedicated QA emulator/simulator.
   `combinedClickable` had consumed the down. It also kept a stale text layout
   after a reflow.
 
+## Marmot v1 → v2 flag day (v1 check)
+
+Sonar on MDK 0.8 ("Marmot v1", `0xf2ee`) cannot write to a contact who moved
+to MDK v0.14 ("Marmot v2", `0xf2f1`, hedwig-corp/bitchat-to-sonar#683): the
+send lands in the old v1 group, which v2 no longer reads, while the sender sees
+"sent". Core reads each contact's KeyPackages (one per install) and refuses the
+send; the apps replace the composer. Design and bounds:
+`core/sonar-core/src/marmot_protocol.rs`.
+
+### QA-216 — A contact who moved to Marmot v2 gets "Update Sonar", not a lost message
+- **Platforms:** both (Android scripted; iOS driven by `ios-drive.sh`). The
+  v2 side is a `sonar-cli` built from #683's branch (`SONAR_CLI_V2`).
+- **Steps:** a fresh v1 peer (`peers.sh new`) sends the app a message, so
+  there is a 1:1 chat. The peer "updates": `"$SONAR_CLI_V2" --home
+  $QA_HOME/peers/<peer> publish` republishes its KeyPackage as v2 into the
+  same slot. Open the chat (or reopen it more than 2 minutes after the last
+  open, the open-chat recheck window).
+- **Expect:** within a few seconds of the open, the composer is replaced by
+  "<name> has updated Sonar. Update the app to keep chatting" with an
+  **Update Sonar** button (TestFlight on iPhone and Mac; Zapstore / Play /
+  GitHub releases on Android by installer). No text field, attach, sticker or
+  mic control is left. The transcript stays readable. A chat with a v1 peer,
+  a peer with both a v1 and a v2 install ("Mixed"), and a peer with no
+  KeyPackage on the relays keep the normal composer. A send from any other
+  path (share sheet, notification reply, retry) fails with the same copy and
+  never shows "sent".
+  - Performance: no KeyPackage fetch before first paint (logcat / unified log
+    `marmot protocol refresh` appears after the chat painted), and none at
+    all in the first minute after launch. Cold start and chat open stay
+    within `docs/PERFORMANCE.md` baselines.
+- **How:** `android-smoke.sh` QA-216 (needs `QA_APP_NPUB` or QA-001 first and
+  `SONAR_CLI_V2`; SKIP without them). iOS: the same peer steps, then
+  `ios-drive.sh 'launch; tapc:<peer row>; expect:has updated Sonar; tree; shot'`.
+- **Guard:** core `marmot_protocol_gate_tests::a_contact_on_marmot_v2_blocks_the_chat_and_every_send_into_it`
+  (send boundary: text, reaction, media refuse; goes red without the guard),
+  `v1_mixed_and_unknown_contacts_keep_the_chat_open`,
+  `a_fresh_record_is_not_refetched_and_a_relay_miss_keeps_the_block`,
+  `the_heartbeat_waits_out_cold_start_then_checks_one_bounded_batch_of_recent_chats`,
+  `marmot_protocol::tests::*` (classification); Compose `MarmotChatGateStateTest`
+  (`SonarAppState.composerGate`, the call ChatScreen reads),
+  `MarmotComposerSlotUiTest`, `MarmotProtocolGateTest`; iOS
+  `MarmotProtocolGateTests.theStoreGatesTheComposerFromTheModelsGate`
+  (`SonarAppStore.composerGate`, read by `SonarDMScreen` and the Mac pane),
+  `MarmotLookupLaneTests.marmotProtocolRefreshDoesNotWaitBehindTheWorkQueue`.
+- **Origin:** 2026-11-08, the "v1 check" release that ships before #683 so
+  v1 users are protected when their contacts update.
+
+### QA-217 — Groups and Bluetooth around the v2 check
+- **Platforms:** both (manual: the CLI peers cannot accept group invites
+  headlessly, and Bluetooth needs two devices).
+- **Steps:** (a) a group with two other members, one moved to v2 (as in
+  QA-216) and one still on v1. (b) Move the second member too. (c) A
+  mesh-folded chat (`docs/CHAT-TYPES.md`) with a peer on v2, first in
+  Bluetooth range, then out of range.
+- **Expect:** (a) the composer stays; a note above the transcript says
+  "1 member has updated Sonar — they can't read new messages until you update
+  the app" with an **Update** button. (b) The composer is replaced as in
+  QA-216. (c) In range, the composer stays and the message goes over
+  Bluetooth (the Marmot version does not touch BLE); out of range the chat
+  falls back to Marmot and shows the update panel.
+- **Guard:** core `a_group_blocks_only_when_every_other_member_moved`,
+  `note_to_self_is_never_gated`, `marmot_protocol::tests::gate_blocks_only_when_every_other_member_moved`;
+  Compose `MarmotChatGateStateTest.aMeshFoldedChatInBluetoothRangeKeepsItsComposer`,
+  `MarmotProtocolGateTest.aLiveBluetoothLinkKeepsAMeshFoldedChatOpen`; iOS
+  `MarmotProtocolGateTests.aLiveBluetoothLinkKeepsAMeshFoldedChatOpen`.
+- **Origin:** 2026-11-08, same release as QA-216.
+
 ## Cross-client Bluetooth mesh (#671)
 
 The codec half of mesh interop is proved in CI: `scripts/bitchat-vectors/cross-replay.sh`
