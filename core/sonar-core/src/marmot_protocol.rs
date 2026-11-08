@@ -266,6 +266,26 @@ pub fn merge_fetched(
     }
 }
 
+/// A v1 message from a contact proves an install of theirs still reads v1,
+/// whatever its KeyPackage's age says: a v1 install whose republish failed,
+/// or one that has not reconnected for a while, looks abandoned to the
+/// [`STALE_V1_SLOT_SECS`] rule. `last_v1_message_secs` is when the newest
+/// v1 message from them was sent; within that window `V2Only` reads `Mixed`
+/// (the chat stays open, and their v1 install keeps reading it).
+pub fn with_v1_activity(
+    fetched: PeerMarmotProtocol,
+    last_v1_message_secs: Option<u64>,
+    now_secs: u64,
+) -> PeerMarmotProtocol {
+    let recent = last_v1_message_secs
+        .is_some_and(|at| now_secs.saturating_sub(at) <= STALE_V1_SLOT_SECS);
+    if fetched == PeerMarmotProtocol::V2Only && recent {
+        PeerMarmotProtocol::Mixed
+    } else {
+        fetched
+    }
+}
+
 /// True when a record is missing or older than `ttl`.
 pub fn is_stale(record: Option<PeerProtocolRecord>, ttl: Duration, now_secs: u64) -> bool {
     record.is_none_or(|r| now_secs.saturating_sub(r.checked_at_secs) >= ttl.as_secs())
@@ -623,6 +643,29 @@ pub(crate) mod tests {
             OPEN_CHAT_TTL,
             1000 + OPEN_CHAT_TTL.as_secs()
         ));
+    }
+
+    #[test]
+    fn a_recent_v1_message_keeps_a_contact_out_of_v2_only() {
+        use PeerMarmotProtocol::*;
+        let now = 100 * DAY;
+        // Their v1 phone wrote yesterday: whatever its KeyPackage's age, it
+        // still reads v1, so the chat must stay open.
+        assert_eq!(with_v1_activity(V2Only, Some(now - DAY), now), Mixed);
+        assert_eq!(
+            with_v1_activity(V2Only, Some(now - STALE_V1_SLOT_SECS), now),
+            Mixed
+        );
+        // Older than the stale-slot window, or no v1 message: no evidence.
+        assert_eq!(
+            with_v1_activity(V2Only, Some(now - STALE_V1_SLOT_SECS - 1), now),
+            V2Only
+        );
+        assert_eq!(with_v1_activity(V2Only, None, now), V2Only);
+        // It only ever reopens, never closes or reclassifies anything else.
+        for other in [V1Only, Mixed, Unknown] {
+            assert_eq!(with_v1_activity(other, Some(now), now), other);
+        }
     }
 
     fn pks(n: usize) -> Vec<PublicKey> {
