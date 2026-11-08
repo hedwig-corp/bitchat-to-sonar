@@ -2986,7 +2986,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Toast for a failed Marmot send: core's "peer has updated Sonar" refusal
+    /** Toast for a failed Marmot send: core's "can't read messages from this version" refusal
      *  gets the update copy (and flips the composer), anything else the raw error. */
     private fun marmotSendFailureToast(chatId: String, prefix: String, error: Throwable): String {
         if (isPeerUpdatedSonarError(error.message)) {
@@ -7565,8 +7565,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (restoredChat == null) {
             if (activeTranscriptChatId != null) endTranscriptSession()
             messages = emptyList()
-        } else if (activeTranscriptChatId != restoredChat.id) {
-            restoreTranscriptSession(restoredChat)
+        } else {
+            if (activeTranscriptChatId != restoredChat.id) restoreTranscriptSession(restoredChat)
+            // Back reveals a chat whose gate may have moved while another chat
+            // was on top (core only notifies the chats that queued a contact):
+            // re-read it like an open does. Local read first, after paint.
+            scheduleMarmotChatGate(restoredChat.id)
         }
     }
 
