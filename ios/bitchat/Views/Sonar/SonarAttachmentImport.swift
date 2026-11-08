@@ -125,7 +125,16 @@ private func snReadAttachment(_ url: URL, maxBytes: Int) -> SNAttachmentReadResu
             filename: filename,
             plaintext: data
         )
-        return .attachment(SNImportedAttachment(data: data, filename: filename, mime: mime))
+        // A photo sent as a file names where it was taken just the same, and
+        // every file, drag-drop and share-sheet send comes through here.
+        switch snImageBytesForSend(data, filename: filename, mime: mime) {
+        case let .send(clean, cleanName, cleanMime):
+            // A HEIC re-encoded to JPEG can outgrow the original.
+            guard clean.count <= maxBytes else { return .tooLarge }
+            return .attachment(SNImportedAttachment(data: clean, filename: cleanName, mime: cleanMime))
+        case .refused:
+            return .unreadable
+        }
     } catch {
         return .unreadable
     }

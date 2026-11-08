@@ -193,6 +193,17 @@ actual object SonarCore {
     actual fun mentionsPubkey(content: String, pubkeyHex: String, displayName: String?): Boolean =
         uniffi.sonar_ffi.sonarMentionsPubkey(content, pubkeyHex, displayName)
 
+    actual fun scrubImageMetadata(data: ByteArray): SonarImageScrub =
+        when (val scrub = uniffi.sonar_ffi.scrubImageMetadata(data)) {
+            uniffi.sonar_ffi.ImageMetadataScrub.NotImage -> SonarImageScrub.NotImage
+            uniffi.sonar_ffi.ImageMetadataScrub.Clean -> SonarImageScrub.Clean
+            is uniffi.sonar_ffi.ImageMetadataScrub.Stripped -> SonarImageScrub.Stripped(scrub.data)
+            uniffi.sonar_ffi.ImageMetadataScrub.Reencode -> SonarImageScrub.Reencode
+        }
+
+    actual fun imageExifOrientation(data: ByteArray): Int =
+        uniffi.sonar_ffi.imageExifOrientation(data).toInt()
+
     actual fun mentionShortSuffix(pubkeyHex: String): String? =
         uniffi.sonar_ffi.sonarMentionShortSuffix(pubkeyHex)
 

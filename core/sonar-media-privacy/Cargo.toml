@@ -1,0 +1,16 @@
+[package]
+name = "sonar-media-privacy"
+description = "Strip location and device metadata from images before they are sent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# No runtime dependencies: this parses untrusted files on the send path of both
+# apps, so it stays a small, fully bounds-checked byte walker.
+[dependencies]
+
+[dev-dependencies]
+# Already in the graph through MDK; used only to prove a scrubbed image decodes
+# to the same pixels as the original.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }

@@ -8876,10 +8876,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             // Finalize every staged item IN ORDER (lazy jpeg re-encode happens
-            // here, on send confirmation — Signal-style). GIFs pass through
-            // untouched: `reencodeToJpeg` cannot decode them. Videos keep their
-            // encode (already bounded by the pick-time size cap) but lose any
-            // location metadata first.
+            // here, on send confirmation — Signal-style). GIFs keep their
+            // frames (`reencodeToJpeg` would flatten them) but lose comments and
+            // XMP. Videos keep their encode (already bounded by the pick-time
+            // size cap) but lose any location metadata first.
             val prepared = mutableListOf<Triple<String, PickedPhoto, Boolean>>()
             var encodeFailed = false
             var videoFailed = false
@@ -8889,7 +8889,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     readTempMediaFile(preview.tempPath).also { deleteTempMediaFile(preview.tempPath) }
                 } ?: continue
                 if (preview.mime == "image/gif") {
-                    prepared += Triple(preview.chatId, PickedPhoto(raw, preview.filename, preview.mime), true)
+                    when (val gif = withContext(Dispatchers.Default) { imageBytesForSend(raw, preview.filename, preview.mime) }) {
+                        is ImageSendDecision.Send ->
+                            prepared += Triple(preview.chatId, PickedPhoto(gif.bytes, gif.filename, gif.mime), true)
+                        ImageSendDecision.Refused -> encodeFailed = true
+                    }
                 } else if (isVideoMime(preview.mime)) {
                     // A clip recorded with location on names the place it was
                     // shot (iOS finalizeVideoForSend parity). Fail closed: only
@@ -9233,12 +9237,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             when (val route = prepareMediaRoute(chatId)) {
                 is AttachmentRoutePreparation.Ready -> {
-                    dropped.files.forEach { file ->
-                        sendAttachment(route.chatId, file.bytes, file.filename, file.mime)
+                    // A photo sent as a file names where it was taken just the
+                    // same: strip it here, before the echo, mesh retry queue and
+                    // outbox each keep a copy of the bytes.
+                    val outgoing = withContext(Dispatchers.Default) {
+                        dropped.files.map { imageBytesForSend(it.bytes, it.filename, it.mime) }
+                    }
+                    var refused = 0
+                    outgoing.forEach { file ->
+                        when (file) {
+                            is ImageSendDecision.Send ->
+                                sendAttachment(route.chatId, file.bytes, file.filename, file.mime)
+                            ImageSendDecision.Refused -> refused++
+                        }
                     }
                     // The files are dispatched — the share is genuinely resolved.
                     onRouteReady?.invoke()
-                    if (dropped.rejectedCount > 0) {
+                    if (refused > 0) {
+                        toast = "Couldn't remove a photo's location data, so it wasn't sent."
+                    } else if (dropped.rejectedCount > 0) {
                         toast = "Some files couldn't be attached."
                     }
                 }

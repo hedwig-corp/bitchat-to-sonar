@@ -7707,6 +7707,109 @@ public func FfiConverterTypeCashuWalletEvent_lower(_ value: CashuWalletEvent) ->
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a host must do with an image before it sends it; see
+ * [`scrub_image_metadata`].
+ */
+
+public enum ImageMetadataScrub: Equatable, Hashable {
+
+    /**
+     * Not an image: send the bytes as they are.
+     */
+    case notImage
+    /**
+     * An image with no metadata to remove: send the bytes as they are.
+     */
+    case clean
+    /**
+     * The image without its metadata: send these bytes instead.
+     */
+    case stripped(data: Data
+    )
+    /**
+     * An image the core cannot rewrite in place (HEIF, AVIF, TIFF, JPEG XL)
+     * or could not parse. Decode it and send a re-encoded JPEG, rotated per
+     * [`image_exif_orientation`] when the decoder ignores EXIF orientation.
+     * Never send the original bytes.
+     */
+    case reencode
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ImageMetadataScrub: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImageMetadataScrub: FfiConverterRustBuffer {
+    typealias SwiftType = ImageMetadataScrub
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageMetadataScrub {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .notImage
+
+        case 2: return .clean
+
+        case 3: return .stripped(data: try FfiConverterData.read(from: &buf)
+        )
+
+        case 4: return .reencode
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ImageMetadataScrub, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .notImage:
+            writeInt(&buf, Int32(1))
+
+
+        case .clean:
+            writeInt(&buf, Int32(2))
+
+
+        case let .stripped(data):
+            writeInt(&buf, Int32(3))
+            FfiConverterData.write(data, into: &buf)
+
+
+        case .reencode:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageMetadataScrub_lift(_ buf: RustBuffer) throws -> ImageMetadataScrub {
+    return try FfiConverterTypeImageMetadataScrub.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageMetadataScrub_lower(_ value: ImageMetadataScrub) -> RustBuffer {
+    return FfiConverterTypeImageMetadataScrub.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum MeshEngineCommand: Equatable, Hashable {
 
@@ -10518,6 +10621,18 @@ public func handleLooksValid(input: String) -> Bool  {
 })
 }
 /**
+ * The EXIF orientation (1–8) of a JPEG or TIFF, or 1 when it has none. For
+ * hosts whose decoder ignores it (Android `BitmapFactory`, Java ImageIO): a
+ * re-encode that drops the tag without rotating sends the photo sideways.
+ */
+public func imageExifOrientation(data: Data) -> UInt8  {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_image_exif_orientation(
+        FfiConverterData.lower(data),$0
+    )
+})
+}
+/**
  * Host helper: classify FFI error text as soft-missing backup.
  */
 public func isMissingAccountBackupError(message: String) -> Bool  {
@@ -10871,6 +10986,22 @@ public func restoreAccountFromBlossom(nsec: String, dbPath: String, blossomServe
 })
 }
 /**
+ * Remove location, device, time, comment and thumbnail metadata from an
+ * image, keeping its pixels, animation, colour profile and orientation.
+ *
+ * Images are recognized by their bytes, not their name or MIME, so call it on
+ * every file a user sends, not only photos. Pure, CPU-bound and O(n): call it
+ * off the main thread where the bytes enter a send path, so the local echo,
+ * retries and outbox all hold the clean copy.
+ */
+public func scrubImageMetadata(data: Data) -> ImageMetadataScrub  {
+    return try!  FfiConverterTypeImageMetadataScrub_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_scrub_image_metadata(
+        FfiConverterData.lower(data),$0
+    )
+})
+}
+/**
  * Seal only (exclusive DB access). Hosts should reopen the node, then call
  * [`upload_sealed_account_backup`] so chat is not blocked on Blossom upload.
  */
@@ -11084,6 +11215,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_handle_looks_valid() != 39625) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_image_exif_orientation() != 51447) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_is_missing_account_backup_error() != 20301) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11166,6 +11300,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_restore_account_from_blossom() != 16615) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_scrub_image_metadata() != 48073) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_seal_account_backup() != 2091) {

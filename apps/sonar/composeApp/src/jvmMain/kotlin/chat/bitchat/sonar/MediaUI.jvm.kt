@@ -300,10 +300,13 @@ actual fun deleteTempMediaFile(path: String) {
 
 actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
     val src = ImageIO.read(ByteArrayInputStream(data)) ?: return null
-    val rgb = BufferedImage(src.width, src.height, BufferedImage.TYPE_INT_RGB)
-    val g = rgb.createGraphics()
+    val flat = BufferedImage(src.width, src.height, BufferedImage.TYPE_INT_RGB)
+    val g = flat.createGraphics()
     g.drawImage(src, 0, 0, java.awt.Color.WHITE, null)
     g.dispose()
+    // ImageIO ignores EXIF orientation and the JPEG below carries none, so
+    // rotate the pixels or a portrait photo arrives sideways.
+    val rgb = uprightImage(flat, SonarCore.imageExifOrientation(data))
     val writers = ImageIO.getImageWritersByFormatName("jpg")
     if (!writers.hasNext()) return null
     val writer = writers.next()
@@ -320,5 +323,14 @@ actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
         return out.toByteArray().takeIf { it.isNotEmpty() }
     } finally {
         writer.dispose()
+    }
+}
+
+private fun uprightImage(image: BufferedImage, orientation: Int): BufferedImage {
+    if (orientation !in 2..8) return image
+    val pixels = image.getRGB(0, 0, image.width, image.height, null, 0, image.width)
+    val (width, height, upright) = orientPixels(pixels, image.width, image.height, orientation)
+    return BufferedImage(width, height, BufferedImage.TYPE_INT_RGB).apply {
+        setRGB(0, 0, width, height, upright, 0, width)
     }
 }
