@@ -64,8 +64,15 @@ cost.
 
 ## The harness (`scripts/bench/`)
 
-- `build-sim.sh` — Debug, arm64, simulator-signed build (the App Group needs
-  it); prints the `.app` path.
+- `build-sim.sh [--derived-data DIR]` — Debug, arm64, simulator-signed build
+  (the App Group needs it), with `scripts/qa/ios-setup.sh`'s flags; fails if the
+  App Group is missing from the simulated entitlements; prints only the `.app`
+  path on stdout. DerivedData defaults to
+  `~/Library/Developer/Xcode/DerivedData/sonar-bench-<worktree>`.
+- `_bench-sim.sh` — prints the UDID of this worktree's dedicated simulator,
+  `Sonar Bench <worktree>`, creating and booting it on first use. Both bench
+  scripts use it unless `--device` is given; neither picks "a booted simulator"
+  any more.
 - `cold-start-bench.sh` — terminate→relaunch loop; parses the markers; prints a
   per-phase min/median/max table. Stands alone (freshly-generated identity →
   `woke=0`, useful for the identity-independent phase breakdown).
@@ -100,9 +107,14 @@ scripts/bench/cold-start-bench.sh --app "$APP" --runs 5
 
 # faithful: existing account re-syncing real messages (woke=1)
 scripts/bench/provision-and-bench.sh --app "$APP" --runs 5 --msgs-per-run 3
+
+# concurrent sessions: give each its own work dir (sonar-cli homes + run logs)
+SONAR_BENCH_WORK="$TMPDIR/sonar-bench-$(basename "$PWD")" \
+  scripts/bench/provision-and-bench.sh --app "$APP" --runs 5 --msgs-per-run 3
 ```
 
-Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
+Raw per-run logs land in `$SONAR_BENCH_WORK/runs/run_*.ndjson`
+(`SONAR_BENCH_WORK` defaults to `/tmp/sonar-bench`).
 
 ## Design notes / gotchas
 
@@ -122,7 +134,11 @@ Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
   local open failed: App Group group.sh.hedwig.sonar unavailable" before
   `t1_local_paint`, never publishes a KeyPackage, and `provision-and-bench.sh`
   fails with "A's KeyPackage never found" (found 2026-11-07; the script now
-  names the store-open error instead). A simulator build needs no device
+  names the store-open error instead). A simulator app's entitlements live in
+  the `__TEXT,__entitlements` section of its executable, not in the code
+  signature (`codesign -d` shows ad-hoc, none); `build-sim.sh` reads that
+  section and fails when `group.sh.hedwig.sonar` is missing, instead of letting
+  the provisioning DM retry 8 times. A simulator build needs no device
   provisioning; if Xcode refuses to sign, set your own `DEVELOPMENT_TEAM` in
   the gitignored `ios/Configs/Local.xcconfig`. The benchmark provisioning path
   stays **Keychain-free**, so a keychain entry left by an earlier launch does
@@ -133,6 +149,12 @@ Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
   - `MarmotService.databaseConfig` derives the encrypted-DB key as `SHA256(nsec)`
     — stable across runs, so the existing-account DB persists.
   These hooks are inert in normal use and impossible in Release.
+- **Dedicated simulator + own work dir.** Other sessions on the same Mac share
+  CoreSimulator and used to share `/tmp/sonar-bench`. `provision-and-bench.sh`
+  uninstalls Sonar and clears its App Group container on its device, and wipes
+  the `sonar-cli` homes in its work dir, so the scripts default to the
+  per-worktree `Sonar Bench <worktree>` simulator and read the work dir from
+  `SONAR_BENCH_WORK`. Never pass `--device booted`.
 - **Env passing** — `simctl launch` forwards `SIMCTL_CHILD_<NAME>` to the app.
 - **`log show` hides info-level** without `--info`; the harness streams with
   `log stream --level debug`.

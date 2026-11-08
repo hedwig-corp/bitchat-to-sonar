@@ -9,10 +9,12 @@
 # two agents on the same Mac never install into (or --fresh-erase) the same
 # device.
 #
-# Why signed, not scripts/bench/build-sim.sh: the unsigned bench build has no
-# App Group entitlement, so the Marmot store cannot open and real onboarding /
-# messaging cannot be tested. A signed simulator build carries the simulated
-# entitlements (App Group + keychain) and behaves like the real app.
+# Why signed: an unsigned build has no App Group entitlement, so the Marmot
+# store cannot open and real onboarding / messaging cannot be tested. A signed
+# simulator build carries the simulated entitlements (App Group + keychain) and
+# behaves like the real app. scripts/bench/build-sim.sh uses the same flags
+# (generic simulator destination); this script adds the core-stamp and config
+# checks a QA pass needs.
 #
 # Always target the simulator by UDID — never `booted`. Other agents on the
 # same Mac share CoreSimulator; one ran `simctl uninstall booted` mid-QA and

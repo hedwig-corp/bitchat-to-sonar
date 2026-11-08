@@ -23,6 +23,14 @@
 # Usage:
 #   scripts/bench/provision-and-bench.sh --app /path/Sonar.app [--runs N] \
 #       [--device NAME|UDID] [--cli /path/sonar-cli] [--msgs-per-run K]
+#
+# --device defaults to this worktree's dedicated bench simulator
+# (scripts/bench/_bench-sim.sh), never "whatever is booted": this script
+# uninstalls Sonar and clears its App Group container on the device it uses.
+#
+# Work dir (throwaway sonar-cli homes, raw per-run logs): $SONAR_BENCH_WORK,
+# default /tmp/sonar-bench. Give each concurrent session its own, or two runs
+# wipe each other's identities mid-benchmark.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -33,7 +41,7 @@ DEVICE=""
 RUNS=5
 MSGS_PER_RUN=1
 CLI="$REPO_ROOT/core/target/release/sonar-cli"
-WORK="/tmp/sonar-bench"
+WORK="${SONAR_BENCH_WORK:-/tmp/sonar-bench}"
 # Keep this list in sync with MarmotService.defaultRelayUrls (Swift).
 RELAYS=( wss://relay.damus.io wss://nos.lol wss://relay.primal.net wss://relay.kaleidoswap.com wss://nostr.relay.hedwig.sh )
 
@@ -77,9 +85,7 @@ resolve_device() {
     if [[ "$DEVICE" =~ ^[0-9A-Fa-f-]{36}$ ]]; then echo "$DEVICE"; return; fi
     xcrun simctl list devices available | grep -F "$DEVICE" | grep -oE '[0-9A-Fa-f-]{36}' | head -1; return
   fi
-  local b; b="$(xcrun simctl list devices booted | grep -oE '[0-9A-Fa-f-]{36}' | head -1 || true)"
-  [[ -n "$b" ]] && { echo "$b"; return; }
-  xcrun simctl list devices available | grep -E 'iPhone' | grep -oE '[0-9A-Fa-f-]{36}' | tail -1
+  "$REPO_ROOT/scripts/bench/_bench-sim.sh"
 }
 UDID="$(resolve_device)"; [[ -n "$UDID" ]] || { echo "no device" >&2; exit 1; }
 log "device: $UDID"

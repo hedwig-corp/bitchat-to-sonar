@@ -33,22 +33,56 @@ run — in that case `t3→t4` is just the 25 s idle wait, **not** sync cost.
 
 ```bash
 core/build-ios.sh                              # Rust core → sonarffi.xcframework (incl. sim slice)
-APP=$(scripts/bench/build-sim.sh)              # Debug build for the simulator → prints Sonar.app path
+APP=$(scripts/bench/build-sim.sh)              # signed Debug build for the simulator → prints Sonar.app path
 ```
+
+`build-sim.sh [--derived-data DIR]` prints only the `.app` path on stdout. Its
+DerivedData defaults to
+`~/Library/Developer/Xcode/DerivedData/sonar-bench-<worktree>`: one per
+checkout, because a DerivedData shared by two checkouts once linked a binary
+that mixed both trees, and outside `/tmp`, which macOS purges nightly.
 
 Notes on the build:
 - **Debug** is required — the markers are only public in the unified log in DEBUG.
 - **arm64-only** — the Arti + sonarffi simulator slices are arm64 (Apple Silicon);
   a universal/x86_64 sim build fails to link.
-- **Unsigned** — CLI builds of this app sign ad-hoc with empty entitlements (the
-  `sh.hedwig.sonar` bundle id belongs to the Hedwig team; a personal team can't
-  provision it), so Keychain returns `errSecMissingEntitlement` (-34018). Rather
-  than fight signing, the benchmark provisioning path is **Keychain-independent**:
-  with `SONAR_BENCH_NSEC` set, `MarmotChatModel.performConnect` adopts the env
-  identity directly and `MarmotService.databaseConfig` derives the encrypted-DB
-  key as `SHA256(nsec)` — both `#if DEBUG` only. So the reliably-launchable
-  unsigned build is exactly what we want, and the derived DB key is stable across
-  cold-start runs so the existing-account DB persists.
+- **Signed for the simulator**, with the same flags as `scripts/qa/ios-setup.sh`
+  (`-allowProvisioningUpdates`, and `BREEZ_API_KEY` from the environment through a
+  0600 temp xcconfig when `ios/Configs/Local.xcconfig` has none; the bench does not
+  need the wallet). The build used to be unsigned (`CODE_SIGNING_ALLOWED=NO`).
+  Since #362 the Marmot store lives only in the App Group container, and an unsigned
+  build has no App Group: the app stops at "Marmot local open failed: App Group
+  group.sh.hedwig.sonar unavailable", never publishes a KeyPackage, and
+  `provision-and-bench.sh` gives up after 8 "no key package found" retries. A
+  simulator app's entitlements live in the `__TEXT,__entitlements` section of its
+  executable, not in the code signature (`codesign -d` shows ad-hoc, none), so
+  `build-sim.sh` reads that section and fails if `group.sh.hedwig.sonar` is
+  missing. If Xcode refuses to sign, set your own `DEVELOPMENT_TEAM` in the
+  gitignored `ios/Configs/Local.xcconfig`.
+- **Keychain-independent identity** — with `SONAR_BENCH_NSEC` set,
+  `MarmotChatModel.performConnect` adopts the env identity directly and
+  `MarmotService.databaseConfig` derives the encrypted-DB key as `SHA256(nsec)`,
+  both `#if DEBUG` only. The derived key is stable across cold-start runs, so the
+  existing-account DB persists, and a keychain entry an earlier launch left
+  behind does not change which store opens.
+
+## Simulator and work dir
+
+Both bench scripts run on this worktree's **dedicated simulator**,
+`Sonar Bench <worktree>`, which `_bench-sim.sh` creates and boots on first use.
+They no longer fall back to "a booted simulator": `provision-and-bench.sh`
+uninstalls Sonar and clears its App Group container on its device, and other
+sessions on the same Mac share CoreSimulator. Pass `--device NAME|UDID` to pick
+another one (never `booted`).
+
+Throwaway `sonar-cli` homes and raw run logs go to `$SONAR_BENCH_WORK`
+(default `/tmp/sonar-bench`). Give each concurrent session its own; two runs
+sharing it wipe each other's identities:
+
+```bash
+SONAR_BENCH_WORK="$TMPDIR/sonar-bench-$(basename "$PWD")" \
+  scripts/bench/provision-and-bench.sh --app "$APP" --runs 5 --msgs-per-run 3
+```
 
 ## Run
 
@@ -84,12 +118,13 @@ the relays. Relays are pinned (`--relay`) to the app's
 (member_count ≤ 2) auto-join on the recipient (core `marmot.rs::process_incoming`),
 so no UI interaction is needed.
 
-All identities/keys are throwaway and live under `/tmp/sonar-bench/` — never
-commit them. The `SONAR_BENCH_NSEC` hook and markers are `#if DEBUG` only.
+All identities/keys are throwaway and live under `$SONAR_BENCH_WORK`
+(default `/tmp/sonar-bench/`) — never commit them. The `SONAR_BENCH_NSEC` hook and markers are `#if DEBUG` only.
 
 ## Output
 
-Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`. The aggregator
+Raw per-run logs land in `$SONAR_BENCH_WORK/runs/run_*.ndjson` (default
+`/tmp/sonar-bench/runs/`). The aggregator
 (`_aggregate.py`) prints a min/median/max table per phase.
 
 ## Physical iPhone (real account)
@@ -210,14 +245,16 @@ and native UI execution. It is the right target for latency monitoring.
 
 #### iOS Simulator
 
-Build/install the Debug simulator app, stream its unified log, and pass the
-same variables with the `SIMCTL_CHILD_` prefix:
+Build/install the Debug simulator app on the dedicated bench simulator (by
+UDID, never `booted`), stream its unified log, and pass the same variables with
+the `SIMCTL_CHILD_` prefix:
 
 ```bash
 core/build-ios.sh
 APP=$(scripts/bench/build-sim.sh)
-xcrun simctl install booted "$APP"
-xcrun simctl spawn booted log stream --level debug --style compact --color none \
+UDID=$(scripts/bench/_bench-sim.sh)
+xcrun simctl install "$UDID" "$APP"
+xcrun simctl spawn "$UDID" log stream --level debug --style compact --color none \
   --predicate 'subsystem == "chat.bitchat"' > /tmp/simulator-send.log &
 STREAM_PID=$!
 
@@ -225,7 +262,7 @@ xcrun simctl launch --terminate-running \
   --env SIMCTL_CHILD_SONAR_BENCH_SEND_COUNT=50 \
   --env 'SIMCTL_CHILD_SONAR_BENCH_SEND_TARGET=Sonar agent DM' \
   --env SIMCTL_CHILD_SONAR_BENCH_SEND_PREFIX=simulator-smoke \
-  booted sh.hedwig.sonar
+  "$UDID" sh.hedwig.sonar
 
 scripts/bench/_send_aggregate.py --label "iOS simulator smoke" /tmp/simulator-send.log
 kill "$STREAM_PID"

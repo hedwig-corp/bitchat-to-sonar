@@ -75,8 +75,9 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
   `TEST_RUNNER_*` environment variables; screenshots land directly in
   `$QA_HOME/idrive/<name>/`.
 
-- **Build signed, not with `scripts/bench/build-sim.sh`:** the unsigned bench
-  build has no App Group, so the Marmot store never opens.
+- **Build signed (`ios-setup.sh`):** an unsigned build has no App Group, so the
+  Marmot store never opens. `scripts/bench/build-sim.sh` is signed too now, but
+  it is not tied to the QA simulator and skips the core-stamp and config checks.
 - **Rust core:** `ios-setup.sh` needs `sonarffi.xcframework` built from this
   worktree's core (stamp `Frameworks/.sonar-core-tree`; `--build-core` writes
   it). Copying one from another worktree is fine only if `git rev-parse
