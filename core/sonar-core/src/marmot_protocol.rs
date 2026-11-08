@@ -163,6 +163,15 @@ pub fn classify_peer_key_packages<'a>(
     author: &PublicKey,
     events: impl IntoIterator<Item = &'a Event>,
 ) -> PeerMarmotProtocol {
+    peer_key_package_summary(author, events).0
+}
+
+/// [`classify_peer_key_packages`] plus when the newest v2 KeyPackage was
+/// published (the time [`with_v1_activity`] compares a v1 message against).
+pub fn peer_key_package_summary<'a>(
+    author: &PublicKey,
+    events: impl IntoIterator<Item = &'a Event>,
+) -> (PeerMarmotProtocol, Option<u64>) {
     let mut newest_per_slot: HashMap<String, &Event> = HashMap::new();
     for event in events {
         if event.pubkey != *author || event.kind != Kind::Custom(KEY_PACKAGE_KIND) {
@@ -194,12 +203,13 @@ pub fn classify_peer_key_packages<'a>(
     let live_v1 = v1_slots
         .iter()
         .any(|&at| newest_v2.is_none_or(|v2| v2.saturating_sub(at) <= STALE_V1_SLOT_SECS));
-    match (live_v1, newest_v2.is_some()) {
+    let protocol = match (live_v1, newest_v2.is_some()) {
         (true, true) => PeerMarmotProtocol::Mixed,
         (true, false) => PeerMarmotProtocol::V1Only,
         (false, true) => PeerMarmotProtocol::V2Only,
         (false, false) => PeerMarmotProtocol::Unknown,
-    }
+    };
+    (protocol, newest_v2)
 }
 
 /// What a chat's composer may do, from its other members' protocols.
@@ -266,23 +276,22 @@ pub fn merge_fetched(
     }
 }
 
-/// A v1 message from a contact proves an install of theirs still reads v1,
-/// whatever its KeyPackage's age says: a v1 install whose republish failed,
-/// or one that has not reconnected for a while, looks abandoned to the
-/// [`STALE_V1_SLOT_SECS`] rule. `last_v1_message_secs` is when the newest
-/// v1 message from them was sent; within that window `V2Only` reads `Mixed`
-/// (the chat stays open, and their v1 install keeps reading it).
+/// A v1 message from a contact proves an install of theirs read v1 when it
+/// was SENT. That outranks the KeyPackages only if it came after their newest
+/// v2 KeyPackage: then some install is still on v1 although the slot rule
+/// calls it abandoned (a v1 install whose republish failed, or one that has
+/// not reconnected for 14 days), and `V2Only` reads `Mixed`. A v1 message
+/// from before the v2 KeyPackage proves nothing: the usual upgrade is the
+/// same install moving to v2 right after its last v1 message, and that chat
+/// must block, or a v1 user's next messages are lost silently.
 pub fn with_v1_activity(
     fetched: PeerMarmotProtocol,
     last_v1_message_secs: Option<u64>,
-    now_secs: u64,
+    newest_v2_key_package_secs: Option<u64>,
 ) -> PeerMarmotProtocol {
-    let recent = last_v1_message_secs
-        .is_some_and(|at| now_secs.saturating_sub(at) <= STALE_V1_SLOT_SECS);
-    if fetched == PeerMarmotProtocol::V2Only && recent {
-        PeerMarmotProtocol::Mixed
-    } else {
-        fetched
+    match (fetched, last_v1_message_secs, newest_v2_key_package_secs) {
+        (PeerMarmotProtocol::V2Only, Some(v1), Some(v2)) if v1 > v2 => PeerMarmotProtocol::Mixed,
+        _ => fetched,
     }
 }
 
@@ -646,25 +655,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_recent_v1_message_keeps_a_contact_out_of_v2_only() {
+    fn only_a_v1_message_newer_than_the_v2_key_package_keeps_a_contact_open() {
         use PeerMarmotProtocol::*;
-        let now = 100 * DAY;
-        // Their v1 phone wrote yesterday: whatever its KeyPackage's age, it
-        // still reads v1, so the chat must stay open.
-        assert_eq!(with_v1_activity(V2Only, Some(now - DAY), now), Mixed);
-        assert_eq!(
-            with_v1_activity(V2Only, Some(now - STALE_V1_SLOT_SECS), now),
-            Mixed
-        );
-        // Older than the stale-slot window, or no v1 message: no evidence.
-        assert_eq!(
-            with_v1_activity(V2Only, Some(now - STALE_V1_SLOT_SECS - 1), now),
-            V2Only
-        );
-        assert_eq!(with_v1_activity(V2Only, None, now), V2Only);
+        let v2_at = 100 * DAY;
+        // A v1 install wrote after the contact's newest v2 KeyPackage: it
+        // still reads v1, whatever its own KeyPackage's age.
+        assert_eq!(with_v1_activity(V2Only, Some(v2_at + 1), Some(v2_at)), Mixed);
+        // The usual upgrade: last v1 message, then the same install moves to
+        // v2. That must block, however recent the message (QA-216).
+        assert_eq!(with_v1_activity(V2Only, Some(v2_at - 60), Some(v2_at)), V2Only);
+        assert_eq!(with_v1_activity(V2Only, Some(v2_at), Some(v2_at)), V2Only);
+        assert_eq!(with_v1_activity(V2Only, None, Some(v2_at)), V2Only);
         // It only ever reopens, never closes or reclassifies anything else.
         for other in [V1Only, Mixed, Unknown] {
-            assert_eq!(with_v1_activity(other, Some(now), now), other);
+            assert_eq!(with_v1_activity(other, Some(v2_at + 1), Some(v2_at)), other);
         }
     }
 

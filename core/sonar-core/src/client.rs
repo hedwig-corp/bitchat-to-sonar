@@ -39,7 +39,7 @@ use crate::marmot::{
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::marmot_protocol::{
-    chat_gate, classify_peer_key_packages, is_stale, merge_fetched, with_v1_activity,
+    chat_gate, is_stale, merge_fetched, peer_key_package_summary, with_v1_activity,
     ChatProtocolGate, PeerMarmotProtocol, PeerProtocolRecord, ProtocolRefreshState,
     MEMBERS_PER_CHAT, OPEN_CHAT_TTL, RECENT_CHAT_LIMIT, RECENT_CHAT_TTL, RECENT_CHAT_WINDOW_SECS,
 };
@@ -8034,11 +8034,15 @@ impl SonarClient {
     }
 
     /// A contact's v1 message just decrypted (this build reads v1 groups
-    /// only), so some install of theirs still reads v1. Remember when it was
-    /// sent, and if the cache says they are V2Only, reopen their chats at
-    /// once: the record becomes Mixed, stays due for a recheck, and the next
-    /// heartbeat refetches them first. One map write per inbound message; the
-    /// disk write and the requeue happen only when a block is contradicted.
+    /// only), so some install of theirs read v1 when it was sent. Remember
+    /// that time (a refetch weighs it against their newest v2 KeyPackage,
+    /// `with_v1_activity`). If the cache says they are V2Only and the message
+    /// was sent AFTER that check, reopen their chats at once: the record
+    /// becomes Mixed, stays due for a recheck, and the next heartbeat
+    /// refetches them first. A message older than the check (catch-up of
+    /// history from before an upgrade) proves nothing and changes nothing.
+    /// One map write per inbound message; the disk write and the requeue
+    /// happen only when a block is contradicted.
     fn note_marmot_v1_message(&self, message: &crate::marmot::ChatMessage) {
         let sender = message.sender;
         let sent_at = message.created_at.as_secs();
@@ -8047,14 +8051,11 @@ impl SonarClient {
             let last = seen.entry(sender).or_insert(sent_at);
             *last = (*last).max(sent_at);
         }
-        let now_secs = Timestamp::now().as_secs();
-        if with_v1_activity(PeerMarmotProtocol::V2Only, Some(sent_at), now_secs)
-            == PeerMarmotProtocol::V2Only
-        {
-            return; // too old to say anything about today
-        }
         let reopened = self.with_marmot_protocol_cache(|cache| match cache.get(&sender) {
-            Some(record) if record.protocol == PeerMarmotProtocol::V2Only => {
+            Some(record)
+                if record.protocol == PeerMarmotProtocol::V2Only
+                    && sent_at > record.checked_at_secs =>
+            {
                 let record = PeerProtocolRecord {
                     protocol: PeerMarmotProtocol::Mixed,
                     checked_at_secs: 0,
@@ -8212,11 +8213,9 @@ impl SonarClient {
         };
         self.with_marmot_protocol_cache(|cache| {
             for pk in &batch {
-                let protocol = with_v1_activity(
-                    classify_peer_key_packages(pk, by_author.get(pk).into_iter().flatten()),
-                    v1_seen.get(pk).copied(),
-                    now_secs,
-                );
+                let (fetched, newest_v2) =
+                    peer_key_package_summary(pk, by_author.get(pk).into_iter().flatten());
+                let protocol = with_v1_activity(fetched, v1_seen.get(pk).copied(), newest_v2);
                 let previous = cache.get(pk).copied();
                 let record = merge_fetched(previous, protocol, now_secs);
                 if previous.map_or(PeerMarmotProtocol::Unknown, |p| p.protocol) != record.protocol {
@@ -14153,13 +14152,9 @@ mod marmot_protocol_gate_tests {
         );
     }
 
-    /// The cache said Bob is on v2 (a v1 install of his looked abandoned to
-    /// the 14-day KeyPackage rule), then his v1 message arrives: proof that
-    /// he still reads v1. The chat must reopen at once: before, a reply from
-    /// a notification or the share sheet stayed refused until a refetch.
-    #[tokio::test]
-    async fn a_v1_message_from_a_contact_cached_as_v2_reopens_the_chat() {
-        let h = harness().await;
+    /// Alice starts a real DM with Bob over the harness relay and both sides
+    /// hold it. Returns Bob, Alice's group id and Bob's.
+    async fn dm_with_bob(h: &Harness) -> (SonarClient, GroupId, GroupId) {
         let bob = SonarClient::connect_in_memory(Identity::generate(), h.relays.clone())
             .await
             .expect("bob connects");
@@ -14179,7 +14174,30 @@ mod marmot_protocol_gate_tests {
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
-        let bob_group = bob_group.expect("bob joined the dm");
+        (bob, group, bob_group.expect("bob joined the dm"))
+    }
+
+    /// Alice's transcript reaches `n` rows (her sync is the real inbound path).
+    async fn alice_receives(h: &Harness, group: &GroupId, n: usize) {
+        for _ in 0..100 {
+            let _ = h.alice.sync().await;
+            if h.alice.messages(group).map(|m| m.len()).unwrap_or(0) >= n {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert_eq!(h.alice.messages(group).expect("messages").len(), n);
+    }
+
+    /// The cache said Bob is on v2 (a v1 install of his looked abandoned to
+    /// the 14-day KeyPackage rule), then a v1 message he sent AFTER that
+    /// check arrives: proof that he still reads v1. The chat must reopen at
+    /// once: before, a reply from a notification or the share sheet stayed
+    /// refused until a refetch.
+    #[tokio::test]
+    async fn a_v1_message_from_a_contact_cached_as_v2_reopens_the_chat() {
+        let h = harness().await;
+        let (bob, group, bob_group) = dm_with_bob(&h).await;
         let chat = hex::encode(group.as_slice());
         let bob_pk = bob.identity().public_key();
         h.alice.with_marmot_protocol_cache(|cache| {
@@ -14187,25 +14205,14 @@ mod marmot_protocol_gate_tests {
                 bob_pk,
                 PeerProtocolRecord {
                     protocol: PeerMarmotProtocol::V2Only,
-                    checked_at_secs: Timestamp::now().as_secs(),
+                    checked_at_secs: Timestamp::now().as_secs() - 60,
                 },
             );
         });
         assert!(h.alice.marmot_chat_gate(&[chat.clone()]).is_blocked());
 
         bob.send_text(&bob_group, "still on v1").await.expect("bob sends");
-        for _ in 0..100 {
-            let _ = h.alice.sync().await;
-            if h.alice.messages(&group).map(|m| m.len()).unwrap_or(0) >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-        assert_eq!(
-            h.alice.messages(&group).expect("messages").len(),
-            2,
-            "alice received bob's v1 message"
-        );
+        alice_receives(&h, &group, 2).await;
         assert_eq!(
             h.alice.peer_marmot_protocol(&bob_pk),
             PeerMarmotProtocol::Mixed
@@ -14219,8 +14226,9 @@ mod marmot_protocol_gate_tests {
             .await
             .expect("the reopened chat sends");
         // A refetch that would say V2Only again (his v1 KeyPackage still
-        // looks abandoned) keeps him Mixed while his v1 message is recent.
-        let stale_v1_and_newer_v2 = [
+        // looks abandoned, his v2 one is older than his v1 message) keeps
+        // him Mixed.
+        let stale_v1_and_older_v2 = [
             v1_key_package(bob.identity().keys(), "bob-ipad", 1_000),
             v2_key_package(
                 bob.identity().keys(),
@@ -14228,14 +14236,59 @@ mod marmot_protocol_gate_tests {
                 1_000 + crate::marmot_protocol::STALE_V1_SLOT_SECS + 1,
             ),
         ];
+        let (fetched, newest_v2) =
+            peer_key_package_summary(&bob_pk, stale_v1_and_older_v2.iter());
+        assert_eq!(fetched, PeerMarmotProtocol::V2Only);
         assert_eq!(
             with_v1_activity(
-                classify_peer_key_packages(&bob_pk, stale_v1_and_newer_v2.iter()),
+                fetched,
                 h.alice.marmot_v1_seen.lock().unwrap().get(&bob_pk).copied(),
-                Timestamp::now().as_secs(),
+                newest_v2,
             ),
             PeerMarmotProtocol::Mixed
         );
+    }
+
+    /// QA-216's real shape: Bob writes in v1, then the SAME install moves to
+    /// v2 (its v2 KeyPackage replaces the v1 one in its slot). His last v1
+    /// message is seconds old, but it predates the update, so the chat must
+    /// block: keeping it open would lose Alice's next messages silently.
+    #[tokio::test]
+    async fn a_contact_who_wrote_in_v1_then_updated_is_blocked() {
+        let h = harness().await;
+        let (bob, group, bob_group) = dm_with_bob(&h).await;
+        let chat = hex::encode(group.as_slice());
+        let bob_pk = bob.identity().public_key();
+        bob.send_text(&bob_group, "last words in v1").await.expect("bob sends");
+        alice_receives(&h, &group, 2).await;
+        let last_v1 = h.alice.marmot_v1_seen.lock().unwrap().get(&bob_pk).copied();
+        let last_v1 = last_v1.expect("alice noted bob's v1 message");
+
+        // Bob's install updates: a v2 KeyPackage into his own slot.
+        let slot = h
+            .alice
+            .nostr
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(KEY_PACKAGE_KIND))
+                    .author(bob_pk),
+                FETCH_TIMEOUT,
+            )
+            .await
+            .expect("bob's key package")
+            .into_iter()
+            .find_map(|e| e.tags.identifier().map(str::to_owned))
+            .expect("bob's slot");
+        publish(&h, &v2_key_package(bob.identity().keys(), &slot, last_v1 + 2)).await;
+
+        h.alice.refresh_marmot_chat_protocol(&[chat.clone()]).await;
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&bob_pk),
+            PeerMarmotProtocol::V2Only
+        );
+        assert!(h.alice.marmot_chat_gate(&[chat.clone()]).is_blocked());
+        let err = h.alice.send_text(&group, "into the void").await;
+        assert!(matches!(err, Err(Error::PeerUpdatedMarmot)), "{err:?}");
     }
 
     #[tokio::test]

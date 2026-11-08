@@ -201,6 +201,9 @@ send; the apps replace the composer. Design and bounds:
   `ios-drive.sh 'launch; tapc:<peer row>; expect:from this version of Sonar; tree; shot'`.
 - **Guard:** core `marmot_protocol_gate_tests::a_contact_on_marmot_v2_blocks_the_chat_and_every_send_into_it`
   (send boundary: text, reaction, media refuse; goes red without the guard),
+  `a_contact_who_wrote_in_v1_then_updated_is_blocked` (the peer's last v1
+  message predates its v2 KeyPackage: still blocks; red when any recent v1
+  message kept the chat open, which is how the first QA-219 fix broke QA-216),
   `v1_mixed_and_unknown_contacts_keep_the_chat_open`,
   `a_fresh_record_is_not_refetched_and_a_relay_miss_keeps_the_block`,
   `the_heartbeat_waits_out_cold_start_then_checks_one_bounded_batch_of_recent_chats`,
@@ -243,14 +246,17 @@ send; the apps replace the composer. Design and bounds:
   way to the normal composer, and a send goes through. It must not wait for
   the 2-minute open-chat recheck. The same holds for a reply from a
   notification or the share sheet, before the chat is ever opened. A v1
-  message proves the contact still reads v1, whatever their KeyPackages say
-  (a v1 install that has not republished for 14 days looks abandoned).
+  message sent after the contact's newest v2 KeyPackage proves an install of
+  theirs still reads v1, whatever the KeyPackages say (a v1 install that has
+  not republished for 14 days looks abandoned). A v1 message from BEFORE the
+  v2 KeyPackage proves nothing: that is the usual upgrade, and QA-216 must
+  still block.
 - **How:** `android-smoke.sh` QA-219 (same preconditions as QA-216). iOS:
   the same peer steps with `ios-drive.sh`.
 - **Guard:** core
   `marmot_protocol_gate_tests::a_v1_message_from_a_contact_cached_as_v2_reopens_the_chat`
   (red without the inbound hook: the contact stays V2Only),
-  `marmot_protocol::tests::a_recent_v1_message_keeps_a_contact_out_of_v2_only`.
+  `marmot_protocol::tests::only_a_v1_message_newer_than_the_v2_key_package_keeps_a_contact_open`.
   A Back to the chat re-reads the gate on Compose:
   `MarmotChatGateStateTest.backToAChatReReadsItsGateFromCore`.
 - **Origin:** 2026-11-08, the #684 review. The cached V2Only outlived the
