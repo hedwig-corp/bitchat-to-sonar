@@ -181,21 +181,24 @@ send; the apps replace the composer. Design and bounds:
   same slot. Open the chat (or reopen it more than 2 minutes after the last
   open, the open-chat recheck window).
 - **Expect:** within a few seconds of the open, the composer is replaced by
-  "<name> has updated Sonar. Update the app to keep chatting" with an
+  "<name> can't read messages from this version of Sonar. Update the app to keep chatting" with an
   **Update Sonar** button (TestFlight on iPhone and Mac; Zapstore / Play /
   GitHub releases on Android by installer). No text field, attach, sticker or
   mic control is left. The transcript stays readable. A chat with a v1 peer,
   a peer with both a v1 and a v2 install ("Mixed"), and a peer with no
   KeyPackage on the relays keep the normal composer. A send from any other
   path (share sheet, notification reply, retry) fails with the same copy and
-  never shows "sent".
+  never shows "sent". A White Noise contact (White Noise runs MDK v0.14, so
+  it publishes only v2 KeyPackages) gets the same panel, and the copy names
+  no app for them: it says what they can't read, not that they "updated
+  Sonar".
   - Performance: no KeyPackage fetch before first paint (logcat / unified log
     `marmot protocol refresh` appears after the chat painted), and none at
     all in the first minute after launch. Cold start and chat open stay
     within `docs/PERFORMANCE.md` baselines.
 - **How:** `android-smoke.sh` QA-216 (needs `QA_APP_NPUB` or QA-001 first and
   `SONAR_CLI_V2`; SKIP without them). iOS: the same peer steps, then
-  `ios-drive.sh 'launch; tapc:<peer row>; expect:has updated Sonar; tree; shot'`.
+  `ios-drive.sh 'launch; tapc:<peer row>; expect:from this version of Sonar; tree; shot'`.
 - **Guard:** core `marmot_protocol_gate_tests::a_contact_on_marmot_v2_blocks_the_chat_and_every_send_into_it`
   (send boundary: text, reaction, media refuse; goes red without the guard),
   `v1_mixed_and_unknown_contacts_keep_the_chat_open`,
@@ -218,8 +221,8 @@ send; the apps replace the composer. Design and bounds:
   mesh-folded chat (`docs/CHAT-TYPES.md`) with a peer on v2, first in
   Bluetooth range, then out of range.
 - **Expect:** (a) the composer stays; a note above the transcript says
-  "1 member has updated Sonar — they can't read new messages until you update
-  the app" with an **Update** button. (b) The composer is replaced as in
+  "1 member is on a newer version — they can't read new messages until you
+  update the app" with an **Update** button. (b) The composer is replaced as in
   QA-216. (c) In range, the composer stays and the message goes over
   Bluetooth (the Marmot version does not touch BLE); out of range the chat
   falls back to Marmot and shows the update panel.

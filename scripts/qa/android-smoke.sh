@@ -947,12 +947,12 @@ qa216() { # a contact who moved to Marmot v2 (MDK v0.14): composer → "Update S
     { record QA-216 FAIL "v2 sonar-cli could not publish from the v1 home"; return; }
   t0=$SECONDS
   open_chat_row "qa216 hello $RUN" || { record QA-216 FAIL "could not open the chat"; return; }
-  if ! "$UI" wait "has updated Sonar" 25 >/dev/null; then
+  if ! "$UI" wait "from this version of Sonar" 25 >/dev/null; then
     # A background check may have cached "v1" just before the update: the
     # open-chat recheck is due 2 minutes later.
     ui key 4; sleep $(( 130 - (SECONDS - t0) > 0 ? 130 - (SECONDS - t0) : 0 ))
     open_chat_row "qa216 hello $RUN" || { record QA-216 FAIL "could not reopen the chat"; return; }
-    "$UI" wait "has updated Sonar" 30 >/dev/null ||
+    "$UI" wait "from this version of Sonar" 30 >/dev/null ||
       { record QA-216 FAIL "no update panel $((SECONDS - t0))s after the peer moved to v2"; return; }
   fi
   if hasx "Update Sonar" && ! hasx "Add to your message"; then

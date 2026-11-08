@@ -98,7 +98,7 @@ final class MarmotService: @unchecked Sendable {
     }
 
     /// Substring of core's refusal when every other member moved to Marmot v2.
-    static let peerUpdatedSonarMarker = "peer has updated Sonar"
+    static let peerUpdatedSonarMarker = "can't read messages from this version of Sonar"
 
     struct PeerTimezone: Sendable, Equatable {
         let senderNpub: String

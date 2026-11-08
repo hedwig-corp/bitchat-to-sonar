@@ -5721,7 +5721,7 @@ final class MarmotChatModel: ObservableObject {
 
     static func describe(_ error: Error) -> String {
         if isPeerUpdatedSonar(error) {
-            return "They have updated Sonar. Update the app to keep chatting."
+            return "They can't read messages from this version of Sonar. Update the app to keep chatting."
         }
         switch error {
         case MarmotService.ServiceError.notConnected:

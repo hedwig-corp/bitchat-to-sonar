@@ -3,7 +3,7 @@ use thiserror::Error;
 
 /// Substring of [`Error::PeerUpdatedMarmot`]'s message that hosts match on
 /// (errors cross the FFI as flat strings).
-pub const PEER_UPDATED_SONAR_MARKER: &str = "peer has updated Sonar";
+pub const PEER_UPDATED_SONAR_MARKER: &str = "can't read messages from this version of Sonar";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -100,8 +100,9 @@ pub enum Error {
 
     /// Every other member of this chat moved to Marmot v2 (MDK v0.14), which
     /// this MDK 0.8 build cannot write to: a send would be unreadable. Stable
-    /// Display text — hosts match on [`PEER_UPDATED_SONAR_MARKER`].
-    #[error("peer has updated Sonar: update the app to keep chatting")]
+    /// Display text — hosts match on [`PEER_UPDATED_SONAR_MARKER`]. It names
+    /// no app for the contact: White Noise users publish v2 KeyPackages too.
+    #[error("the contact can't read messages from this version of Sonar: update the app to keep chatting")]
     PeerUpdatedMarmot,
 
     #[error("rng error: {0}")]

@@ -33,11 +33,11 @@ func snComposerGate(_ gate: MarmotService.MarmotChatGate?, sendsOverMesh: Bool) 
 
 enum SNMarmotGateCopy {
     static func updateRequired(_ name: String) -> String {
-        "\(name) has updated Sonar. Update the app to keep chatting"
+        "\(name) can't read messages from this version of Sonar. Update the app to keep chatting"
     }
 
     static func partlyUpdatedBold(_ count: Int) -> String {
-        count == 1 ? "1 member has updated Sonar" : "\(count) members have updated Sonar"
+        count == 1 ? "1 member is on a newer version" : "\(count) members are on a newer version"
     }
 
     static let partlyUpdatedRest = " — they can't read new messages until you update the app"

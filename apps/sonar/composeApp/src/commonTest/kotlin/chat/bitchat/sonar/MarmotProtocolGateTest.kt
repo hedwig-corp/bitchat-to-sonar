@@ -28,8 +28,8 @@ class MarmotProtocolGateTest {
     @Test
     fun aPartlyUpdatedGroupGetsANoteNotABlock() {
         assertEquals(SonarComposerGate.PartlyUpdated(2), composerGateFor(partly, sendsOverMesh = false))
-        assertEquals("1 member has updated Sonar", marmotPartlyUpdatedBold(1))
-        assertEquals("2 members have updated Sonar", marmotPartlyUpdatedBold(2))
+        assertEquals("1 member is on a newer version", marmotPartlyUpdatedBold(1))
+        assertEquals("2 members are on a newer version", marmotPartlyUpdatedBold(2))
     }
 
     @Test
@@ -43,14 +43,14 @@ class MarmotProtocolGateTest {
     @Test
     fun copyNamesThePeer() {
         assertEquals(
-            "Ana has updated Sonar. Update the app to keep chatting",
+            "Ana can't read messages from this version of Sonar. Update the app to keep chatting",
             marmotUpdateRequiredText("Ana"),
         )
     }
 
     @Test
     fun coreRefusalIsRecognisedByItsMarker() {
-        assertTrue(isPeerUpdatedSonarError("peer has updated Sonar: update the app to keep chatting"))
+        assertTrue(isPeerUpdatedSonarError("the contact can't read messages from this version of Sonar: update the app to keep chatting"))
         assertFalse(isPeerUpdatedSonarError("no relay connected within timeout"))
         assertFalse(isPeerUpdatedSonarError(null))
     }

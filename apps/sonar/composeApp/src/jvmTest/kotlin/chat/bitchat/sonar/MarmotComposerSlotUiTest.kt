@@ -31,7 +31,7 @@ class MarmotComposerSlotUiTest {
                 Text("COMPOSER")
             }
         }
-        onNodeWithText("Ana has updated Sonar. Update the app to keep chatting").assertIsDisplayed()
+        onNodeWithText("Ana can't read messages from this version of Sonar. Update the app to keep chatting").assertIsDisplayed()
         onNodeWithText("COMPOSER").assertDoesNotExist()
         onNodeWithText("Update Sonar").performClick()
         assertEquals(1, updates)

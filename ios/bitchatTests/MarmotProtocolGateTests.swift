@@ -36,18 +36,18 @@ struct MarmotProtocolGateTests {
 
     @Test
     func copyNamesThePeer() {
-        #expect(SNMarmotGateCopy.updateRequired("Ana") == "Ana has updated Sonar. Update the app to keep chatting")
-        #expect(SNMarmotGateCopy.partlyUpdatedBold(1) == "1 member has updated Sonar")
-        #expect(SNMarmotGateCopy.partlyUpdatedBold(3) == "3 members have updated Sonar")
+        #expect(SNMarmotGateCopy.updateRequired("Ana") == "Ana can't read messages from this version of Sonar. Update the app to keep chatting")
+        #expect(SNMarmotGateCopy.partlyUpdatedBold(1) == "1 member is on a newer version")
+        #expect(SNMarmotGateCopy.partlyUpdatedBold(3) == "3 members are on a newer version")
     }
 
     @Test @MainActor
     func coreRefusalReadsAsTheUpdateCopy() {
         let refusal = MarmotService.ServiceError.core(
-            "peer has updated Sonar: update the app to keep chatting"
+            "the contact can't read messages from this version of Sonar: update the app to keep chatting"
         )
         #expect(MarmotChatModel.isPeerUpdatedSonar(refusal))
-        #expect(MarmotChatModel.describe(refusal).contains("updated Sonar"))
+        #expect(MarmotChatModel.describe(refusal).contains("from this version of Sonar"))
         #expect(!MarmotChatModel.isPeerUpdatedSonar(MarmotService.ServiceError.core("relay timeout")))
     }
 

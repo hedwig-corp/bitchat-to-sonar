@@ -38,7 +38,7 @@ data class SonarMarmotChatGate(
 
 /** Substring of core's send error when every other member moved to Marmot v2
  *  (`sonar_core::error::PEER_UPDATED_SONAR_MARKER`). */
-const val PEER_UPDATED_SONAR_MARKER = "peer has updated Sonar"
+const val PEER_UPDATED_SONAR_MARKER = "can't read messages from this version of Sonar"
 
 fun isPeerUpdatedSonarError(message: String?): Boolean =
     message?.contains(PEER_UPDATED_SONAR_MARKER) == true
@@ -72,12 +72,12 @@ fun composerGateFor(gate: SonarMarmotChatGate?, sendsOverMesh: Boolean): SonarCo
 }
 
 fun marmotUpdateRequiredText(name: String): String =
-    "$name has updated Sonar. Update the app to keep chatting"
+    "$name can't read messages from this version of Sonar. Update the app to keep chatting"
 
 const val MARMOT_PARTLY_UPDATED_REST = " — they can't read new messages until you update the app"
 
 fun marmotPartlyUpdatedBold(count: Int): String =
-    if (count == 1) "1 member has updated Sonar" else "$count members have updated Sonar"
+    if (count == 1) "1 member is on a newer version" else "$count members are on a newer version"
 
 /** Where this build gets its updates: Zapstore, Google Play, or the GitHub
  *  release page for sideloaded and desktop builds. */
