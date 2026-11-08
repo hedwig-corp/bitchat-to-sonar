@@ -1085,6 +1085,15 @@ expect object SonarCore {
     /** Reset unread count for a chat to 0. */
     suspend fun markConversationRead(chatId: String)
 
+    /** Whether this chat's other members can still read a Marmot send (they
+     *  may have moved to Marmot v2). Local only — cache + member read. */
+    suspend fun marmotChatGate(groupIdHexes: List<String>): SonarMarmotChatGate
+
+    /** Recheck the open chat's members' Marmot protocol from their
+     *  KeyPackages: one bounded relay fetch, skipped while fresh. Background
+     *  only, after first paint. A change arrives on [conversationChanged]. */
+    suspend fun refreshMarmotChatProtocol(groupIdHexes: List<String>)
+
     /** Cursor-based message page — newest first, before the given cursor. */
     suspend fun messagesCursorPage(
         chatId: String,

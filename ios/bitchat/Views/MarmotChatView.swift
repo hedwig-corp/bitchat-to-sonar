@@ -2592,7 +2592,98 @@ final class MarmotChatModel: ObservableObject {
         await loadLocalSummaries()
     }
 
+    // MARK: Marmot v1 → v2 chat gate
+
+    /// Gate per conversation id (absent = open). Filled after the chat paints
+    /// from a local core read; the background KeyPackage refresh updates it
+    /// through `conversationChanged`.
+    @Published private(set) var marmotChatGates: [String: MarmotService.MarmotChatGate] = [:]
+    /// Folded MLS group ids per conversation the gate was asked for.
+    private var marmotChatGateGroups: [String: [String]] = [:]
+    private var marmotChatGateTasks: [String: Task<Void, Never>] = [:]
+
+    /// After first paint: read the gate locally, then let core recheck the
+    /// members' KeyPackages (bounded, TTL'd, deduped in core) and read again.
+    func scheduleMarmotChatGate(conversationId: String, groupIds: [String]) {
+        let groups = Array(Set(groupIds.filter { !$0.isEmpty })).sorted()
+        guard !groups.isEmpty else { return }
+        marmotChatGateGroups[conversationId] = groups
+        marmotChatGateTasks[conversationId]?.cancel()
+        marmotChatGateTasks[conversationId] = Task { [weak self] in
+            guard let self else { return }
+            await self.reloadMarmotChatGate(conversationId: conversationId)
+            await self.service.refreshMarmotChatProtocol(groupIds: groups)
+            guard !Task.isCancelled else { return }
+            await self.reloadMarmotChatGate(conversationId: conversationId)
+            self.marmotChatGateTasks[conversationId] = nil
+        }
+    }
+
+    /// Re-read one conversation's gate from core (local only).
+    func reloadMarmotChatGate(conversationId: String) async {
+        guard let groups = marmotChatGateGroups[conversationId] else { return }
+        let gate = await service.marmotChatGate(groupIds: groups)
+        let next: MarmotService.MarmotChatGate? = gate == .open ? nil : gate
+        if marmotChatGates[conversationId] != next {
+            marmotChatGates[conversationId] = next
+        }
+    }
+
+    #if DEBUG
+    /// Test seam: install a gate as `reloadMarmotChatGate` would.
+    func setMarmotChatGateForTesting(conversationId: String, _ gate: MarmotService.MarmotChatGate?) {
+        marmotChatGates[conversationId] = gate
+    }
+
+    /// Test seam: stands in for the relay wait plus core's `startDm` in
+    /// direct-chat setup, so a host test drives the store's real pending-chat
+    /// path. Errors are handled exactly like core's.
+    var directChatSetupOverrideForTesting: ((String) async throws -> String)?
+    #endif
+
+    /// Peers (canonical npub key) whose last new-chat setup core refused
+    /// because every install moved to Marmot v2. Cleared when a new attempt
+    /// starts, so it always describes the latest one.
+    private var newChatPeersOnNewerSonar: Set<String> = []
+
+    /// Whether the latest new-chat setup with `npub` failed because they
+    /// moved to Marmot v2 (core's `PeerUpdatedMarmot`), not for any other
+    /// reason.
+    func newChatRefusedBecausePeerUpdatedSonar(_ npub: String) -> Bool {
+        newChatPeersOnNewerSonar.contains(SNMarmotProfileCache.canonicalKey(npub))
+    }
+
+    /// Gate a conversation that has no Marmot group to read a gate from (a
+    /// pending chat, or a mesh chat whose internet fallback could not be set
+    /// up) whose peer moved to Marmot v2: its composer becomes the update
+    /// panel, as an existing chat's would.
+    func markPeerUpdatedSonar(conversationId: String, peerNpub: String) {
+        let hex = SNMentions.pubkeyHex(fromNpubOrHex: peerNpub) ?? peerNpub
+        marmotChatGates[conversationId] = .blocked(updatedMemberHexes: [hex])
+    }
+
+    /// Drop a gate `markPeerUpdatedSonar` installed (the pending chat resolved
+    /// to a real one, which reads its own gate).
+    func clearMarmotChatGate(conversationId: String) {
+        if marmotChatGates[conversationId] != nil {
+            marmotChatGates[conversationId] = nil
+        }
+    }
+
+    /// Conversations whose gate reads any of `changedGroupIds`.
+    private func marmotGateConversations(touching changedGroupIds: Set<String>) -> [String] {
+        marmotChatGateGroups.compactMap { conversationId, groups in
+            groups.contains(where: changedGroupIds.contains) ? conversationId : nil
+        }
+    }
+
     private func scheduleConversationRefresh(groupIds: [String]) {
+        // A contact's Marmot protocol (or anything else) changed in a chat
+        // whose gate we hold: re-read it. Local and cheap, a fast no-op while
+        // nobody is known to be on v2.
+        for conversationId in marmotGateConversations(touching: Set(groupIds)) {
+            Task { [weak self] in await self?.reloadMarmotChatGate(conversationId: conversationId) }
+        }
         pendingConversationRefreshGroups.formUnion(groupIds)
         guard conversationRefreshTask == nil else { return }
         conversationRefreshTask = Task { [weak self] in
@@ -4065,11 +4156,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     private func performDirectChatSetup(with npub: String, generation: UInt64) async -> String? {
+        newChatPeersOnNewerSonar.remove(npub)
         guard !Task.isCancelled,
               generation == sendGeneration,
               !sendsSuspendedForAccountMutation
         else { return nil }
-        guard await ensureRelayConnected() else {
+        guard await relayReadyForDirectChatSetup() else {
             self.errorText = "Not connected yet — try again in a moment."
             return nil
         }
@@ -4081,7 +4173,7 @@ final class MarmotChatModel: ObservableObject {
             return existing.id
         }
         do {
-            let groupId = try await service.startDirectMessage(with: npub, name: "")
+            let groupId = try await startDirectMessageForSetup(npub)
             guard !Task.isCancelled,
                   generation == sendGeneration,
                   !sendsSuspendedForAccountMutation
@@ -4092,9 +4184,30 @@ final class MarmotChatModel: ObservableObject {
             }
             return groupId
         } catch {
+            // Core refused: every install of this contact moved to Marmot v2.
+            // The store shows the update panel in the pending chat for it.
+            if Self.isPeerUpdatedSonar(error) {
+                newChatPeersOnNewerSonar.insert(npub)
+            }
             self.errorText = Self.describe(error)
             return nil
         }
+    }
+
+    private func relayReadyForDirectChatSetup() async -> Bool {
+        #if DEBUG
+        if directChatSetupOverrideForTesting != nil { return true }
+        #endif
+        return await ensureRelayConnected()
+    }
+
+    private func startDirectMessageForSetup(_ npub: String) async throws -> String {
+        #if DEBUG
+        if let override = directChatSetupOverrideForTesting {
+            return try await override(npub)
+        }
+        #endif
+        return try await service.startDirectMessage(with: npub, name: "")
     }
 
     func send(
@@ -4136,6 +4249,13 @@ final class MarmotChatModel: ObservableObject {
                 self.discardOptimistic(id: echo.id, from: groupId)
                 onFailure?()
                 self.errorText = Self.describe(error)
+                // Core refused: everyone else here moved to Marmot v2. Flip
+                // the composer now instead of waiting for the next refresh.
+                if Self.isPeerUpdatedSonar(error) {
+                    for conversationId in self.marmotGateConversations(touching: [groupId]) {
+                        await self.reloadMarmotChatGate(conversationId: conversationId)
+                    }
+                }
                 return
             }
             // The core conversation-change callback refreshes this one bounded
@@ -5647,7 +5767,18 @@ final class MarmotChatModel: ObservableObject {
     /// completed. (…error 0.)". `ServiceError` deliberately does NOT conform to
     /// `LocalizedError`: that would change the text at every existing `catch`
     /// in the app and put raw Rust strings from `.core` in front of users.
+    /// Core's refusal of a send nobody in the chat can read any more.
+    nonisolated static func isPeerUpdatedSonar(_ error: Error) -> Bool {
+        if case MarmotService.ServiceError.core(let detail) = error {
+            return detail.contains(MarmotService.peerUpdatedSonarMarker)
+        }
+        return false
+    }
+
     static func describe(_ error: Error) -> String {
+        if isPeerUpdatedSonar(error) {
+            return "They have updated Sonar. Update the app to keep chatting."
+        }
         switch error {
         case MarmotService.ServiceError.notConnected:
             return "Not connected yet — try again in a moment."
