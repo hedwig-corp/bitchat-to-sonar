@@ -6,6 +6,7 @@
 #
 #   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003] [--max-idle-cpu 3]
 #   (set QA_APP_NPUB to run a scenario that needs the app's npub with --only)
+#   SONAR_CLI_V2=<sonar-cli built from the MDK v0.14 branch> enables QA-216.
 #   QA_ALLOW_WIPE=1 also runs QA-118, which CLEARS the app's data: throwaway
 #   emulators only, never a device or an emulator holding an account you need.
 #   On API 34+ images turn stylus handwriting off first
@@ -932,6 +933,68 @@ qa187_log_ms() {
   grep -E "$2" <<<"$1" | awk "$pick"' { split($1, t, "."); print t[1] * 1000 + substr(t[2] "000", 1, 3) }'
 }
 
+qa216() { # a contact who moved to Marmot v2 (MDK v0.14): composer → "Update Sonar" (v1 check)
+  [[ -n "$APP_NPUB" ]] || { record QA-216 SKIP "needs the app npub (QA-001 or QA_APP_NPUB)"; return; }
+  [[ -x "${SONAR_CLI_V2:-}" ]] || {
+    record QA-216 SKIP "set SONAR_CLI_V2 to a sonar-cli built from the MDK v0.14 branch (#683)"; return; }
+  local peer="v2-$RUN" t0
+  "$PEERS" new "$peer" >/dev/null || { record QA-216 FAIL "peer init failed"; return; }
+  "$PEERS" send "$peer" "$APP_NPUB" "qa216 hello $RUN" >/dev/null
+  go_home || { record QA-216 FAIL "could not reach the chat list"; return; }
+  "$UI" wait "qa216 hello $RUN" 45 >/dev/null || { record QA-216 FAIL "the peer's chat never appeared"; return; }
+  # The peer updates: the v2 build republishes its KeyPackage into the same slot.
+  "$SONAR_CLI_V2" --home "$QA_HOME/peers/$peer" publish >/dev/null 2>&1 ||
+    { record QA-216 FAIL "v2 sonar-cli could not publish from the v1 home"; return; }
+  t0=$SECONDS
+  open_chat_row "qa216 hello $RUN" || { record QA-216 FAIL "could not open the chat"; return; }
+  if ! "$UI" wait "from this version of Sonar" 25 >/dev/null; then
+    # A background check may have cached "v1" just before the update: the
+    # open-chat recheck is due 2 minutes later.
+    ui key 4; sleep $(( 130 - (SECONDS - t0) > 0 ? 130 - (SECONDS - t0) : 0 ))
+    open_chat_row "qa216 hello $RUN" || { record QA-216 FAIL "could not reopen the chat"; return; }
+    "$UI" wait "from this version of Sonar" 30 >/dev/null ||
+      { record QA-216 FAIL "no update panel $((SECONDS - t0))s after the peer moved to v2"; return; }
+  fi
+  if hasx "Update Sonar" && ! hasx "Add to your message"; then
+    record QA-216 PASS "update panel replaced the composer $((SECONDS - t0))s after the peer moved to v2"
+  else
+    record QA-216 FAIL "update text shown but the composer controls are still there"
+  fi
+  ui key 4
+}
+
+qa219() { # a v1 message from a contact shown as "on a newer version" brings the composer back
+  [[ -n "$APP_NPUB" ]] || { record QA-219 SKIP "needs the app npub (QA-001 or QA_APP_NPUB)"; return; }
+  [[ -x "${SONAR_CLI_V2:-}" ]] || { record QA-219 SKIP "set SONAR_CLI_V2 (see QA-216)"; return; }
+  local peer="v1back-$RUN" twin t0
+  "$PEERS" new "$peer" >/dev/null || { record QA-219 FAIL "peer init failed"; return; }
+  "$PEERS" send "$peer" "$APP_NPUB" "qa219 hello $RUN" >/dev/null
+  go_home || { record QA-219 FAIL "could not reach the chat list"; return; }
+  "$UI" wait "qa219 hello $RUN" 45 >/dev/null || { record QA-219 FAIL "the peer's chat never appeared"; return; }
+  # A copy of the peer's home moves to v2 and takes over its KeyPackage slot,
+  # so the app sees a v2-only contact while the original v1 install still runs.
+  twin="$QA_HOME/peers/$peer-twin"; rm -rf "$twin"; cp -R "$QA_HOME/peers/$peer" "$twin"
+  "$SONAR_CLI_V2" --home "$twin" publish >/dev/null 2>&1 ||
+    { record QA-219 FAIL "the v2 copy could not publish"; return; }
+  open_chat_row "qa219 hello $RUN" || { record QA-219 FAIL "could not open the chat"; return; }
+  "$UI" wait "from this version of Sonar" 30 >/dev/null ||
+    { record QA-219 FAIL "no update panel after the v2 copy took the slot"; return; }
+  # The original v1 install writes: proof the contact still reads v1.
+  t0=$SECONDS
+  "$PEERS" send "$peer" "$APP_NPUB" "qa219 still on v1 $RUN" >/dev/null
+  "$UI" wait "qa219 still on v1 $RUN" 60 >/dev/null ||
+    { record QA-219 FAIL "the v1 message never reached the open chat"; return; }
+  # Before the fix the panel stayed until the open-chat recheck (2 min TTL).
+  local i
+  for i in $(seq 1 20); do hasx "Add to your message" && break; sleep 3; done
+  if hasx "Add to your message" && ! hasx "Update Sonar" && (( SECONDS - t0 <= 75 )); then
+    record QA-219 PASS "composer back $((SECONDS - t0))s after the contact's v1 message"
+  else
+    record QA-219 FAIL "composer not back $((SECONDS - t0))s after the contact's v1 message"
+  fi
+  ui key 4
+}
+
 qa187() { # cold launch on slow mobile data: first frame never waits for push's relay attach (#665)
   if [[ "$QA_SERIAL" != emulator-* ]]; then
     record QA-187 SKIP "needs an emulator: the link is shaped through its console"; return
@@ -1008,7 +1071,7 @@ sleep 3
 # so it runs after the UI scenarios and restores Wi-Fi before QA-050 measures
 # idle CPU. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa189 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa187 qa050 qa118; do
+for s in qa001 qa002 qa189 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa216 qa219 qa187 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

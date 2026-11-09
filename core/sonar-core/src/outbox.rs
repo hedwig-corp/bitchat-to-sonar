@@ -157,6 +157,13 @@ impl OutboxState {
         self.entries.get(message_id_hex).map(|entry| entry.state)
     }
 
+    /// The MLS group (hex) a recorded message belongs to.
+    pub fn group_for_message(&self, message_id_hex: &str) -> Option<String> {
+        self.entries
+            .get(message_id_hex)
+            .map(|entry| entry.group_id_hex.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn recorded_count(&self) -> usize {
         self.entries.len()

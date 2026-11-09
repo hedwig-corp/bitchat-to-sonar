@@ -14,6 +14,7 @@ pub mod handles;
 pub mod identity;
 pub mod invite_link;
 pub mod marmot;
+pub mod marmot_protocol;
 pub mod media_staging;
 pub mod mention;
 pub mod mesh;

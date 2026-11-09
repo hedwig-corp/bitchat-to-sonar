@@ -1829,6 +1829,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val hasAccount = isMeshRoute && state.hasWhiteNoiseAccount(peerId)
     // Transport the NEXT message will take (drives header + composer + send button).
     val sendOverMesh = isMeshRoute && inRange
+    // Marmot v1 → v2: every other member moved to a Sonar this build cannot
+    // write to. Bluetooth sends are unaffected, so a live mesh link keeps the
+    // composer (core refuses the Marmot send at the boundary either way).
+    val composerGate = state.composerGate(screen.id, sendOverMesh)
+    val updateUriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+    val openAppUpdate: () -> Unit = { runCatching { updateUriHandler.openUri(sonarAppUpdateUrl()) } }
     val transport = if (sendOverMesh) "Bluetooth" else "internet"
     val attachmentLimit = if (sendOverMesh) {
         MAX_MESH_ATTACHMENT_BYTES
@@ -1975,6 +1981,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // composer, "Loading stickers…" frozen in the crushed remainder, IME
         // still visible. One Column root keeps tray + composer vertically stacked
         // in both the legacy Column shell and the Phase-2 Box host.
+        MarmotComposerSlot(composerGate, peerName, onUpdate = openAppUpdate) {
         Column(Modifier.fillMaxWidth()) {
             val pendingReply = state.composerReply(screen.id)
             // Choosing Reply puts the cursor in the composer (Signal behaviour;
@@ -2184,6 +2191,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 }
             }
         } // Column — single root for Phase-2 Box host
+        } // MarmotComposerSlot
     }
 
     Box(
@@ -2279,6 +2287,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     bold = "Out of range", rest = " — messages will wait until you meet again"
                 )
             }
+        } else if (composerGate is SonarComposerGate.PartlyUpdated) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Globe, tone = chat.bitchat.sonar.ui.SNBannerTone.Net,
+                bold = marmotPartlyUpdatedBold(composerGate.updatedCount),
+                rest = MARMOT_PARTLY_UPDATED_REST,
+                actionLabel = "Update", onAction = openAppUpdate,
+            )
         } else if (verified) {
             chat.bitchat.sonar.ui.SNBanner(
                 icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
