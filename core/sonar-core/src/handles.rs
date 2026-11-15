@@ -97,7 +97,13 @@ pub(crate) fn store_claimed_address(path: &Path, address: Option<&str>) -> Resul
 /// Remove the sidecar (account wipe). Missing file is fine.
 pub(crate) fn wipe_handle_state_for_db(db_path: &Path) -> Result<()> {
     let path = handle_state_path_for_db(db_path);
-    match fs::remove_file(&path) {
+    let tmp = path.with_extension("json.tmp");
+    wipe_optional_handle_file(&path)?;
+    wipe_optional_handle_file(&tmp)
+}
+
+fn wipe_optional_handle_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::InvalidInput(format!(
@@ -137,7 +143,9 @@ pub fn is_valid_local_part(s: &str) -> bool {
     if !alnum(bytes[0]) || !alnum(bytes[bytes.len() - 1]) {
         return false;
     }
-    if s.split('.').any(|label| label.is_empty() || label.len() > 63) {
+    if s.split('.')
+        .any(|label| label.is_empty() || label.len() > 63)
+    {
         return false;
     }
     bytes
@@ -203,8 +211,14 @@ fn is_valid_domain(s: &str) -> bool {
     // Include `localhost` as a suffix so `foo.localhost` (loopback on most
     // resolvers) is rejected — bare `localhost` alone already fails the
     // "must contain a dot" check above.
-    const INTERNAL_SUFFIXES: [&str; 6] =
-        ["local", "internal", "localdomain", "home.arpa", "lan", "localhost"];
+    const INTERNAL_SUFFIXES: [&str; 6] = [
+        "local",
+        "internal",
+        "localdomain",
+        "home.arpa",
+        "lan",
+        "localhost",
+    ];
     if labels.first().is_some_and(|l| *l == "localhost")
         || INTERNAL_SUFFIXES
             .iter()
@@ -258,7 +272,14 @@ pub fn looks_like_handle(input: &str) -> bool {
     let cleaned = input.trim().trim_start_matches('₿').trim().to_lowercase();
     if !cleaned.contains('@') {
         const NOT_HANDLES: [&str; 8] = [
-            "npub1", "nsec1", "note1", "nevent1", "nprofile1", "lno1", "lnbc", "lnurl",
+            "npub1",
+            "nsec1",
+            "note1",
+            "nevent1",
+            "nprofile1",
+            "lno1",
+            "lnbc",
+            "lnurl",
         ];
         if NOT_HANDLES.iter().any(|p| cleaned.starts_with(p)) {
             return false;
@@ -553,7 +574,13 @@ mod tests {
         );
         store_claimed_address(&path, None).unwrap();
         assert!(load_claimed_address(&path).is_none());
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, b"leftover").unwrap();
         wipe_handle_state_for_db(&db).unwrap();
+        assert!(
+            !tmp.exists(),
+            "a crashed handle-state rename must not survive a wipe"
+        );
         wipe_handle_state_for_db(&db).unwrap(); // idempotent
     }
 

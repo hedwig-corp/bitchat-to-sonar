@@ -9,7 +9,8 @@
 #   android-ui.sh dump               "x,y  C|E|E!  text  desc" for every labelled node and
 #                                    every edit field (E); E! = uiautomator flags the field
 #                                    NAF (no spoken label) — an accessibility finding
-#   android-ui.sh find <substr>      first node whose text/desc CONTAINS substr → "x y"
+#   android-ui.sh find <substr>      smallest node whose text/desc CONTAINS substr → "x y"
+#                                    (innermost: a chat row's label repeats its bubble text)
 #   android-ui.sh findx <exact>      first node whose text/desc EQUALS exact   → "x y"
 #   android-ui.sh tapt <substr>      tap first CONTAINS match
 #   android-ui.sh tapx <exact> [n]   tap the n-th EXACT match (default 1, -1 = last);
@@ -24,7 +25,7 @@
 #   android-ui.sh longpress <x> <y>
 #   android-ui.sh ime                prints "shown" / "hidden" (soft keyboard)
 #   android-ui.sh bounds <exact>     "x1 y1 x2 y2" of first EXACT match
-#   android-ui.sh boundst <substr>   "x1 y1 x2 y2" of first CONTAINS match (bubble text
+#   android-ui.sh boundst <substr>   "x1 y1 x2 y2" of the smallest CONTAINS match (bubble text
 #                                    ends in inline-content glyphs, so EXACT misses it)
 #
 # Coordinates are device pixels, straight from `dump` — never read them off a
@@ -65,6 +66,7 @@ _query() { # mode(dump|find|findx|bounds|boundst) [needle] [nth]
 import html, re, sys
 xml, mode, needle, nth = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 hits = []
+contains = []
 data = open(xml, encoding="utf-8", errors="replace").read()
 node = re.compile(r'<node [^>]*?text="([^"]*)"[^>]*?class="([^"]*)"[^>]*?content-desc="([^"]*)"[^>]*?'
                   r'clickable="(\w+)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
@@ -80,12 +82,16 @@ for m in node.finditer(data):
             print(f"{cx},{cy}\t{tag}\t{t[:70]}\t{d[:50]}")
     elif mode == "edit" and edit:
         hits.append(f"{cx} {cy}")
-    elif mode == "find" and (needle.lower() in t.lower() or needle.lower() in d.lower()):
-        print(cx, cy); break
-    elif mode == "boundst" and (needle.lower() in t.lower() or needle.lower() in d.lower()):
-        print(x1, y1, x2, y2); break
+    elif mode in ("find", "boundst") and (needle.lower() in t.lower() or needle.lower() in d.lower()):
+        # The innermost match: a transcript row's label repeats its bubble's
+        # text (QA-043), and a tap must land on the text, not the row's edge.
+        area = (int(x2) - int(x1)) * (int(y2) - int(y1))
+        contains.append((area, f"{cx} {cy}" if mode == "find" else f"{x1} {y1} {x2} {y2}"))
     elif mode in ("findx", "bounds") and (t == needle or d == needle):
         hits.append(f"{cx} {cy}" if mode == "findx" else f"{x1} {y1} {x2} {y2}")
+if contains:
+    # Smallest first; a zero-area (fully clipped) node only when nothing else matched.
+    print(min(contains, key=lambda c: (c[0] == 0, c[0]))[1])
 if mode == "naf":
     for n in re.finditer(r'<node [^>]*>', data):
         tag = n.group(0)

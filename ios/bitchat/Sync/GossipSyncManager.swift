@@ -225,7 +225,7 @@ final class GossipSyncManager {
             type: MessageType.requestSync.rawValue,
             senderID: Data(hexString: myPeerID.id) ?? Data(),
             recipientID: nil, // broadcast
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            timestamp: PacketSendClock.shared.next(),
             payload: payload,
             signature: nil,
             ttl: 0 // local-only
@@ -250,7 +250,7 @@ final class GossipSyncManager {
             type: MessageType.requestSync.rawValue,
             senderID: Data(hexString: myPeerID.id) ?? Data(),
             recipientID: recipient,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            timestamp: PacketSendClock.shared.next(),
             payload: payload,
             signature: nil,
             ttl: 0 // local-only

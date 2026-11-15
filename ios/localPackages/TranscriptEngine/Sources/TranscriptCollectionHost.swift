@@ -77,6 +77,8 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     let callbacks: TranscriptCollectionHostCallbacks
     var unreadCountAtOpen: UInt64?
     var expectedNewestDate: Date?
+    /// Hidden fold-family / bak remainder may still hold unread incoming rows.
+    var familyHasOlder: Bool = false
     /// When set, open-action Jump wins over unread/live-edge (search / deep link).
     var jumpMessageId: String?
     var loadOlder: (() async -> Bool)?
@@ -87,8 +89,9 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     /// Runs on the UIKit update path before `apply` — use for app render-context
     /// sync so SwiftUI `body` stays side-effect free.
     var prepareForUpdate: (() -> Void)?
-    /// Invoked once after a Jump open-action is applied (hit or soft-fail) so
-    /// the app can clear its one-shot jump target (#372).
+    /// Invoked after a Jump open-action hits the painted entries so the app
+    /// can clear its one-shot jump target (#372). Soft-fail must not settle:
+    /// 0.8 remainder / family reveal can still admit the parent.
     var onJumpSettled: (() -> Void)?
     /// O(1) app-owned content revision. While it (and the open-action inputs)
     /// are unchanged, apply skips the O(n) snapshot rebuild — composer
@@ -100,6 +103,10 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     /// the hosted SwiftUI value on every such tick schedules needless intrinsic
     /// sizing/layout beside the active keyboard.
     var composerVersion: UInt64?
+    /// Bumped by the app on each send from its composer. The reader's own
+    /// message is scrolled into view even when they were in older history;
+    /// incoming appends there still leave the view alone. Nil = never.
+    var ownSendRevision: UInt64?
     @ViewBuilder var composer: () -> Composer
 
     public init(
@@ -108,6 +115,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         callbacks: TranscriptCollectionHostCallbacks,
         unreadCountAtOpen: UInt64? = nil,
         expectedNewestDate: Date? = nil,
+        familyHasOlder: Bool = false,
         jumpMessageId: String? = nil,
         loadOlder: (() async -> Bool)? = nil,
         loadNewest: (() async -> Void)? = nil,
@@ -116,6 +124,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         onJumpSettled: (() -> Void)? = nil,
         contentVersion: UInt64? = nil,
         composerVersion: UInt64? = nil,
+        ownSendRevision: UInt64? = nil,
         @ViewBuilder composer: @escaping () -> Composer
     ) {
         self.entries = entries
@@ -123,6 +132,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.callbacks = callbacks
         self.unreadCountAtOpen = unreadCountAtOpen
         self.expectedNewestDate = expectedNewestDate
+        self.familyHasOlder = familyHasOlder
         self.jumpMessageId = jumpMessageId
         self.loadOlder = loadOlder
         self.loadNewest = loadNewest
@@ -131,6 +141,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.onJumpSettled = onJumpSettled
         self.contentVersion = contentVersion
         self.composerVersion = composerVersion
+        self.ownSendRevision = ownSendRevision
         self.composer = composer
     }
 
@@ -150,8 +161,10 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             entries: entries,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             contentVersion: contentVersion,
+            ownSendRevision: ownSendRevision,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             callbacks: callbacks,
@@ -172,8 +185,10 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             entries: entries,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             contentVersion: contentVersion,
+            ownSendRevision: ownSendRevision,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             callbacks: callbacks,
@@ -248,6 +263,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var loadNewest: (() async -> Void)?
     private var unreadCountAtOpen: UInt64?
     private var expectedNewestDate: Date?
+    private var familyHasOlder = false
     private var jumpMessageId: String?
     var onJumpSettled: (() -> Void)?
 
@@ -268,6 +284,8 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var contentSizeObservation: NSKeyValueObservation?
     private var lastContentHeight: CGFloat = 0
     private var lastAppliedContentVersion: UInt64?
+    /// Last `ownSendRevision` seen; a change is the reader's own send.
+    private var lastOwnSendRevision: UInt64?
     private var lastAppliedComposerVersion: UInt64?
 
     private let heightCache = TranscriptRowHeightCache()
@@ -459,8 +477,10 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         entries: [TranscriptHostEntry],
         unreadCountAtOpen: UInt64?,
         expectedNewestDate: Date?,
+        familyHasOlder: Bool = false,
         jumpMessageId: String? = nil,
         contentVersion: UInt64? = nil,
+        ownSendRevision: UInt64? = nil,
         loadOlder: (() async -> Bool)?,
         loadNewest: (() async -> Void)?,
         callbacks: TranscriptCollectionHostCallbacks? = nil,
@@ -482,6 +502,15 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             self.transcriptBackgroundColor = transcriptBackgroundColor
             if isViewLoaded { applyTranscriptBackground() }
         }
+        // Before the unchanged-apply skip: a send can reach here in an update
+        // whose rows did not change yet (the echo lands in the next one).
+        if let ownSendRevision {
+            if let last = lastOwnSendRevision, last != ownSendRevision, didInitialScroll {
+                let action = latch.ownSendRequested(at: ProcessInfo.processInfo.systemUptime)
+                followTail(action, animateAppends: true)
+            }
+            lastOwnSendRevision = ownSendRevision
+        }
         if TranscriptScrollPolicy.shouldSkipUnchangedApply(
             contentVersion: contentVersion,
             lastContentVersion: lastAppliedContentVersion,
@@ -490,7 +519,9 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             jumpMessageId: jumpMessageId,
             lastJumpMessageId: self.jumpMessageId,
             expectedNewestDate: expectedNewestDate,
-            lastExpectedNewestDate: self.expectedNewestDate
+            lastExpectedNewestDate: self.expectedNewestDate,
+            familyHasOlder: familyHasOlder,
+            lastFamilyHasOlder: self.familyHasOlder
         ) {
             // SwiftUI rebuilds closures every turn; keep them fresh and keep
             // the live-edge open pump alive, but skip the O(n) snapshot
@@ -508,9 +539,11 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         )
         let previousUnread = self.unreadCountAtOpen
         let previousJump = self.jumpMessageId
+        let previousEntries = self.entries
         self.entries = entries
         self.unreadCountAtOpen = unreadCountAtOpen
         self.expectedNewestDate = expectedNewestDate
+        self.familyHasOlder = familyHasOlder
         self.jumpMessageId = jumpMessageId
         self.loadOlder = loadOlder
         self.loadNewest = loadNewest
@@ -526,6 +559,10 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             didInitialScroll = true
         } else if previousJump != jumpMessageId, jumpMessageId != nil {
             applyOpenAction(transcriptOpenAction)
+        } else if let jump = jumpMessageId,
+                  entries.contains(where: { $0.id == jump }),
+                  !previousEntries.contains(where: { $0.id == jump }) {
+            applyOpenAction(.jump(id: jump))
         } else if !hadAnchor, unreadAnchorId != nil {
             applyOpenAction(.unreadDivider)
         } else if previousUnread != unreadCountAtOpen {
@@ -744,9 +781,19 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
            newest < expected {
             return
         }
+        let feedNewest = entries.compactMap(\.date).max()
         if let resolver = callbacks.unreadAnchorResolver {
             unreadAnchorId = resolver(entries, unreadCountAtOpen)
-            if unreadAnchorId == nil { unreadAnchorAbandoned = true }
+            if unreadAnchorId == nil {
+                guard TranscriptScrollPolicy.shouldRetireOpenUnread(
+                    unreadAtOpen: unreadCountAtOpen,
+                    anchorFound: false,
+                    feedNewest: feedNewest,
+                    expectedNewest: expectedNewestDate,
+                    familyHasOlder: familyHasOlder
+                ) else { return }
+                unreadAnchorAbandoned = true
+            }
             return
         }
         // Generic default: Nth-from-end entry id. Apps that filter mine/calls
@@ -755,7 +802,13 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         let offset = max(0, entries.count - Int(unreadCountAtOpen))
         if offset < entries.count {
             unreadAnchorId = entries[offset].id
-        } else {
+        } else if TranscriptScrollPolicy.shouldRetireOpenUnread(
+            unreadAtOpen: unreadCountAtOpen,
+            anchorFound: false,
+            feedNewest: feedNewest,
+            expectedNewest: expectedNewestDate,
+            familyHasOlder: familyHasOlder
+        ) {
             unreadAnchorAbandoned = true
         }
     }
@@ -791,8 +844,13 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                 guard let self else { return }
                 if let indexPath = self.dataSource?.indexPath(for: .message(id)) {
                     self.collectionView.scrollToItem(at: indexPath, at: .top, animated: false)
+                    if TranscriptScrollPolicy.shouldSettleJump(parentVisible: true) {
+                        self.onJumpSettled?()
+                    }
                 } else {
                     // Soft-fail: id not in the newest local page — unread/live-edge.
+                    // Keep the jump; remainder / family reveal / load-older
+                    // can still admit the parent.
                     let fallback = TranscriptScrollPolicy.openAction(
                         unreadAnchorId: self.unreadAnchorId,
                         unreadCountAtOpen: self.unreadCountAtOpen,
@@ -800,8 +858,22 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                         jumpId: nil
                     )
                     self.applyOpenAction(fallback)
+                    if let loadOlder, !self.isLoadingOlder {
+                        self.isLoadingOlder = true
+                        Task { @MainActor in
+                            defer { self.isLoadingOlder = false }
+                            while let jump = self.jumpMessageId,
+                                  self.dataSource?.indexPath(for: .message(jump)) == nil {
+                                let added = await loadOlder()
+                                if !added { break }
+                            }
+                            if let jump = self.jumpMessageId,
+                               self.dataSource?.indexPath(for: .message(jump)) != nil {
+                                self.applyOpenAction(.jump(id: jump))
+                            }
+                        }
+                    }
                 }
-                self.onJumpSettled?()
             }
         }
     }
@@ -840,7 +912,8 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             tailID: entries.last?.id,
             isNearBottom: near,
             userScrolling: isUserScrolling,
-            isPrepending: isLoadingOlder
+            isPrepending: isLoadingOlder,
+            now: ProcessInfo.processInfo.systemUptime
         )
         followTail(action, animateAppends: feedCaughtUp)
     }

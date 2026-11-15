@@ -57,5 +57,15 @@ class MediaDownloadTest {
         // Downloading / Failed: recover into Available so the UI drops overlays.
         assertTrue(shouldPublishDiskHit(MediaTransferPhase.Downloading))
         assertTrue(shouldPublishDiskHit(MediaTransferPhase.Failed))
+        assertFalse(shouldPublishDiskHit(MediaTransferPhase.Unavailable))
+    }
+
+    @Test
+    fun unavailableStateCarriesTheHostCopyAndNoLocalFile() {
+        val state = MediaTransferState.unavailable(RECOVERED_LEGACY_MEDIA_COPY)
+
+        assertEquals(MediaTransferPhase.Unavailable, state.phase)
+        assertEquals(RECOVERED_LEGACY_MEDIA_COPY, state.userMessage)
+        assertEquals(null, state.localPath)
     }
 }

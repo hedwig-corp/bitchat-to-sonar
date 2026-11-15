@@ -74,7 +74,11 @@ async fn short_lived_send_waits_for_relay_ack_before_process_exit() {
     bob.sync().await.expect("bob syncs after sender exits");
     let groups = bob.groups().expect("bob groups");
     assert_eq!(groups.len(), 1);
-    let messages = bob.messages(&groups[0].mls_group_id).expect("bob messages");
-    assert_eq!(messages.len(), 1);
+    let messages = bob.messages(&groups[0].id).expect("bob messages");
+    assert_eq!(
+        messages.len(),
+        1,
+        "kind-445 backfill must use the 32-byte nostr #h, not the MLS group id"
+    );
     assert_eq!(messages[0].content, "survives process exit");
 }

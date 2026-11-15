@@ -92,6 +92,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var loadNewest: (() async -> Void)? = nil
     var unreadCountAtOpen: UInt64? = nil
     var expectedNewestDate: Date? = nil
+    var familyHasOlder: Bool = false
     /// Search / deep-link jump; see #372 for Sonar search wiring.
     var jumpMessageId: String? = nil
     /// Cleared by the host after Jump applies (or soft-fails).
@@ -100,6 +101,9 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     /// mention roster fingerprint, reply, transport, peer title). Unrelated
     /// store updates then leave the active keyboard hierarchy untouched.
     var composerVersion: UInt64? = nil
+    /// Bumped by the screen on each send from its composer: the reader's own
+    /// message is scrolled into view even from older history (Signal).
+    var ownSendRevision: UInt64? = nil
     @ViewBuilder var composer: () -> Composer
 
     /// Compatibility: kill-switch / Mac SwiftUI host still takes a bare array.
@@ -131,9 +135,11 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             onJumpSettled: onJumpSettled,
             composerVersion: composerVersion,
+            ownSendRevision: ownSendRevision,
             composer: composer
         )
         .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -158,11 +164,12 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            familyHasOlder: familyHasOlder,
+            jumpMessageId: jumpMessageId,
+            onJumpSettled: onJumpSettled,
+            ownSendRevision: ownSendRevision,
             composer: composer
         )
-        // AppKit list has no Jump scroll yet — settle so the one-shot target
-        // does not stick across later opens (#372 Mac gap).
-        .onAppear { if jumpMessageId != nil { onJumpSettled?() } }
         #endif
     }
 }
@@ -170,8 +177,9 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
 // MARK: - macOS / shared SwiftUI ownership host
 
 /// Full-height scroll + overlay composer; bottom content pad = measured chrome.
-/// Short feeds stay top-aligned. The Mac list engine stays SNMsgList (AppKit
-/// collection parity is a tracked gap — docs/SIGNAL-TRANSCRIPT-PATTERNS.md).
+/// Short feeds stay top-aligned. The Mac list engine stays SNMsgList; Jump
+/// is wired through `jumpMessageId` (collection-host AppKit parity is still
+/// a tracked gap — docs/SIGNAL-TRANSCRIPT-PATTERNS.md).
 private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
     let msgs: [SNMessage]
     let showAuthors: Bool
@@ -192,6 +200,10 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
     var loadNewest: (() async -> Void)?
     var unreadCountAtOpen: UInt64?
     var expectedNewestDate: Date?
+    var familyHasOlder: Bool = false
+    var jumpMessageId: String? = nil
+    var onJumpSettled: (() -> Void)? = nil
+    var ownSendRevision: UInt64? = nil
     @ViewBuilder var composer: () -> Composer
 
     @State private var chromeHeight: CGFloat = 56
@@ -217,7 +229,11 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
                 loadOlder: loadOlder,
                 loadNewest: loadNewest,
                 unreadCountAtOpen: unreadCountAtOpen,
-                expectedNewestDate: expectedNewestDate
+                expectedNewestDate: expectedNewestDate,
+                familyHasOlder: familyHasOlder,
+                jumpMessageId: jumpMessageId,
+                onJumpSettled: onJumpSettled,
+                ownSendRevision: ownSendRevision
             )
             .padding(.bottom, chromeHeight)
 

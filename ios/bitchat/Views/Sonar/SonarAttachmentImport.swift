@@ -166,10 +166,14 @@ func snReadAttachments(_ urls: [URL], maxTotalBytes: Int) -> SNAttachmentImportR
 }
 
 /// Route setup can replace a pending conversation while its first attachment
-/// is still importing. Preserve only that import across the replacement.
+/// is still importing. Fold remount reuses the same replacement
+/// (`pending=hist`, `real=live`). Preserve the import on either sibling
+/// so a Mac hop / live-pane remake does not cancel mid-import.
 func snPreservesAttachmentImport(
     conversationID: String,
     routeReplacement: SNMarmotRouteReplacement?
 ) -> Bool {
-    routeReplacement?.pendingId == conversationID
+    guard let replacement = routeReplacement else { return false }
+    return snOpenedConversationIdMatches(conversationID, replacement.pendingId)
+        || snOpenedConversationIdMatches(conversationID, replacement.realId)
 }

@@ -31,8 +31,10 @@ struct MarmotProfileMissThrottleTests {
         return (model, { defaults.removePersistentDomain(forName: suiteName) })
     }
 
+    /// FFI `GroupInfo.is_direct` marks a 1:1; the in-memory default is
+    /// not-direct so a recovered room never takes the 1:1 title path (R-050).
     private func directGroup() -> MarmotService.MarmotGroup {
-        MarmotService.MarmotGroup(id: "ab12", name: "", memberNpubs: [Self.peer])
+        MarmotService.MarmotGroup(id: "ab12", name: "", memberNpubs: [Self.peer], isDirect: true)
     }
 
     private func waitForMiss(_ model: MarmotChatModel, key: String) async throws {

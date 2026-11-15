@@ -37,7 +37,7 @@ impl ReplyTo {
 }
 
 /// Projected reply pointer on a `ChatMessage`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplyRef {
     pub parent_id: EventId,
     pub parent_pubkey: Option<PublicKey>,
@@ -54,7 +54,11 @@ pub fn quote_tag(parent_id: &EventId, parent_pubkey: &PublicKey) -> Tag {
 }
 
 /// `nostr:nevent1…\n<body>` — author is included so White Noise can strip it.
-pub fn prefix_content(user_text: &str, parent_id: &EventId, parent_pubkey: &PublicKey) -> Result<String> {
+pub fn prefix_content(
+    user_text: &str,
+    parent_id: &EventId,
+    parent_pubkey: &PublicKey,
+) -> Result<String> {
     let uri = Nip19Event::new(*parent_id)
         .author(*parent_pubkey)
         .to_nostr_uri()
@@ -136,7 +140,10 @@ pub fn truncate_preview(text: &str) -> String {
     if trimmed.chars().count() <= REPLY_PREVIEW_MAX_CHARS {
         return trimmed.to_string();
     }
-    let mut out = trimmed.chars().take(REPLY_PREVIEW_MAX_CHARS).collect::<String>();
+    let mut out = trimmed
+        .chars()
+        .take(REPLY_PREVIEW_MAX_CHARS)
+        .collect::<String>();
     out.push('…');
     out
 }
@@ -169,11 +176,7 @@ pub fn parent_content_for_preview<'a>(
 /// Fill a missing quote snapshot from a locally stored parent body.
 /// NIP-C7 does not carry preview text; Signal-style chips denormalize it here.
 pub fn hydrate_reply_preview(reply: &mut ReplyRef, parent_content: Option<&str>) {
-    if reply
-        .preview
-        .as_ref()
-        .is_some_and(|p| !p.trim().is_empty())
-    {
+    if reply.preview.as_ref().is_some_and(|p| !p.trim().is_empty()) {
         return;
     }
     let Some(parent) = parent_content.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -241,7 +244,10 @@ mod tests {
         let body = "⚡PAY|1|abc-123|21";
         let wire = prefix_content(body, &id, &pk).unwrap();
         assert!(
-            matches!(MessageClassification::of(&wire), MessageClassification::Text),
+            matches!(
+                MessageClassification::of(&wire),
+                MessageClassification::Text
+            ),
             "classifying the wire body would hide the payment"
         );
         let tag = quote_tag(&id, &pk);
@@ -306,16 +312,16 @@ mod tests {
             None
         );
         assert_eq!(
-            parent_content_for_preview(
-                &MessageClassification::Text,
-                false,
-                false,
-                "⚡PAY|1|p|1"
-            ),
+            parent_content_for_preview(&MessageClassification::Text, false, false, "⚡PAY|1|p|1"),
             None
         );
         assert_eq!(
-            parent_content_for_preview(&MessageClassification::CallControl, false, false, "☎CALL|1"),
+            parent_content_for_preview(
+                &MessageClassification::CallControl,
+                false,
+                false,
+                "☎CALL|1"
+            ),
             None
         );
         assert_eq!(

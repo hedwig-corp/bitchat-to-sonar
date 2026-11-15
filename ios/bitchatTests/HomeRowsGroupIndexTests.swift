@@ -22,7 +22,7 @@ struct HomeRowsGroupIndexTests {
     private static let me = "npub1ownaccount"
 
     private static func group(_ id: String, _ peer: String) -> MarmotService.MarmotGroup {
-        MarmotService.MarmotGroup(id: id, name: "", memberNpubs: [me, peer])
+        MarmotService.MarmotGroup(id: id, name: "", memberNpubs: [me, peer], isDirect: true)
     }
 
     /// Fails without the fix: each of the 160 rows derived all 160 groups'

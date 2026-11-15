@@ -23,9 +23,9 @@ struct SonarConversationRegressionSmokeTests {
         let sara = npub(2)
         let vincenzo = npub(3)
         let groups = [
-            MarmotService.MarmotGroup(id: "sara-old", name: "", memberNpubs: [own, sara]),
-            MarmotService.MarmotGroup(id: "vincenzo", name: "", memberNpubs: [own, vincenzo]),
-            MarmotService.MarmotGroup(id: "sara-new", name: "", memberNpubs: [own, sara]),
+            MarmotService.MarmotGroup(id: "sara-old", name: "", memberNpubs: [own, sara], isDirect: true),
+            MarmotService.MarmotGroup(id: "vincenzo", name: "", memberNpubs: [own, vincenzo], isDirect: true),
+            MarmotService.MarmotGroup(id: "sara-new", name: "", memberNpubs: [own, sara], isDirect: true),
         ]
 
         let grouped = snCanonicalDirectMarmotGroups(groups, ownNpub: own)
@@ -126,6 +126,27 @@ struct SonarConversationRegressionSmokeTests {
         )
 
         #expect(snMarmotHomeRowMessage(loaded: loaded, summary: summary)?.id == loaded.id)
+    }
+
+    @Test
+    func copySummaryZeroCountStillPaintsHomeRowFromLatestAt() {
+        let summary = MarmotService.ConversationSummary(
+            groupIdHex: "group-09",
+            name: "",
+            latestContent: "recovered latest",
+            latestSenderNpub: npub(2),
+            latestAt: Date(timeIntervalSince1970: 1_700_000_000),
+            latestMine: false,
+            messageCount: 0,
+            unreadCount: 0
+        )
+
+        let row = snMarmotHomeRowMessage(loaded: nil, summary: summary)
+
+        #expect(snMarmotHomeRowSummaryKnownNonEmpty(summary))
+        #expect(row?.content == "recovered latest")
+        #expect(row?.createdAt == summary.latestAt)
+        #expect(row?.id == "summary:group-09:0")
     }
 
     @Test

@@ -122,7 +122,7 @@ roughly halves it. The ranking is stable across all three.)
 
 **Guarded by:** `ConversationRegressionSmokeTest.duplicateSaraGroupsKeepOneNewestTranscript`
 
-**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`
+**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`, `ConversationFoldTest.recoveredChatWaitsForPeerUpdateUntilLiveSiblingExists`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`, `SonarConversationFoldTests.recoveredAndResumedDirectChatsPreferLiveSendTarget`, `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`, `e2e.rs::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `e2e.rs::recovered_08_group_adds_a_member_who_updates_later`, `e2e.rs::recovered_08_group_adds_late_member_on_sync_without_a_local_send`, `e2e.rs::recovered_08_outbound_only_chat_resumes_from_admin_pubkeys`, `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `mdk08_migrate.rs::copies_imeta_and_p_tags_from_stored_message_tags`, `marmot.rs::recovered_history_survives_fold_onto_new_group`, `marmot.rs::historical_fold_survives_account_backup_restore`, `conversation_index.rs::copy_summary_promotes_recovered_row_onto_live_id`, `persistence.rs::mdk08_account_backup_preserves_recovered_transcript`, `e2e.rs::persist_folds_lost_core_sidecar_second_dm_does_not_steal_hist`, `e2e.rs::persist_folds_lost_core_sidecar_send_on_hist_reuses_live`
 
 **Partly guarded:** the cited tests pin *chat-list* dedup and identity routing. The "one transcript" half is not pinned: if duplicate groups still collapse to one row but transcript loading stopped merging every duplicate group's messages, all of them stay green. See Unguarded.
 
@@ -2030,7 +2030,7 @@ schedule.
 
 1. *Every upload is a full snapshot.* `seal_account_backup_files` reads the
    whole SQLCipher DB **plus** the conversation index and PUTs the sealed blob
-   (cap 200 MiB). There is no delta format.
+   (cap 400 MiB). There is no delta format.
 2. *Nothing on the server can dedupe it.* `seal_account_backup` draws a fresh
    random nonce per run, so an unchanged account produces different ciphertext
    and a different sha256 every time. Blossom is content-addressed and still
@@ -2805,8 +2805,12 @@ the read row, clamped onto it (by design — that clamp is what a window shorter
 than the unread count needs), and the anchor froze by row id before the new
 rows arrived.
 
-**Compose call site:** `SonarAppState.openChat` Marmot reopen branch, now
-gated by `reopenTranscriptPaint(retained, openChatUnread[chat.id])`.
+**Compose call site:** `SonarAppState.openChat` Marmot early-paint branch,
+gated by `firstOpenPaintsBeforePage(retained, snapshot, openChatUnread[chat.id])`.
+#613 widened that branch from "reopen with a leave frame" to "any open with a
+leave frame OR a remounted 0.8 home snapshot"; the unread gate
+(`reopenTranscriptPaint`'s rule) covers both sources, and an unread open still
+seeds the fold family on the page path.
 
 **Apple call site:** not affected — `ConversationViewState.activate()`
 rebuilds the retained window synchronously from the store before the first
@@ -2815,6 +2819,8 @@ same session).
 
 **Guarded by:** `TranscriptDisplayPolicyTest.reopenWithUnreadDoesNotRepaintTheLeaveFrame`
 (fails when the gate is reverted to `retained?.takeIf { it.isNotEmpty() }`),
+`TranscriptDisplayPolicyTest.earlyOpenPaintRefusesAnUnreadOpen` (fails when
+`firstOpenPaintsBeforePage` drops the unread check),
 and `android-smoke.sh` QA-005 end to end.
 
 **Not guarded:** the unit test pins the helper, not the `openChat` call site —
@@ -3323,6 +3329,230 @@ transport moved into the protocol crate.
 with the wire value.* snow caps messages at 65 535 bytes while bitchat
 encrypts whole 1 MiB private files in one message, so the crate derives the
 split keys and owns the cipher state instead.
+
+## R-060 — A recovered 0.8 room must not become a DM
+
+**Invariant:** A recovered 0.8 conversation with `member_count > 2` resumes as a
+named group (`create_group`), never as `start_dm` / `start_dm_with_key_package`,
+and never folds onto an existing 1:1 with a known peer. Only one reachable
+member after extract is not enough to treat the room as a DM.
+
+**Breaks as:** A pending 3-person invite (or a room whose other members have
+not updated) collapses into a 1:1 with the welcomer. Later members cannot be
+invited; the room name disappears; sends land in the wrong chat.
+
+**Call sites:** Rust `client.rs::resolve_send_group`,
+`client.rs::maybe_fold_new_group`, `client.rs::group_is_direct`; Compose
+`directMarmotPeerKey` / `dedupeDirectMarmotChats`; iOS `snDirectMarmotPeerKey` /
+`snCanonicalDirectMarmotGroups`. FFI `GroupInfo.is_direct` is the host signal.
+
+**Guarded by:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`
+
+**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `persistence.rs::mdk08_named_room_with_one_known_peer_is_not_direct`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `mdk08_migrate.rs::named_joined_room_description_is_copied`, `mdk08_migrate.rs::processed_welcome_member_count_survives_extract`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `ConversationFoldTest.emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm`, `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`, `ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `ConversationFoldTest.startupSnapshotRewriteDoesNotStampInventedIsDirect`, `ConversationFoldTest.modernSnapshotDoesNotNeedStartupRewrite`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm`, `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`, `MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `e2e.rs::persist_folds_lost_core_sidecar_refolds_empty_desc_room_from_index`, `e2e.rs::persist_folds_lost_core_sidecar_refolds_mixed_resume_on_ensure_subscriptions`, `e2e.rs::persist_folds_lost_core_sidecar_messages_page_restores_index_bind`, `e2e.rs::persist_folds_lost_core_sidecar_summaries_hide_hist_from_index`, `e2e.rs::persist_folds_lost_core_sidecar_groups_and_aliases_restore_index_bind`, `client.rs::incoming_09_named_pair_welcome_does_not_fold_three_member_room`, `e2e.rs::persist_folds_empty_topic_room_live_is_not_direct`
+
+**Not guarded:** a real 0.8 device upgrade with a pending White Noise room. Host chat-list rendering still needs a constructible store (the helper pins are the R-001 shape).
+
+**History:** #613. `historical_resume_is_direct` landed first; resume still used
+`start_dm_with_key_package`, then `maybe_fold_new_group` absorbed the room into
+a new 1:1 with the same known peer. Hosts then folded any two-member FFI row
+by npub, so a pending room with only the welcomer listed still vanished into
+the 1:1. Core, FFI `is_direct`, and both hosts had to agree. FFI `groups()`
+also had to omit a folded historical room — `conversation_summaries()` already
+hid it, but hosts paint `chats()` / `groups()`, so a resumed room split into
+two home-list rows. Joined rooms were
+a second hole: the 0.8 `groups` table has no `member_count`, so a named room
+where only one peer ever sent fell back to `peers+1 <= 2` and resumed as a DM.
+Extract now copies `groups.description` and processed-welcome counts, and
+`historical_resume_is_direct` matches live `group_is_direct` (DM description
+or empty name+description). Host in-memory constructors (`SonarChat.isDirect`,
+`MarmotGroup.init`) default false to match snapshot decode, so an omitted
+flag cannot fold an empty-topic remounted room onto the welcomer 1:1.
+
+**Rejected:**
+- *Pinning only `historical_resume_is_direct` / `groups().len() == 2`.*
+  `start_dm_with_key_package` always mints a new DM and never reuses the
+  existing 1:1, so those asserts stay green on the old path.
+- *Auto-folding any recovered chat whose known peer set matches a new live
+  group.* Correct for recovered DMs (R-003); wrong for rooms where only the
+  welcomer is known yet.
+- *Using `members.count > 2` on hosts for notifications or contact-profile
+  1:1 resolution.* A pending room lists only the welcomer after extract, so
+  count-based checks still treat it as a DM. `is_direct` is the signal.
+- *Re-folding a unique subset + name when the live description is empty,
+  or treating “local user is founder/admin” as enough.* Incoming
+  `create_group("standup")` has an empty description, and a later local
+  2-person create of the same name still makes the user founder. Either
+  signal absorbs a recovered 3-person standup (the
+  `incoming_09_named_pair_welcome_does_not_fold_three_member_room` pin).
+  Empty-desc lost-sidecar heals restore only binds already recorded in
+  the conversation index at mint time.
+
+## R-061 — A recovered 0.8 pending send must not paint delivered
+
+**Invariant:** After a 0.8 → 0.9 upgrade (MDK v0.10.4 today), a still-pending outbound row
+stays on disk, paints Failed (not Sent, not eternal Sending), and a user
+tap on retry refuses to republish the 0.8 wrapper.
+
+**Breaks as:** The transcript shows Sent while the peer never decrypts the
+message; or shows Sending forever with no retry; or a tap publishes 0.8
+ciphertext that a 0.9 / White Noise peer cannot read and a relay ACK
+flips the row Sent.
+
+**Call sites:** Rust `client.rs::retry_outbox`, `client.rs::retry_message`,
+`outbox.rs::retryable_events`; Compose `SonarAppState.retryMessage` /
+`sonarCanRetryMessage` (Failed → retry button); iOS
+`MarmotChatModel.retryMessage` / `snCanRetryFailedMessage`. Hosts paint
+`delivery_state` from core and only offer retry on Failed.
+
+**Guarded by:** `e2e.rs::recovered_08_pending_outbox_survives_upgrade_connect`
+
+**Also guarded by:** `outbox.rs::retryable_events_keeps_unpublishable_active_rows_and_marks_failed`
+
+**Not guarded:** host toast copy; re-encrypt-in-place onto a new 0.9 group
+(would mint a second transcript row). iOS tests do not run in CI.
+
+**History:** #613. `retry_outbox` first kept recovered 0.8 group ids so
+upgrade connect would not purge the row and paint Sent. Leaving it
+Pending then painted eternal Sending, and `retry_message` still
+republished the dead wrapper.
+
+**Rejected:**
+- *Deleting the outbox row so the mine message paints Sent.* The 0.9 peer
+  never received it.
+- *Re-sending via `resolve_send_group` + `send_text` from `retry_message`.*
+  That API is documented never to create a second local transcript row.
+- *Including fold aliases of a live group in the publishable set.* After
+  resume the hist id is an alias of live; its stored wrapper is still 0.8.
+
+## R-062 — A chat that folds while it is open must keep following, and close
+
+**Invariant:** when a recovered v1 (MDK 0.8) chat folds onto its v2 group
+while it is the visible screen, the screen ends on the live id with that id's
+transcript following the store and the open state recorded on it. Leaving
+then closes the chat.
+
+**Breaks as:** iOS, after the in-place v1 → v2 upgrade: open a v1 chat, the
+peer updates, send. The peer's v2 replies reach core (the Home row previews
+them) but never paint in the open chat until it is reopened. After Back, a tap
+on the row does nothing (`SONAR_BENCH chat_open … path=already-open`) until
+another chat is opened first.
+
+**Why:** with the hist→live fold persisted, `marmotGroupId(v1)` already
+resolves to live, so `remountFoldedOpenChatIfNeeded` takes its "already on
+live" return. Its deferred `remountFoldedNavigationPath` still rewrites the
+top `.dm(v1)` route to `.dm(live)`, and the NavigationStack updates that
+screen in place: neither `closedDM(v1)` nor `openedDM(live)` runs (the R-038
+shape, which `handOverVisibleTranscript` already handles for pending → real).
+The live `ConversationViewState` adopted the window but was never attached,
+and `openedConversationId` stayed on the v1 id, so `closedDM(live)` did not
+clear it and `openDM` saw the chat as still open.
+
+**Apple call site:** `SonarAppStore.remountFoldedNavigationPath` →
+`handOverFoldedVisibleTranscript` (route replacement v1 → live, opened = live
+/ pane = v1, `handOverVisibleTranscript`, mark read).
+
+**Compose call site:** does not apply as written. `SonarAppState` derives the
+open chat from the top of `stack` (`screen`), and the fold's
+`remountFoldedNavStack` rewrites that stack, so the open state moves with
+the route; transcripts are recomposed from state, with no attach/detach to
+miss. QA-212 runs the same steps on Android (`android-mdk-upgrade.sh`,
+QA-192b).
+
+**Guarded by:** `FoldHopVisibleTranscriptTests.theVisibleTranscriptFollowsTheStoreOnTheLiveIdAfterTheFold`
+
+**Also guarded by:** `FoldHopVisibleTranscriptTests.leavingAfterTheFoldClosesTheChatSoItsRowOpensAgain`,
+`FoldHopVisibleTranscriptTests.aLateDisappearOfTheV1ScreenDoesNotCloseTheLiveChat`
+
+**Not guarded:** the tests drive `remountFoldedNavigationPath` with a known
+live target, not the `groups` emission that calls it, and they cannot show
+whether SwiftUI fires the lifecycle pair on a given iOS version; the
+simulator walk (QA-212) is the end-to-end check. iOS tests do not run in CI.
+
+**Rejected:**
+- *Re-running the full remount (path kept on `.dm(v1)`) when the open id
+  already resolves to live.* That branch also copies windows, echoes and
+  send queues keyed by the resolved id, which is live there: a larger change
+  to code with five QA rounds behind it, for the same visible result.
+- *`openedDM(live)` from the path remount.* It hydrates the live id as a
+  fresh open and snaps a scrolled recovered transcript to the tail (the
+  remount comments already rule it out).
+
+## R-063 — Paging older history must keep firing while the reader stays at the top
+
+**Invariant:** each older page a reader pulls in at the top of a transcript
+re-arms the load-older trigger, so they can keep paging to message 1 however
+slow the device is.
+
+**Breaks as:** Compose, after the MDK v0.14 upgrade, on a loaded emulator:
+scrolling up an 85-message recovered chat loads one older page (60 rows)
+and stops at row 27–33; more swipes and a minute of idle never page further.
+On a quiet run the same chat pages to the top. `FOLDDBG` tracing showed one
+`loadOlderMessages` call in the whole scroll and no failed one.
+
+**Why:** the trigger was `snapshotFlow { atTop }.distinctUntilChanged()`.
+After a prepend, the continuity restore waited one frame and then read
+`currentListItems`; on a slow device that list was still the pre-prepend
+one, so the anchor's old index (≤ 2) kept the reader at the top, `atTop`
+never turned false, and the flow never emitted again.
+
+**Compose call site:** `App.kt` `rememberChatTranscriptViewport` load-older
+`LaunchedEffect`: the trigger is now `transcriptTopTriggerKey(currentListItems)`
+while at the top (the oldest message row), and the restore waits up to 1 s
+for the recomposed list before scrolling to the anchor.
+
+**Apple call site:** not the same code. iOS pages through
+`ConversationViewState.loadOlder` from the UIKit host; `ios-mdk-upgrade.sh`
+QA-191 pages the same 85-message chat with swipes.
+
+**Guarded by:** `ChatFeedListItemsTest.topTriggerKeyChangesOnlyWhenOlderRowsArePrepended`
+
+**Not guarded:** the test pins the key, not the `LaunchedEffect` wiring or the
+restore wait, which need a device. The scripted QA-191 is the end-to-end
+check and only reproduced the stall under heavy host load.
+
+**History:** #613 QA A1 fixed a different cause of the same symptom
+(`transcriptSourceHasOlder` re-arming an exhausted source).
+
+**Rejected:**
+- *Waiting longer (more frames) before reading the list.* Still a race on a
+  slower device; the key-based trigger does not depend on the restore at all.
+
+## R-064 — A page read racing the 0.8 remainder drain must not end paging
+
+**Invariant:** while leftover 0.8 rows are still being copied out of
+`*.mdk08.bak`, a scroll-up page read waits for the copy and returns a full
+page; "no remainder pending" is reported only once the bak is exhausted.
+
+**Breaks as:** right after the v1 → v2 upgrade, scrolling up a long recovered
+chat stops at the oldest migrated row (row 7 of 85); the rows only in the bak
+never appear. Intermittent: it happens when the idle drain is mid-copy as the
+reader reaches the top (1 of 6 iOS walk runs). Platform-independent (core).
+
+**Why:** `ensure_mdk08_remainder_budget` took the pending remainder out of its
+slot (`slot.take()`) for the whole extraction. A concurrent
+`messages_cursor_page` saw `has_pending_mdk08_remainder() == false`, skipped
+the fill and returned a short page; the host then set "nothing older" and
+stopped asking, and the drained rows landed below a window it no longer paged.
+
+**Core call site:** `MarmotEngine::ensure_mdk08_remainder_budget` now holds
+`mdk08_remainder_extract` for the whole extraction and reads the pending
+remainder without taking it (cleared only when the bak is exhausted).
+
+**Hosts:** not applicable — both page through `messages_cursor_page`.
+
+**Guarded by:** `persistence.rs::a_page_read_racing_the_remainder_drain_still_gets_a_full_page`
+(fails on the first round without the fix)
+
+**Not guarded:** a host that sets "nothing older" from a short page for any
+other reason; the walks (`ios-mdk-upgrade.sh`, `android-mdk-upgrade.sh`
+QA-191) page an 85-row chat right after the upgrade.
+
+**History:** #613 QA A1 and R-063 fixed two other causes of the same
+symptom (a host re-arming an exhausted source; Compose's at-top trigger).
+
+**Rejected:**
+- *Waiting for the idle drain to finish before first paint.* Puts the bak
+  copy on the open path (Signal-Comparable Performance Rule).
 
 ## Unguarded
 

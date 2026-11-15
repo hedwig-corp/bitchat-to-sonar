@@ -1,7 +1,14 @@
 package chat.bitchat.sonar.push
 
+import chat.bitchat.sonar.HISTORICAL_FOLDS_BLOB_KEY
 import chat.bitchat.sonar.MUTE_BLOB_KEY
 import chat.bitchat.sonar.Notifier
+import chat.bitchat.sonar.decodeGroupFoldMap
+import chat.bitchat.sonar.encodeGroupFoldMap
+import chat.bitchat.sonar.encodeMuteMap
+import chat.bitchat.sonar.foldFamilyIds
+import chat.bitchat.sonar.promotedFoldedMutesFromFolds
+import chat.bitchat.sonar.wakeMuteHistoricalFolds
 import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
 import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarCore
@@ -15,6 +22,7 @@ import chat.bitchat.sonar.decodeMuteMap
 import chat.bitchat.sonar.decodeProfileCache
 import chat.bitchat.sonar.isMutedAt
 import chat.bitchat.sonar.resolvePushSenderName
+import chat.bitchat.sonar.wakeNotificationNames
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeoutOrNull
@@ -65,33 +73,59 @@ internal object SonarWakeNotifications {
 
         // Per-chat mute is honored on the killed-app drain too: rows and unread
         // counts still accrued in local storage — only the banner is skipped.
-        // muteChat persists the whole folded-id set, so a direct group-id
-        // lookup is sufficient here.
+        // muteChat persists the folded-id set when the fold is already known.
+        // A mute taken on the recovered 0.8 id before resume still needs the
+        // hist→live blob: walk that family so a killed-app drain on the live
+        // id stays silent.
         val mutes = decodeMuteMap(SonarCore.loadBlob(MUTE_BLOB_KEY))
+        val persistedFolds = decodeGroupFoldMap(SonarCore.loadBlob(HISTORICAL_FOLDS_BLOB_KEY))
+        val listedIds = unread.map { it.groupIdHex }.filter { it.isNotBlank() }
+        val folds = wakeMuteHistoricalFolds(
+            persisted = persistedFolds,
+            listedIds = listedIds,
+            foldAliases = { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+        if (folds != persistedFolds) {
+            SonarCore.saveBlob(HISTORICAL_FOLDS_BLOB_KEY, encodeGroupFoldMap(folds))
+        }
+        val promotedMutes = promotedFoldedMutesFromFolds(mutes, folds)
+        if (promotedMutes != mutes) {
+            SonarCore.saveBlob(MUTE_BLOB_KEY, encodeMuteMap(promotedMutes))
+        }
         val nowSecs = System.currentTimeMillis() / 1000
 
         var notified = 0
         for (summary in unread) {
-            if (isMutedAt(mutes[summary.groupIdHex], nowSecs)) continue
+            val muted = foldFamilyIds(summary.groupIdHex, folds)
+                .plus(summary.groupIdHex)
+                .any { isMutedAt(promotedMutes[it], nowSecs) }
+            if (muted) continue
             val kind = SonarNotificationRouter.classifyContent(
                 summary.latestContent,
                 isCallControl = { SonarCore.callParseControl(it) != null },
             )
             if (kind == SonarNotificationKind.Call) continue
 
+            val senderName = if (!prefs.showNames) null else summary.latestSenderNpub
+                .takeIf { it.isNotBlank() }
+                ?.let { npub ->
+                    // Everything is prefetched above under one budget, so
+                    // the fetch lambda is a pure map read (no network).
+                    resolvePushSenderName(npub, cachedProfiles) { missing ->
+                        fetchedProfiles[canonicalProfileKey(missing)]
+                    }
+                }
+            // Remounted hist room names live on summary.name. Passing only
+            // conversationTitle lets visibleLabel prefer the sender and drop
+            // the room (iOS always sets groupName when they differ).
+            val names = wakeNotificationNames(summary.name, senderName)
             val notif = SonarNotificationRouter.build(
                 idKey = summary.groupIdHex,
                 kind = kind,
-                conversationTitle = summary.name.ifBlank { null },
-                senderName = if (!prefs.showNames) null else summary.latestSenderNpub
-                    .takeIf { it.isNotBlank() }
-                    ?.let { npub ->
-                        // Everything is prefetched above under one budget, so
-                        // the fetch lambda is a pure map read (no network).
-                        resolvePushSenderName(npub, cachedProfiles) { missing ->
-                            fetchedProfiles[canonicalProfileKey(missing)]
-                        }
-                    },
+                conversationTitle = names.conversationTitle,
+                senderName = senderName,
+                groupName = names.groupName,
                 preview = summary.latestContent,
                 unreadCount = summary.unreadCount,
                 prefs = prefs,
