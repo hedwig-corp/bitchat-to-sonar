@@ -7472,6 +7472,12 @@ final class SonarAppStore: ObservableObject {
         return .internet
     }
 
+    /// Marmot v1 → v2 gate for this conversation's composer. A pure read of
+    /// published state (the gate is filled off the render path in `openedDM`).
+    func composerGate(_ id: String) -> SNComposerGate {
+        snComposerGate(marmot.marmotChatGates[id], sendsOverMesh: dmTransport(id) == .mesh)
+    }
+
     func sendDm(_ id: String, _ text: String) {
         // Every send route lands a local echo synchronously; repaint this
         // frame instead of waiting on the throttled service republish. One
@@ -7778,6 +7784,15 @@ final class SonarAppStore: ObservableObject {
             defer { startingMarmotChats.remove(clean) }
             let groupId = await marmot.startChatReturningId(with: clean)
             if groupId == nil {
+                if marmot.newChatRefusedBecausePeerUpdatedSonar(clean) {
+                    // Out of Bluetooth range this chat can only send over
+                    // Marmot, which the contact no longer reads: show the
+                    // update panel there (in range, BLE keeps the composer).
+                    let meshChatIds = Set((pendingMarmotSends[clean] ?? []).map(\.chatId))
+                    for chatId in meshChatIds where !chatId.isEmpty {
+                        marmot.markPeerUpdatedSonar(conversationId: chatId, peerNpub: clean)
+                    }
+                }
                 failPendingMeshMarmotSends(npub: clean)
                 if let err = marmot.errorText, !err.isEmpty {
                     showToast(err)
@@ -7900,6 +7915,9 @@ final class SonarAppStore: ObservableObject {
             cancelPendingSecureChatSetup(pendingId: pendingId, npub: npub)
         }
         pendingMarmotChats[pendingId] = nil
+        // A setup refused earlier (the contact had moved to Marmot v2) left
+        // the update panel on the pending id; the real chat reads its own gate.
+        marmot.clearMarmotChatGate(conversationId: pendingId)
         let realId = Self.marmotIDPrefix + groupId
         moveComposerState(from: pendingId, to: realId)
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
@@ -7945,7 +7963,14 @@ final class SonarAppStore: ObservableObject {
     private func failPendingSecureChat(pendingId: String, npub: String, setupToken: UUID? = nil) {
         guard isActivePendingSecureChatSetup(pendingId: pendingId, npub: npub, token: setupToken) else { return }
         pendingMarmotChats[pendingId] = nil
-        pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
+        if marmot.newChatRefusedBecausePeerUpdatedSonar(npub) {
+            // Every install of this contact moved to Marmot v2: keep the user
+            // in the chat and replace its composer with the update panel, as
+            // an existing chat's gate does (the Mac pane stays open on it).
+            marmot.markPeerUpdatedSonar(conversationId: pendingId, peerNpub: npub)
+        } else {
+            pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
+        }
         let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
         let queuedIds = Set(queued.map(\.messageId))
         var messages = (pendingMarmotMessagesByChat[pendingId] ?? []).map {
@@ -9520,6 +9545,13 @@ final class SonarAppStore: ObservableObject {
             // P2: service cold-start catch-up for the conversation the user opened.
             if let hydratedGroupId {
                 Task { await self.marmot.preferCatchupGroup(hydratedGroupId) }
+                // After local paint: has everyone here moved to Marmot v2?
+                // Local read first, then a bounded background recheck.
+                let gateGroups = self.directMarmotGroups(matchingGroupId: hydratedGroupId).map(\.id)
+                self.marmot.scheduleMarmotChatGate(
+                    conversationId: id,
+                    groupIds: gateGroups.isEmpty ? [hydratedGroupId] : gateGroups
+                )
             }
             let needsHistoryBackfill = hydratedGroupId.map {
                 let groups = self.directMarmotGroups(matchingGroupId: $0)

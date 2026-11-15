@@ -1,6 +1,10 @@
 use nostr::PublicKey;
 use thiserror::Error;
 
+/// Substring of [`Error::PeerUpdatedMarmot`]'s message that hosts match on
+/// (errors cross the FFI as flat strings).
+pub const PEER_UPDATED_SONAR_MARKER: &str = "peer has updated Sonar";
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid key: {0}")]
@@ -93,6 +97,12 @@ pub enum Error {
 
     #[error("no relay connected within timeout")]
     NoRelayConnected,
+
+    /// Every other member of this chat moved to Marmot v2 (MDK v0.14), which
+    /// this MDK 0.8 build cannot write to: a send would be unreadable. Stable
+    /// Display text — hosts match on [`PEER_UPDATED_SONAR_MARKER`].
+    #[error("peer has updated Sonar: update the app to keep chatting")]
+    PeerUpdatedMarmot,
 
     #[error("rng error: {0}")]
     Rng(#[from] getrandom::Error),

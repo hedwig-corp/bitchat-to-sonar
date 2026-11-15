@@ -45,6 +45,17 @@ struct MarmotLookupLaneTests {
         #expect(waited < 1.0, "publishSonarDescriptor waited \(waited)s behind workQueue")
     }
 
+    /// The Marmot v1 → v2 KeyPackage recheck runs on chat open; behind
+    /// `workQueue` it would sit in front of the gap sync (and vice versa).
+    @Test
+    func marmotProtocolRefreshDoesNotWaitBehindTheWorkQueue() async {
+        let waited = await elapsed {
+            await $0.refreshMarmotChatProtocol(groupIds: [String(repeating: "ab", count: 32)])
+            _ = await $0.marmotChatGate(groupIds: [String(repeating: "ab", count: 32)])
+        }
+        #expect(waited < 1.0, "Marmot protocol gate calls waited \(waited)s behind workQueue")
+    }
+
     @Test
     func walletOfferBackupCallsDoNotWaitBehindTheWorkQueue() async {
         let waited = await elapsed {
