@@ -398,6 +398,21 @@ data class SonarMentionSpan(
     val suffixHex4: String?,
 )
 
+/** What [SonarCore.scrubImageMetadata] found; [imageBytesForSend] acts on it. */
+sealed class SonarImageScrub {
+    /** Not an image: send the bytes as they are. */
+    data object NotImage : SonarImageScrub()
+
+    /** An image with no metadata to remove: send the bytes as they are. */
+    data object Clean : SonarImageScrub()
+
+    /** The image without its metadata: send these bytes instead. */
+    class Stripped(val bytes: ByteArray) : SonarImageScrub()
+
+    /** An image the core cannot rewrite in place or parse: re-encode it. */
+    data object Reencode : SonarImageScrub()
+}
+
 /** A handle (`vincenzo` / `alice@example.com`) resolved to its owner via
  *  NIP-05. `address` is the canonical lowercased `name@domain` that resolved. */
 data class SonarResolvedHandle(
@@ -890,6 +905,15 @@ expect object SonarCore {
 
     /** The `#abcd` disambiguator for [pubkeyHex] — its last 4 hex, lowercased. */
     fun mentionShortSuffix(pubkeyHex: String): String?
+
+    /** Strip location, device and time metadata from a file about to be sent.
+     *  The core recognizes images by their bytes. CPU-bound: call it off Main,
+     *  through [imageBytesForSend]. */
+    fun scrubImageMetadata(data: ByteArray): SonarImageScrub
+
+    /** EXIF orientation (1–8) of a JPEG or TIFF, else 1, for decoders that
+     *  ignore it (`BitmapFactory`, ImageIO). */
+    fun imageExifOrientation(data: ByteArray): Int
 
     /** All active Marmot chats we belong to. */
     suspend fun chats(): List<SonarChat>

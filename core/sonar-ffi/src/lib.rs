@@ -122,6 +122,49 @@ pub fn max_media_plaintext_bytes() -> u64 {
     sonar_core::client::MAX_MEDIA_PLAINTEXT_BYTES as u64
 }
 
+/// What a host must do with an image before it sends it; see
+/// [`scrub_image_metadata`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ImageMetadataScrub {
+    /// Not an image: send the bytes as they are.
+    NotImage,
+    /// An image with no metadata to remove: send the bytes as they are.
+    Clean,
+    /// The image without its metadata: send these bytes instead.
+    Stripped { data: Vec<u8> },
+    /// An image the core cannot rewrite in place (HEIF, AVIF, TIFF, JPEG XL)
+    /// or could not parse. Decode it and send a re-encoded JPEG, rotated per
+    /// [`image_exif_orientation`] when the decoder ignores EXIF orientation.
+    /// Never send the original bytes.
+    Reencode,
+}
+
+/// Remove location, device, time, comment and thumbnail metadata from an
+/// image, keeping its pixels, animation, colour profile and orientation.
+///
+/// Images are recognized by their bytes, not their name or MIME, so call it on
+/// every file a user sends, not only photos. Pure, CPU-bound and O(n): call it
+/// off the main thread where the bytes enter a send path, so the local echo,
+/// retries and outbox all hold the clean copy.
+#[uniffi::export]
+pub fn scrub_image_metadata(data: Vec<u8>) -> ImageMetadataScrub {
+    use sonar_media_privacy::{scrub_image, ImageScrub};
+    match scrub_image(&data) {
+        ImageScrub::NotImage => ImageMetadataScrub::NotImage,
+        ImageScrub::Clean => ImageMetadataScrub::Clean,
+        ImageScrub::Stripped(data) => ImageMetadataScrub::Stripped { data },
+        ImageScrub::Reencode => ImageMetadataScrub::Reencode,
+    }
+}
+
+/// The EXIF orientation (1–8) of a JPEG or TIFF, or 1 when it has none. For
+/// hosts whose decoder ignores it (Android `BitmapFactory`, Java ImageIO): a
+/// re-encode that drops the tag without rotating sends the photo sideways.
+#[uniffi::export]
+pub fn image_exif_orientation(data: Vec<u8>) -> u8 {
+    sonar_media_privacy::image_orientation(&data)
+}
+
 /// Aggregate plaintext ceiling for one album send (every attachment is
 /// memory-resident at once during `send_media_multi`). Hosts should bound the
 /// combined size of picked videos against this; the core also rejects
