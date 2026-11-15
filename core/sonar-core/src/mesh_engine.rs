@@ -53,7 +53,26 @@ pub const MAX_CLIENTS: usize = 4;
 pub const CONNECT_ESTABLISH_MS: u64 = 5_000;
 pub const ANNOUNCE_TIMEOUT_MS: u64 = 6_000;
 pub const REDIAL_BACKOFF_MS: u64 = 30_000;
+/// The longest wait before redialing a connection that keeps failing.
+pub const MAX_REDIAL_BACKOFF_MS: u64 = 120_000;
 pub const HANDSHAKE_RETRY_MS: u64 = 8_000;
+
+/// The wait before redialing a connection whose last `failures` dials in a
+/// row failed. None (a link that worked, then dropped): `REDIAL_BACKOFF_MS`.
+/// One is often transient (Android's 133, a dial race), so it retries at once.
+/// From the second on, the wait starts at `REDIAL_BACKOFF_MS` and doubles up
+/// to `MAX_REDIAL_BACKOFF_MS`. Android opens one connection at a time, so an
+/// advertiser that never accepts would otherwise keep a real peer waiting: on
+/// 2026-10-29 three such addresses kept a doomed dial pending 67% of the time.
+pub fn redial_backoff_ms(failures: u32) -> u64 {
+    match failures {
+        0 => REDIAL_BACKOFF_MS,
+        1 => 0,
+        n => REDIAL_BACKOFF_MS
+            .saturating_mul(1u64 << (n - 2).min(16))
+            .min(MAX_REDIAL_BACKOFF_MS),
+    }
+}
 /// A healthy link carries rx at least every ~30s (our heartbeat plus iOS's
 /// 15–38s connected announce cadence): 90s of silence means the link is dead
 /// even though no disconnect callback ever fired (Pixel 10 stack).
@@ -261,7 +280,11 @@ pub struct Engine {
     dialing: HashMap<String, DialState>,
     /// Client connections that reached GATT-connected.
     connected: HashSet<String>,
+    /// When each connection was last dialed.
     recent_dials: HashMap<String, u64>,
+    /// Dials in a row that failed per connection, for `redial_backoff_ms`.
+    /// Reset when the peer answers with a direct announce.
+    dial_failures: HashMap<String, u32>,
 
     /// Once a sender ID has established an Ed25519 signing key, later announces
     /// must not replace it (reinstall rotates the sender ID too, so an in-place
@@ -348,6 +371,7 @@ impl Engine {
             dialing: HashMap::new(),
             connected: HashSet::new(),
             recent_dials: HashMap::new(),
+            dial_failures: HashMap::new(),
             signing_key_by_peer: HashMap::new(),
             fingerprint_by_peer: HashMap::new(),
             identity_lru: VecDeque::new(),
@@ -438,7 +462,8 @@ impl Engine {
             return out;
         }
         if let Some(t) = self.recent_dials.get(conn) {
-            if now_ms.saturating_sub(*t) < REDIAL_BACKOFF_MS {
+            let failures = self.dial_failures.get(conn).copied().unwrap_or(0);
+            if now_ms.saturating_sub(*t) < redial_backoff_ms(failures) {
                 return out;
             }
         }
@@ -454,7 +479,9 @@ impl Engine {
         self.recent_dials.insert(conn.to_string(), now_ms);
         if self.recent_dials.len() > 256 {
             self.recent_dials
-                .retain(|_, t| now_ms.saturating_sub(*t) <= REDIAL_BACKOFF_MS);
+                .retain(|_, t| now_ms.saturating_sub(*t) <= MAX_REDIAL_BACKOFF_MS);
+            let recent = &self.recent_dials;
+            self.dial_failures.retain(|c, _| recent.contains_key(c));
         }
         self.dialing.insert(
             conn.to_string(),
@@ -491,6 +518,7 @@ impl Engine {
         let dead_unconnected = !d.connected && age >= CONNECT_ESTABLISH_MS;
         let dead_unannounced = age >= CONNECT_ESTABLISH_MS + ANNOUNCE_TIMEOUT_MS;
         if dead_unconnected || dead_unannounced {
+            self.note_dial_failure(conn);
             self.cleanup_client_conn(conn);
             out.commands.push(Command::Disconnect {
                 conn: conn.to_string(),
@@ -500,11 +528,17 @@ impl Engine {
     }
 
     /// A failed connect (transient 133, dial-race 19, …) is frequently
-    /// retryable — clear the backoff so the next scan hit can re-dial at once.
+    /// retryable, so the first one re-dials on the next scan hit; repeated
+    /// ones wait longer each time (`redial_backoff_ms`).
     pub fn on_client_connect_failed(&mut self, conn: &str) -> Output {
-        self.recent_dials.remove(conn);
+        self.note_dial_failure(conn);
         self.cleanup_client_conn(conn);
         Output::default()
+    }
+
+    fn note_dial_failure(&mut self, conn: &str) {
+        let failures = self.dial_failures.entry(conn.to_string()).or_insert(0);
+        *failures = failures.saturating_add(1);
     }
 
     pub fn on_client_disconnected(&mut self, conn: &str) -> Output {
@@ -1045,6 +1079,7 @@ impl Engine {
         self.dialing.clear();
         self.connected.clear();
         self.recent_dials.clear();
+        self.dial_failures.clear();
         self.signing_key_by_peer.clear();
         self.fingerprint_by_peer.clear();
         self.identity_lru.clear();
@@ -1638,6 +1673,7 @@ impl Engine {
             // A real peer answered — keep this connection past the dial window.
             if let Origin::Client(id) = &origin {
                 self.dialing.remove(&id.conn);
+                self.dial_failures.remove(&id.conn);
             }
         }
         out.events.push(AppEvent::PeerAnnounced {
@@ -2951,6 +2987,76 @@ mod tests {
             accepted += a.on_dial_request(&conn, 50_000).commands.len();
         }
         assert_eq!(accepted, MAX_CLIENTS);
+    }
+
+    /// An advertiser that never accepts (three did on 2026-10-29, each failing
+    /// 147 every 2–9 s, a doomed dial pending 67% of the time) must not hog the
+    /// radio's one connection initiator while a real peer waits behind it.
+    #[test]
+    fn a_connection_that_keeps_failing_is_redialed_ever_less_often() {
+        let mut a = engine(1, "pixel");
+        let dial = |a: &mut Engine, t: u64| a.on_dial_request("dead", t).commands.len();
+        let t0 = 1_000;
+        assert_eq!(dial(&mut a, t0), 1);
+        a.on_client_connect_failed("dead");
+        // One failure is often transient (Android's 133, a dial race).
+        let t1 = t0 + 500;
+        assert_eq!(dial(&mut a, t1), 1, "a first failure retries at once");
+        a.on_client_connect_failed("dead");
+        assert_eq!(dial(&mut a, t1 + REDIAL_BACKOFF_MS - 1), 0, "a second failure waits");
+        let t2 = t1 + REDIAL_BACKOFF_MS;
+        assert_eq!(dial(&mut a, t2), 1);
+        a.on_client_connect_failed("dead");
+        assert_eq!(dial(&mut a, t2 + 2 * REDIAL_BACKOFF_MS - 1), 0, "each further failure doubles the wait");
+        assert_eq!(dial(&mut a, t2 + 2 * REDIAL_BACKOFF_MS), 1);
+    }
+
+    #[test]
+    fn the_redial_wait_after_failures_is_capped() {
+        assert_eq!(redial_backoff_ms(0), REDIAL_BACKOFF_MS, "a link that worked keeps today's wait");
+        assert_eq!(redial_backoff_ms(1), 0);
+        assert_eq!(redial_backoff_ms(2), REDIAL_BACKOFF_MS);
+        assert_eq!(redial_backoff_ms(3), 2 * REDIAL_BACKOFF_MS);
+        assert_eq!(redial_backoff_ms(4), MAX_REDIAL_BACKOFF_MS);
+        assert_eq!(redial_backoff_ms(u32::MAX), MAX_REDIAL_BACKOFF_MS);
+    }
+
+    /// A peer that answers starts over: its next failure is transient again.
+    #[test]
+    fn a_peer_that_answers_resets_its_redial_wait() {
+        let mut a = engine(1, "pixel");
+        let peer = engine(9, "iphone");
+        let mut now = 1_000;
+        a.on_dial_request("c1", now);
+        a.on_client_connect_failed("c1");
+        a.on_dial_request("c1", now + 1);
+        a.on_client_connect_failed("c1");
+        now += REDIAL_BACKOFF_MS + 1;
+        assert_eq!(a.on_dial_request("c1", now).commands.len(), 1);
+        a.on_client_connected("c1", now);
+        a.on_instances_discovered("c1", &[7], now);
+        a.on_subscribe_result("c1", 7, true, now);
+        a.on_client_rx("c1", 7, &peer.announce_bytes(now).unwrap(), now);
+        a.on_client_disconnected("c1");
+
+        now += REDIAL_BACKOFF_MS;
+        assert_eq!(a.on_dial_request("c1", now).commands.len(), 1);
+        a.on_client_connect_failed("c1");
+        assert_eq!(a.on_dial_request("c1", now + 1).commands.len(), 1, "the count started over");
+    }
+
+    /// A dial recycled at its deadline (never connected, or never announced)
+    /// failed too, and counts toward the wait.
+    #[test]
+    fn a_dial_recycled_at_its_deadline_counts_as_a_failure() {
+        let mut a = engine(1, "pixel");
+        let t0 = 1_000;
+        a.on_dial_request("mute", t0);
+        a.on_dial_deadline("mute", t0 + CONNECT_ESTABLISH_MS);
+        let t1 = t0 + CONNECT_ESTABLISH_MS;
+        assert_eq!(a.on_dial_request("mute", t1).commands.len(), 1, "one failure: at once");
+        a.on_dial_deadline("mute", t1 + CONNECT_ESTABLISH_MS);
+        assert_eq!(a.on_dial_request("mute", t1 + CONNECT_ESTABLISH_MS).commands.len(), 0);
     }
 
     #[test]
