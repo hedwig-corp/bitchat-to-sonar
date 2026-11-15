@@ -28,12 +28,19 @@
 # Options:
 #   --app PATH        .app bundle to (re)install once before the runs
 #   --no-install      skip install (use the already-installed, provisioned app)
-#   --device NAME|UDID  simulator to use (default: a booted one, else newest iPhone)
+#   --device NAME|UDID  simulator to use (default: this worktree's dedicated
+#                     bench simulator, scripts/bench/_bench-sim.sh — never
+#                     "whatever is booted", which may be another session's)
 #   --runs N          number of cold-start iterations (default 5)
 #   --timeout SECS    per-run wait for t4 before giving up (default 60)
 #   --bundle ID       app bundle id (default sh.hedwig.sonar)
-#   --out DIR         output dir for raw logs (default /tmp/sonar-bench/runs)
+#   --out DIR         output dir for raw logs (default $SONAR_BENCH_WORK/runs)
+#
+# Env: SONAR_BENCH_WORK  work dir, default /tmp/sonar-bench. Give each
+#                        concurrent session its own.
 set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 BUNDLE_ID="sh.hedwig.sonar"
 RUNS=5
@@ -41,7 +48,7 @@ TIMEOUT=60
 APP_PATH=""
 DO_INSTALL=1
 DEVICE=""
-OUT_DIR="/tmp/sonar-bench/runs"
+OUT_DIR="${SONAR_BENCH_WORK:-/tmp/sonar-bench}/runs"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -69,13 +76,8 @@ resolve_device() {
     fi
     echo "ERROR: device '$DEVICE' not found" >&2; exit 1
   fi
-  # Prefer an already-booted device.
-  local booted
-  booted="$(xcrun simctl list devices booted | grep -oE '[0-9A-Fa-f-]{36}' | head -1 || true)"
-  if [[ -n "$booted" ]]; then echo "$booted"; return; fi
-  # Else newest available iPhone.
-  xcrun simctl list devices available \
-    | grep -E 'iPhone' | grep -oE '[0-9A-Fa-f-]{36}' | tail -1
+  # This worktree's dedicated bench simulator (created + booted on demand).
+  "$REPO_ROOT/scripts/bench/_bench-sim.sh"
 }
 
 UDID="$(resolve_device)"
