@@ -24,6 +24,73 @@ struct MeshLinkSenderPolicy {
     static func isSelfEcho(senderIsSelf: Bool, ttl: UInt8) -> Bool {
         senderIsSelf && ttl > 0
     }
+
+    /// What a packet from `claimed` may do on a bound link.
+    enum Ingress: Equatable {
+        /// From an identity the link already speaks for.
+        case trusted
+        /// A relayed announce or Sonar profile: validated as its claimed sender.
+        case relayedIdentity
+        /// A full-TTL announce from an identity the link does not speak for
+        /// yet. Two mesh apps on one device share its radio, so this is the
+        /// other app, provided its signature verifies (the caller checks).
+        case candidateDirectIdentity
+        case reject
+    }
+
+    static func ingress(claimed: PeerID, link: MeshLinkIdentities, type: UInt8, ttl: UInt8) -> Ingress {
+        if link.carries(claimed) { return .trusted }
+        if type == MessageType.announce.rawValue, ttl == TransportConfig.messageTTLDefault {
+            return .candidateDirectIdentity
+        }
+        if allowsRelayedIdentityPacket(type: type, ttl: ttl) { return .relayedIdentity }
+        return .reject
+    }
+}
+
+/// The identities one BLE link speaks for.
+///
+/// A link usually carries one app, but two mesh apps on one device (Sonar
+/// beside stock bitchat on Android, Sonar.app beside a bitchat build on a Mac)
+/// share the device's radio: iOS sees one CBCentral writing both apps'
+/// packets. The first full-TTL announce binds the link (`primary`, never
+/// rebound, see #244); a further identity joins only after its own signed
+/// full-TTL announce verifies.
+struct MeshLinkIdentities {
+    let primary: PeerID
+    /// When each identity last announced at full TTL on this link.
+    private(set) var lastDirectAnnounce: [PeerID: Date]
+
+    init(primary: PeerID, at date: Date) {
+        self.primary = primary
+        self.lastDirectAnnounce = [primary: date]
+    }
+
+    func carries(_ peerID: PeerID) -> Bool {
+        peerID == primary || lastDirectAnnounce[peerID] != nil
+    }
+
+    /// More than one app has announced directly on this link.
+    var isShared: Bool { lastDirectAnnounce.keys.contains { $0 != primary } }
+
+    mutating func noteDirectAnnounce(from peerID: PeerID, at date: Date) {
+        lastDirectAnnounce[peerID] = date
+    }
+
+    /// Whether the link still vouches that `peerID` is directly reachable. A
+    /// link that carries one app vouches for as long as it is up. On a shared
+    /// link each identity has to keep announcing: the radio link outlives a
+    /// co-located app that quit, so without this the quit app stays online.
+    func vouches(for peerID: PeerID, now: Date, window: TimeInterval) -> Bool {
+        guard carries(peerID) else { return false }
+        guard isShared else { return true }
+        guard let last = lastDirectAnnounce[peerID] else { return false }
+        return now.timeIntervalSince(last) <= window
+    }
+
+    func vouchedPeers(now: Date, window: TimeInterval) -> Set<PeerID> {
+        Set(lastDirectAnnounce.keys.filter { vouches(for: $0, now: now, window: window) })
+    }
 }
 
 // RelayController centralizes flood control policy for relays.
