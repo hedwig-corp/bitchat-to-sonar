@@ -431,10 +431,14 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     let loadNewest: (() async -> Void)?
     let unreadCountAtOpen: UInt64?
     let expectedNewestDate: Date?
+    var familyHasOlder: Bool = false
     /// Search / deep-link jump target; wins over unread/live-edge open (#372).
     var jumpMessageId: String? = nil
     var onJumpSettled: (() -> Void)? = nil
     var composerVersion: UInt64? = nil
+    /// Bumped on each send from the composer: follow the reader's own message
+    /// even from older history (see `TranscriptTailPinLatch.ownSendRequested`).
+    var ownSendRevision: UInt64? = nil
     @ViewBuilder var composer: () -> Composer
 
     @StateObject private var renderContext = SNTranscriptHostRenderContext()
@@ -464,6 +468,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
             callbacks: renderContext.makeCallbacks(),
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
@@ -494,6 +499,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
             // the host skip the apply that carries this pass's row change.
             contentVersion: version,
             composerVersion: composerVersion,
+            ownSendRevision: ownSendRevision,
             composer: composer
         )
     }

@@ -84,36 +84,110 @@ internal const val SYNTHETIC_SUMMARY_ID_PREFIX = "summary:"
 internal fun List<SonarMsg>.withoutSyntheticSummaryRows(): List<SonarMsg> =
     filterNot { it.id.startsWith(SYNTHETIC_SUMMARY_ID_PREFIX) }
 
+/** True when [rows] already hold real event ids. A conversation-index
+ *  stand-in must not replace those — persist-folds remount the hidden 0.8
+ *  extract onto live before core `fold_family` exists, and chats outside
+ *  the bounded home page window never get a page to put the rows back.
+ *  iOS never writes synthetics into `messagesByGroup`; home paint uses
+ *  `snMarmotHomeRowMessage` only (`latestAt`-or-count after `copy_summary`). */
+internal fun hydrationHasRealTranscriptRows(rows: List<SonarMsg>): Boolean =
+    rows.any { !it.id.startsWith(SYNTHETIC_SUMMARY_ID_PREFIX) }
+
+/** Merge a bounded home page into remounted / leftover rows. A newer live
+ *  page must not replace a remounted 0.8 extract (iOS `loadLocalSummaries`
+ *  already `mergeMessages`s into `byGroup`). */
+internal fun hydrateMergedPageRows(
+    existing: List<SonarMsg>,
+    incoming: List<SonarMsg>,
+): List<SonarMsg> = mergeAllTranscriptRows(existing.withoutSyntheticSummaryRows() + incoming)
+
+/** Listed live id that should receive a hidden 0.8 summary / page.
+ *  Empty persist-folds still walk the remount pair so a hist-keyed
+ *  `recentMessagePages` / index row lands on live before wake-mute.
+ *  iOS `snHydrationTargetGroupId`. */
+internal fun hydrationTargetId(
+    sourceId: String,
+    activeChatIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    if (sourceId in activeChatIds) return sourceId
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val bare = sourceId.removePrefix("marmot:")
+    val live = folds[bare]?.takeIf { it.isNotBlank() && it != bare }
+        ?: folds[sourceId]?.takeIf { it.isNotBlank() && it != sourceId }
+    return live?.takeIf { it in activeChatIds }
+}
+
 internal fun hydrateLocalConversationRows(
     activeChatIds: Set<String>,
     existingMessagesByChat: Map<String, List<SonarMsg>>,
     existingLatestByChat: Map<String, Long>,
     summaries: List<SonarConversationSummary>,
     pages: List<SonarRecentTranscriptPage>,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): LocalConversationHydration {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     val messages = existingMessagesByChat.filterKeys { it in activeChatIds }.toMutableMap()
     val latest = existingLatestByChat.filterKeys { it in activeChatIds }.toMutableMap()
+    for ((historical, live) in folds) {
+        if (live !in activeChatIds) continue
+        val incoming = existingMessagesByChat[historical].orEmpty()
+        if (incoming.isNotEmpty()) {
+            messages[live] = mergedFoldedMessageLists(incoming, messages[live].orEmpty()) { it.id }
+        }
+        val incomingTs = existingLatestByChat[historical]
+            ?: incoming.maxOfOrNull { it.tsSecs }
+            ?: 0L
+        if (incomingTs > (latest[live] ?: 0L)) latest[live] = incomingTs
+    }
 
     for (summary in summaries) {
-        if (summary.groupIdHex !in activeChatIds || summary.latestAtSecs <= 0L) continue
-        latest[summary.groupIdHex] = summary.latestAtSecs
-        val existing = messages[summary.groupIdHex]
-        val previous = existing?.lastOrNull()
+        val target = hydrationTargetId(
+            summary.groupIdHex,
+            activeChatIds,
+            folds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+            ?: continue
+        if (summary.latestAtSecs <= 0L) continue
+        val existing = messages[target].orEmpty()
+        if (summary.latestAtSecs > (latest[target] ?: 0L)) {
+            latest[target] = summary.latestAtSecs
+        }
+        // Remounted / paged rows are transcript content. `lastOrNull()` is not
+        // necessarily newest (fold merge does not sort), so a newer summary
+        // used to wipe an 80-row 0.8 extract down to one `summary:` stand-in.
+        if (hydrationHasRealTranscriptRows(existing)) continue
+        latest[target] = maxOf(latest[target] ?: 0L, summary.latestAtSecs)
+        val previous = existing.lastOrNull()
         val summaryId =
-            "$SYNTHETIC_SUMMARY_ID_PREFIX${summary.groupIdHex}:${summary.latestAtSecs}:${summary.messageCount}"
+            "$SYNTHETIC_SUMMARY_ID_PREFIX$target:${summary.latestAtSecs}:${summary.messageCount}"
         val visibleFieldsMatch = previous != null &&
             previous.tsSecs == summary.latestAtSecs &&
             previous.content == summary.latestContent &&
             previous.senderNpub == summary.latestSenderNpub &&
             previous.mine == summary.latestMine
         val staleSyntheticIdentity =
-            previous?.id?.startsWith("$SYNTHETIC_SUMMARY_ID_PREFIX${summary.groupIdHex}:") == true &&
+            previous?.id?.startsWith("$SYNTHETIC_SUMMARY_ID_PREFIX$target:") == true &&
             previous.id != summaryId
         // Preserve a real bounded-page row when it already represents the same
         // visible latest message. Synthetic summaries additionally track count,
         // because core timestamps have only second resolution.
         if (!visibleFieldsMatch || staleSyntheticIdentity) {
-            messages[summary.groupIdHex] = listOf(
+            messages[target] = listOf(
                 SonarMsg(
                     id = summaryId,
                     senderNpub = summary.latestSenderNpub,
@@ -127,13 +201,23 @@ internal fun hydrateLocalConversationRows(
     }
 
     for (page in pages) {
-        if (page.chatId !in activeChatIds || page.messages.isEmpty()) continue
-        // Normalize to the transcript display order (tsSecs, id) so the snapshot
-        // paint on chat open matches the async bounded-page refresh; otherwise
-        // equal-second messages visibly swap right after the transcript opens.
-        messages[page.chatId] = mergeAllTranscriptRows(page.messages)
-        latest[page.chatId] = page.latestTsSecs.takeIf { it > 0L }
-            ?: page.messages.maxOf { it.tsSecs }
+        val target = hydrationTargetId(
+            page.chatId,
+            activeChatIds,
+            folds,
+            openedConversationId,
+            openedConversationPaneId,
+        ) ?: continue
+        if (page.messages.isEmpty()) continue
+        val existingTs = latest[target] ?: 0L
+        val pageTs = page.latestTsSecs.takeIf { it > 0L } ?: page.messages.maxOf { it.tsSecs }
+        val existing = messages[target].orEmpty()
+        // Persist-folds remount the hidden extract onto live, then a newer
+        // live page (or an older hist page after that live page) must merge.
+        // Replacing dropped the recovered rows for every chat in the page
+        // window. iOS `loadLocalSummaries` already merges into `byGroup`.
+        messages[target] = hydrateMergedPageRows(existing, page.messages)
+        latest[target] = maxOf(existingTs, pageTs)
     }
     return LocalConversationHydration(messages, latest)
 }

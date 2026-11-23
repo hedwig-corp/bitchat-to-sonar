@@ -69,7 +69,7 @@ struct PaymentOfferFreshnessTests {
     ) -> (SonarAppStore, String, () -> Void) {
         let (store, cleanup) = makeIsolatedSonarAppStore(wallet: wallet)
         store.marmot.npub = me
-        store.marmot.groups = [MarmotService.MarmotGroup(id: "g1", name: "", memberNpubs: [me, peer])]
+        store.marmot.groups = [MarmotService.MarmotGroup(id: "g1", name: "", memberNpubs: [me, peer], isDirect: true)]
         store.marmot.sonarDescriptorsByNpub[peer] = descriptor
         return (store, SonarAppStore.marmotIDPrefix + "g1", cleanup)
     }
@@ -122,7 +122,7 @@ struct PaymentOfferFreshnessTests {
         let (store, cleanup) = makeIsolatedSonarAppStore()
         defer { cleanup() }
         store.marmot.npub = Self.me
-        store.marmot.groups = [MarmotService.MarmotGroup(id: "g1", name: "", memberNpubs: [Self.me, Self.peer])]
+        store.marmot.groups = [MarmotService.MarmotGroup(id: "g1", name: "", memberNpubs: [Self.me, Self.peer], isDirect: true)]
         let message = await store.paymentDetailsUnavailableMessage(SonarAppStore.marmotIDPrefix + "g1")
         #expect(message == SonarAppStore.paymentLookupFailedMessage)
     }

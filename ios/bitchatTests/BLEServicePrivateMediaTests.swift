@@ -38,8 +38,9 @@ struct BLEServicePrivateMediaTests {
         // 1. Our authenticated peer state went out on its own, carrying the
         //    capabilities this build implements and a 32-byte signing key.
         let ourState = try #require(
-            await decryptedPayloads(from: outbound, peer: peer, me: me)
-                .first { $0.first == NoisePayloadType.authenticatedPeerState.rawValue }
+            await outbound.waitForDecrypted(by: peer, from: me) {
+                $0.first == NoisePayloadType.authenticatedPeerState.rawValue
+            }
         )
         let decodedState = try #require(AuthenticatedPeerStatePacket.decode(from: ourState.dropFirst()))
         #expect(decodedState.capabilities.contains(.privateMedia))
@@ -69,14 +70,17 @@ struct BLEServicePrivateMediaTests {
         // 4. Our media to a peer that proved the capability is Noise 0x20 — never a 0x22.
         outbound.reset()
         #expect(ble.sendFilePrivate(file, to: peerID, transferId: "t1"))
-        let mediaFrames = await outbound.waitForFrames(ofType: MessageType.noiseEncrypted.rawValue)
-        #expect(!mediaFrames.isEmpty, "the file must leave as a Noise frame")
+        // Wait for the file frame itself, not the first Noise frame: another
+        // session frame (e.g. a receipt for the file from step 3) can leave
+        // first, and CI caught the snapshot taken before the file went out.
+        let mediaPlain = try #require(
+            await outbound.waitForDecrypted(by: peer, from: me) {
+                $0.first == NoisePayloadType.privateFile.rawValue
+            },
+            "the file must leave as a Noise 0x20 frame"
+        )
         #expect(!outbound.snapshot().contains { $0.type == MessageType.fileTransfer.rawValue },
                 "no plaintext 0x22 may be emitted once the peer proved .privateMedia")
-        let mediaPlain = try #require(
-            try mediaFrames.compactMap { try? peer.decrypt($0.payload, from: me) }
-                .first { $0.first == NoisePayloadType.privateFile.rawValue }
-        )
         let received = try #require(BitchatFilePacket.decode(mediaPlain.dropFirst()))
         #expect(received.content == jpeg)
         #expect(received.mimeType == "image/jpeg")
@@ -119,6 +123,38 @@ struct BLEServicePrivateMediaTests {
                 "no encrypted copy may be sent alongside the fallback")
     }
 
+    /// A burst of sends to one peer leaves with distinct timestamps. Receivers
+    /// drop a repeat of `<sender>-<timestamp>-<type>`, and packets stamped from
+    /// `Date()` in the same millisecond collided: payloads queued during a
+    /// handshake and flushed back to back reached the peer as only the first.
+    /// Twenty sends fit in a few milliseconds, so without the per-sender send
+    /// clock several share one.
+    @Test
+    func backToBackSendsToOnePeerNeverShareATimestamp() async throws {
+        let ble = makeService()
+        ble.delegate = CaptureDelegate()
+        let outbound = OutboundCapture()
+        ble._test_outboundObserver = { outbound.append($0) }
+
+        let (peer, peerID) = try await announcedPeer(to: ble)
+        try await completeHandshake(peer: peer, peerID: peerID, with: ble, outbound: outbound)
+        ble._test_drainMessageQueue()
+        outbound.reset()
+
+        let sends = 20
+        for i in 0..<sends {
+            ble.sendPrivateMessage("burst \(i)", to: peerID, recipientNickname: "Peer", messageID: "burst-\(i)")
+        }
+        let arrived = await TestHelpers.waitUntil({
+            outbound.snapshot().filter { $0.type == MessageType.noiseEncrypted.rawValue }.count >= sends
+        }, timeout: TestConstants.defaultTimeout)
+        #expect(arrived, "every send leaves as a Noise frame")
+        let stamps = outbound.snapshot()
+            .filter { $0.type == MessageType.noiseEncrypted.rawValue }
+            .map(\.timestamp)
+        #expect(Set(stamps).count == stamps.count, "timestamps repeat: \(stamps)")
+    }
+
     // MARK: - Fixtures and drivers
 
     /// SOI + APP0 header, filler, EOI: passes the image/jpeg magic check.
@@ -129,7 +165,12 @@ struct BLEServicePrivateMediaTests {
         return d
     }()
 
-    private func now() -> UInt64 { UInt64(Date().timeIntervalSince1970 * 1000) }
+    /// Packets the test's peer sends must not share a millisecond: the service
+    /// drops a repeat of `<sender>-<timestamp>-<type>`, and `Date()` stamped
+    /// the capability proof and the file right after it alike, so the file was
+    /// dropped and never surfaced (main failed that way by its 3rd of 25
+    /// repeats). The peer stamps like a real sender: the unique send clock.
+    private func now() -> UInt64 { PacketSendClock.shared.next() }
 
     /// A reference-style peer (bare Noise service) that has announced itself
     /// to `ble` with a signed full-TTL announce, so its keys are pinned and it
@@ -196,13 +237,6 @@ struct BLEServicePrivateMediaTests {
             ttl: 7
         )
     }
-
-    /// Every Noise frame the service has emitted so far, decrypted by the peer
-    /// in wire order (the window tolerates reordering; we keep order anyway).
-    private func decryptedPayloads(from outbound: OutboundCapture, peer: NoiseEncryptionService, me: PeerID) async -> [Data] {
-        let frames = await outbound.waitForFrames(ofType: MessageType.noiseEncrypted.rawValue)
-        return frames.compactMap { try? peer.decrypt($0.payload, from: me) }
-    }
 }
 
 private func makeService() -> BLEService {
@@ -235,6 +269,32 @@ private final class OutboundCapture: @unchecked Sendable {
     func waitForFrames(ofType type: UInt8) async -> [BitchatPacket] {
         _ = await TestHelpers.waitUntil({ self.snapshot().contains { $0.type == type } }, timeout: TestConstants.defaultTimeout)
         return snapshot().filter { $0.type == type }
+    }
+
+    /// Decrypts the Noise frames emitted since the last `reset()`, in wire
+    /// order and each new one as it arrives, until a plaintext satisfies
+    /// `match`; nil on timeout. Each frame is decrypted exactly once: the
+    /// peer's receive window rejects a replayed nonce, so re-decrypting on
+    /// every poll would drop frames.
+    func waitForDecrypted(
+        by peer: NoiseEncryptionService,
+        from sender: PeerID,
+        where match: (Data) -> Bool
+    ) async -> Data? {
+        let deadline = Date().addingTimeInterval(TestConstants.defaultTimeout)
+        var decrypted = 0
+        while true {
+            let frames = snapshot().filter { $0.type == MessageType.noiseEncrypted.rawValue }
+            while decrypted < frames.count {
+                let frame = frames[decrypted]
+                decrypted += 1
+                if let plain = try? peer.decrypt(frame.payload, from: sender), match(plain) {
+                    return plain
+                }
+            }
+            if Date() >= deadline { return nil }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
     }
 }
 

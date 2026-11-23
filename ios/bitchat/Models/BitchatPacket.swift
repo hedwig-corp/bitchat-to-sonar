@@ -8,6 +8,30 @@
 
 import Foundation
 
+/// Millisecond timestamps for packets this device sends: wall-clock time,
+/// strictly increasing across every packet built in this process.
+///
+/// Receivers drop a packet whose `<sender>-<timestamp>-<type>` they have
+/// already seen (both reference clients and `BLEService`; the Rust engine keys
+/// on sender and timestamp alone). Packets stamped from `Date()` in the same
+/// millisecond collided: payloads queued during a handshake, flushed back to
+/// back once it completes, reached the peer as one message and duplicates of
+/// it, and the rest were dropped. Bumping a collision by 1 ms keeps the wire
+/// format and stays within milliseconds of the clock.
+final class PacketSendClock: @unchecked Sendable {
+    static let shared = PacketSendClock()
+
+    private let lock = NSLock()
+    private var last: UInt64 = 0
+
+    func next(now: Date = Date()) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        last = max(UInt64(now.timeIntervalSince1970 * 1000), last &+ 1)
+        return last
+    }
+}
+
 /// The payload bytes exactly as they arrived on the wire, kept beside the
 /// decoded payload so a re-encode (relay TTL decrement, signature
 /// verification) reproduces the originator's bytes instead of running our own
@@ -97,7 +121,7 @@ struct BitchatPacket: Codable {
         }
         self.senderID = senderData
         self.recipientID = nil
-        self.timestamp = UInt64(Date().timeIntervalSince1970 * 1000) // milliseconds
+        self.timestamp = PacketSendClock.shared.next() // milliseconds, unique per sender
         self.payload = payload
         self.signature = nil
         self.ttl = ttl

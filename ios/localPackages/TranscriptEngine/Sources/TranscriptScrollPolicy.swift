@@ -128,12 +128,39 @@ public enum TranscriptScrollPolicy {
         jumpMessageId: String?,
         lastJumpMessageId: String?,
         expectedNewestDate: Date?,
-        lastExpectedNewestDate: Date?
+        lastExpectedNewestDate: Date?,
+        familyHasOlder: Bool = false,
+        lastFamilyHasOlder: Bool = false
     ) -> Bool {
         guard let contentVersion, contentVersion == lastContentVersion else { return false }
         return unreadCountAtOpen == lastUnreadCountAtOpen
             && jumpMessageId == lastJumpMessageId
             && expectedNewestDate == lastExpectedNewestDate
+            && familyHasOlder == lastFamilyHasOlder
+    }
+
+    /// Do not abandon an unread divider while older fold-family / bak rows
+    /// may still hold incoming unread. Compose `shouldRetireOpenChatUnread`.
+    public static func shouldRetireOpenUnread(
+        unreadAtOpen: UInt64,
+        anchorFound: Bool,
+        feedNewest: Date?,
+        expectedNewest: Date?,
+        familyHasOlder: Bool
+    ) -> Bool {
+        if unreadAtOpen == 0 || anchorFound { return false }
+        if familyHasOlder { return false }
+        if let expected = expectedNewest {
+            let feed = feedNewest ?? .distantPast
+            if feed < expected { return false }
+        }
+        return true
+    }
+
+    /// Keep a Jump target until the parent is in the painted entries.
+    /// Soft-fail must not settle: remainder / family reveal can still admit it.
+    public static func shouldSettleJump(parentVisible: Bool) -> Bool {
+        parentVisible
     }
 
     public static func insetFollowDecision(
@@ -222,8 +249,38 @@ public struct TranscriptTailPinLatch {
     public private(set) var wasPinned = false
     public private(set) var lastItemCount = 0
     public private(set) var lastTailID: String?
+    /// When the reader last sent a message (monotonic seconds) and the append
+    /// it causes has not been followed yet. Signal scrolls to the reader's own
+    /// send even from older history; an incoming append there must not move
+    /// the view, so only an explicit own-send request overrides `wasPinned`.
+    public private(set) var ownSendRequestedAt: TimeInterval?
+    /// The last tail append left unfollowed because the reader was in history.
+    /// A host can learn about the send after the append it caused landed (two
+    /// state changes in one SwiftUI update, either order).
+    private var unfollowedAppendAt: TimeInterval?
+
+    /// A send that appends nothing (it failed) must not leave a request that
+    /// yanks a later incoming message: the request expires.
+    public static let ownSendFollowSeconds: TimeInterval = 5
+    /// How recent an unfollowed append must be to count as this send's echo.
+    public static let ownSendEchoRaceSeconds: TimeInterval = 1
 
     public init() {}
+
+    /// The reader sent from the composer. Returns `.animate` when the send's
+    /// echo already landed unfollowed; otherwise the next tail append within
+    /// `ownSendFollowSeconds` is followed by `itemsChanged`.
+    public mutating func ownSendRequested(at now: TimeInterval) -> TranscriptTailPinAction {
+        if let appended = unfollowedAppendAt, now >= appended,
+           now - appended <= Self.ownSendEchoRaceSeconds {
+            unfollowedAppendAt = nil
+            ownSendRequestedAt = nil
+            wasPinned = true
+            return .animate
+        }
+        ownSendRequestedAt = now
+        return .none
+    }
 
     public mutating func tailVisible(itemCount: Int, tailID: String?) {
         wasPinned = true
@@ -239,12 +296,15 @@ public struct TranscriptTailPinLatch {
         if !isNearBottom { wasPinned = false }
     }
 
+    /// `now` (monotonic seconds) enables the own-send follow; nil keeps the
+    /// plain pin rules for hosts that never send own-send requests.
     public mutating func itemsChanged(
         itemCount: Int,
         tailID: String?,
         isNearBottom: Bool,
         userScrolling: Bool,
-        isPrepending: Bool
+        isPrepending: Bool,
+        now: TimeInterval? = nil
     ) -> TranscriptTailPinAction {
         let appendedAtTail = tailID != lastTailID
         updateSnapshot(itemCount: itemCount, tailID: tailID)
@@ -252,11 +312,23 @@ public struct TranscriptTailPinLatch {
             wasPinned = false
             return .none
         }
+        if appendedAtTail, let requested = ownSendRequestedAt {
+            ownSendRequestedAt = nil
+            if let now, now >= requested, now - requested <= Self.ownSendFollowSeconds {
+                wasPinned = true
+                unfollowedAppendAt = nil
+                return .animate
+            }
+        }
         if userScrolling {
             wasPinned = isNearBottom
             return .none
         }
-        guard wasPinned, appendedAtTail else { return .none }
+        guard wasPinned, appendedAtTail else {
+            if appendedAtTail { unfollowedAppendAt = now }
+            return .none
+        }
+        unfollowedAppendAt = nil
         return .animate
     }
 

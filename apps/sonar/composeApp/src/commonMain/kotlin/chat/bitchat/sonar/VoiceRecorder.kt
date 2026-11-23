@@ -57,6 +57,7 @@ internal fun audioClickAction(
 ): AudioAction = when (phase) {
     MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed -> AudioAction.Download
     MediaTransferPhase.Downloading -> AudioAction.CancelDownload
+    MediaTransferPhase.Unavailable -> AudioAction.Nothing
     MediaTransferPhase.Available -> when {
         unavailable != null -> AudioAction.Nothing
         playing -> AudioAction.Stop

@@ -14,7 +14,7 @@
 #   peers.sh expect <name> <substring> [secs] print the first inbound message JSON
 #                                             containing <substring> and exit 0 the
 #                                             moment it arrives; exit 1 on timeout
-#   peers.sh share-tz <name> <to-npub> <zone> share an IANA zone privately (kind-449
+#   peers.sh share-tz <name> <to-npub> <zone> share an IANA zone privately (encrypted
 #                                             in MLS) with the existing 1:1 chat
 #   peers.sh expect-tz <name> <from-npub> [zone] [secs]
 #                                             exit 0 once <from> has shared a zone

@@ -19,8 +19,9 @@
 # wiped the app under test. Use a SECOND dedicated simulator for
 # `xcodebuild test` (tests clone and reboot their destination).
 #
-# --fresh erases this QA simulator's app (simulators are disposable; real
-# devices are never touched by this script).
+# --fresh erases this QA simulator's app AND resets its keychain, so no
+# earlier account key survives (simulators are disposable; real devices are
+# never touched by this script).
 #
 # Rust core freshness: sonarffi.xcframework is gitignored, so a worktree can
 # carry one built from an OLDER core. An ABI-compatible build links fine and
@@ -156,6 +157,11 @@ fi
 if (( FRESH )); then
   echo ">> erasing the app on QA simulator $UDID" >&2
   xcrun simctl uninstall "$UDID" "$BUNDLE" || true
+  # Uninstall drops the App Group container but keeps the keychain, so the
+  # next launch recovers the old account key (as the app must) and keys a new
+  # store from it. A SONAR_BENCH_NSEC launch derives its key from the env
+  # identity and then cannot open that store: the share smoke never connected.
+  xcrun simctl keychain "$UDID" reset || true
 fi
 xcrun simctl install "$UDID" "$APP"
 

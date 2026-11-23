@@ -562,6 +562,353 @@ nothing by design.
   every iOS notification-extension wake — rebuilt the index, and a failed
   rebuild refused to open the account's chats).
 
+## MDK v1 (0.8) → v2 (v0.14.0) upgrade (#613, MDK v0.14 bump)
+
+Build history on an MDK 0.8 install, then replace it **in place** with the
+#613 build (MDK v0.10.4; it was v0.9.14 until the White Noise interop bump —
+same `0xf2f1` wire, same migration) — never uninstall. "0.9" below and `09` in
+`mdk-upgrade.sh` mean that post-port build. Needs two apps and two CLIs: build `main`
+(pre-#613, 0.8) from a second checkout (`git worktree add --detach <dir>
+<pre-613 commit>`) for both the app and `sonar-cli`, and this branch for the
+0.9 ones. On Android, `scripts/qa/android-mdk-upgrade.sh` runs QA-190…196 and
+QA-210…213 end to end on a disposable emulator; on iOS,
+`scripts/qa/ios-mdk-upgrade.sh` runs the same walk on a dedicated simulator. `scripts/qa/mdk-upgrade.sh` drives the peers (`peer <name> 08|09`,
+`seed`, `upgrade-peer`, `send`/`expect`, `store`). iOS runs headless
+(`SIMCTL_CHILD_SONAR_BENCH_NSEC`, same nsec before and after — the bench path
+derives the DB key from it); Android through `android-ui.sh`. Seed at least one
+chat above 80 messages (the first-paint extract window) and one image.
+
+### QA-190 — In-place upgrade keeps every chat
+- **Platforms:** iOS (headless), Android (UI)
+- **Steps:** 0.8 app with ≥ 3 DMs from 0.8 peers (one > 80 msgs, one image) and
+  a 3+ member room; install the #613 build in place; launch; wait 30 s.
+- **Expect:** first paint shows the same rows, previews and unread dots
+  (`SONAR_BENCH t1_local_paint groups=N`), and they are still there after relay
+  attach (`t4_first_drain`, `home_rows … rows=N`); `mdk-upgrade.sh store` lists
+  `*.mdk08.bak`, `.sonar-transcript.json` and the historical sidecars; sync
+  resumes from its watermark (`sync() called … since_secs=` ≠ 0); no
+  "Group chat · invite" row appears.
+- **Guard:** `persistence.rs::boot_reconcile_keeps_recovered_08_history_and_live_sidecars`
+- **Origin:** i2 (#613) — boot reconcile deleted every live sidecar on each
+  store open: all recovered chats vanished ~1 s after launch, the bak and the
+  transcript were gone, sync restarted from 0 and re-parked old 0.8 welcomes.
+
+### QA-191 — Older recovered history pages in
+- **Platforms:** Android (`android-mdk-upgrade.sh`), iOS (`ios-mdk-upgrade.sh`,
+  85 seeded rows, paged with swipes)
+- **Steps:** open the > 80-message recovered chat right after the upgrade;
+  scroll to the top.
+- **Expect:** reaches message 1 and its 👍, including the rows only in the bak.
+- **Guard:** `TranscriptDisplayPolicyTest.exhaustedSourceDoesNotDemandAnotherExpansion`,
+  `ChatFeedListItemsTest.topTriggerKeyChangesOnlyWhenOlderRowsArePrepended` (R-063),
+  `persistence.rs::a_page_read_racing_the_remainder_drain_still_gets_a_full_page` (R-064)
+- **Origin:** A1 (#613) — every Compose chat stopped after one older page.
+  Then on the MDK v0.14 bump (R-063): on a loaded emulator paging stopped
+  after the first older page again, stuck at row 27–33 of 85 for minutes,
+  while a quiet run paged to the top. The load-older trigger fired on an
+  at-top flag that never turned false when the anchor restore read a stale
+  item list. Not migration-specific: any chat on a slow device. Then on iOS
+  (1 of 6 walk runs) the page stopped at row 7 when it raced the idle bak
+  drain, which hid the pending remainder while copying (R-064, core).
+
+### QA-192 — Send in a recovered chat once the peer updated
+- **Platforms:** Android (UI); iOS covered by core e2e (no headless send)
+- **Steps:** `mdk-upgrade.sh upgrade-peer <peer>`; send from the recovered row.
+- **Expect:** "Sent · internet"; the peer's 0.9 CLI receives it; one row on
+  Home; the new message sits under the recovered history.
+- **Guard:** `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
+
+### QA-193 — Peer still on 0.8
+- **Platforms:** Android (`android-mdk-upgrade.sh`), iOS (`ios-mdk-upgrade.sh`)
+- **Steps:** send in the recovered chat of a peer who has not upgraded.
+- **Expect:** "Waiting for them to update Sonar" banner; no second row; no
+  wipe. (The peer's own 0.8 sends never arrive — flag-day by design.)
+- **Guard:** `e2e.rs::recovered_08_resume_with_a_peer_still_on_08_waits_for_their_update`,
+  `SendFailureErrorTextTests.theFailureCallbackSeesTheSendsError` (iOS)
+- **Origin:** A2 (#613) — the peer's 0.8 KeyPackage reached MDK 0.9 and the
+  send failed with an opaque error and "Couldn't send". On iOS (first checked
+  by the MDK v0.14 upgrade walk) the banner never showed: the send's catch
+  called the store's failure callback before setting `errorText`, so the store
+  read nil, and the discarded echo made the message vanish silently.
+
+### QA-194 — Upgraded peer messages first
+- **Platforms:** iOS (headless), Android
+- **Steps:** `upgrade-peer <peer>`; the peer sends to the app.
+- **Expect:** the 0.9 DM auto-joins and folds onto the recovered row — still
+  one row, now previewing the new message; `.sonar-historical-folds.json` maps
+  hist → live; unchanged after a cold restart. Several contacts resuming within
+  10 minutes all fold (the unknown-sender budget does not apply to them).
+- **Guard:** `persistence.rs::recovered_08_contact_resume_welcome_bypasses_the_stranger_budget`
+- **Origin:** i3 (#613) — recovered contacts counted as strangers.
+
+### QA-195 — A recovered room stays a room
+- **Platforms:** Android (UI)
+- **Steps:** send in a recovered 3+ member room with one member upgraded.
+- **Expect:** title and "only group members" banner kept; the upgraded member
+  receives it in a group with the same name; no fold onto a 1:1.
+- **Guard:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm` (R-060)
+
+### QA-196 — Chat history is sealed at rest
+- **Platforms:** both (file check on the simulator App Group / `run-as`)
+- **Steps:** after QA-190/074, `grep` a message body in the store directory.
+- **Expect:** no match in `.sonar-transcript.json` / `.sonar-transcript.log`.
+- **Guard:** `marmot.rs::transcript_rows_are_sealed_at_rest_and_survive_reopen`
+- **Origin:** P1 (#613) — the 0.9 transcript was plaintext JSON and rewritten
+  whole per message (17 ms at 10k rows).
+
+### QA-197 — The checked-in Swift binding matches the core
+- **Platforms:** iOS (CI: *Checked-in SonarFFI.swift matches the core*)
+- **Expect:** `core/build-ios.sh` leaves `git status` clean.
+- **Origin:** i1 (#613) — edited `///` doc comments moved two UniFFI checksums;
+  a build from the committed binding would fatalError at launch.
+
+### QA-208 — A real v1 store migrates, and its history moves into the v2 chat
+- **Platforms:** core, both apps' path (headless, `sonar-cli` on a local relay)
+- **Steps:** `V1_CLI=<main's MDK 0.8 sonar-cli> scripts/qa/mdk-upgrade-e2e.sh`.
+  Two peers trade texts and a 👍 on v1; the v2 CLI then opens the same homes
+  (the real MDK 0.8 SQLCipher stores); one peer sends on v2, the other
+  listens and replies.
+- **Expect:** `RESULT … fail=0`: each v1 store is quarantined as
+  `*.mdk08.bak`; its decrypted rows and the reaction land in sealed sidecars
+  (no plaintext on disk); the first v2 send makes ONE v2 DM both peers join;
+  each side's v1 history, with the 👍, pages inside that v2 chat; replies flow
+  both ways; neither side lists a second chat.
+- **Guard:** `mdk08_migrate::v1_reactions_move_into_the_reaction_index`,
+  `marmot::message_identity_tests::a_message_has_one_id_for_sender_and_receiver`,
+  `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
+- **Origin:** MDK v0.14 bump — the hand-written v1 fixtures only model the
+  0.8 schema; this runs the real one. One-shot CLI verbs can exit before a
+  live welcome lands, so the receiving side uses `listen`.
+
+### QA-210 — The v1 Note to Self becomes the v2 one, not a second row
+- **Platforms:** both (Android: `scripts/qa/android-mdk-upgrade.sh`)
+- **Steps:** onboard on the v1 (MDK 0.8) app, so it ensures its Note to Self;
+  install the v2 build in place; open Messages; open Note to Self and send.
+- **Expect:** exactly one "Note to Self" row; the note sends; any v1 notes page
+  inside it.
+- **Guard:** `client.rs::the_v1_note_to_self_folds_onto_the_v2_one`,
+  `client.rs::a_send_into_the_v1_note_to_self_lands_in_the_v2_one`
+- **Origin:** QA on the MDK v0.14 bump (Android emulator, in-place upgrade):
+  Note to Self landed on main after #613, so the recovered v1 Note to Self
+  stayed a second row next to a new v2 one, and could not send (no peers to
+  resume with). It now folds onto the v2 Note to Self like any recovered chat.
+
+### QA-211 — The first v2 launch does not flood the log on Android
+- **Platforms:** Android (`scripts/qa/android-mdk-upgrade.sh`)
+- **Steps:** install the v2 build over a v1 install with history; launch;
+  count `sqlcipher_mlock` lines in logcat from that launch.
+- **Expect:** under 1,000 (0 today). Messages paints from local state.
+- **Guard:** `marmot.rs::sqlcipher_memory_security_stays_off_after_an_engine_opens`
+  (opens a real engine, then reads SQLCipher's process-wide setting); the log
+  count itself is checked by the script only.
+- **Origin:** QA on the MDK v0.14 bump: v0.14 turns SQLCipher
+  `cipher_memory_security` on by default. Every `mlock` fails on Android, and
+  SQLCipher logs each failure: about 1M lines on the first launch and 31k on
+  every cold start, against about 35 on v1. Android opted out first. On the
+  other platforms the `mlock` calls succeed but cost a syscall pair per SQLite
+  allocation in the whole process: release `sonar-sim group-scale` on macOS
+  took 74 s with it on against 26 s off, and 2-member group creation ~750 ms
+  against ~240 ms. v1 never ran with it, so Sonar now turns it off on every
+  platform (`marmot.rs::sonar_storage_options`).
+
+### QA-213 — A send from older history scrolls into view
+- **Platforms:** both (`android-mdk-upgrade.sh`, `ios-mdk-upgrade.sh`)
+- **Steps:** in a long chat, scroll up into older messages; send from the
+  composer without scrolling back.
+- **Expect:** the view moves to the bottom and the sent message is on
+  screen. An incoming message while you read history still leaves the view
+  where it is.
+- **Guard:** `TranscriptScrollPolicyTests.ownSendFromHistoryFollowsItsEcho`
+  (+ `ownSendAfterItsEchoLandedStillFollows`,
+  `incomingAppendWhileReadingHistoryStaysPut`,
+  `anExpiredOwnSendRequestDoesNotFollowLaterIncoming`),
+  `ChatFeedListItemsTest.ownSendFollowsOnlyANewSendInTheOpenChat`
+- **Origin:** the MDK v0.14 upgrade walk (85-message chat), on both apps and
+  on `main`: the message was sent and appended but stayed off-screen, so it
+  looked unsent. The tail-pin rules only followed appends when the reader was
+  already at the bottom. Signal scrolls to your send. The screens now bump an
+  own-send revision on each composer send (text, sticker, voice); iOS's
+  `TranscriptTailPinLatch.ownSendRequested` follows its echo (either order,
+  expiring after 5 s so a failed send cannot yank a later incoming message),
+  and Compose scrolls to the tail on `SonarAppState.lastOwnSend`.
+
+### QA-214 — A received photo keeps its shape
+- **Platforms:** both (Android: `android-smoke.sh` QA-106 sends a 320×180
+  photo and checks the bubble; iOS: the same photo from `scripts/qa/peers.sh
+  send-image`, then a `tree` dump of the chat)
+- **Steps:** a peer sends a landscape photo; open the chat.
+- **Expect:** the bubble has the photo's aspect ratio (16:9 here) from first
+  paint, before the blob is downloaded; no grey bars above and below.
+- **Guard:** `media.rs::media_sends_over_white_noise_end_to_end` (the
+  receiver's media reference carries the sender's size; fails without the
+  fix), `media_dimensions::tests` (PNG, GIF, WebP, JPEG + EXIF orientation,
+  truncated input)
+- **Origin:** the stability round on the MDK v0.14 bump (QA-106 failed "no 😮
+  chip under the photo"): the photo was drawn letterboxed in the app's largest
+  media box, 660 px tall for a 320×180 image. MDK 0.8 filled the MIP-04 `dim`
+  field by decoding the image; the v2 port encrypted without it, so every
+  photo Sonar sent arrived without a size and both apps fell back to the max
+  box. `media_crypto::encrypt_with_scheme` now reads the size from the image
+  header (`media_dimensions.rs`, no decode). `blurhash` stays out: MIP-04 v2
+  rejects it.
+
+### QA-215 — A burst of mesh messages to one peer all arrive
+- **Platforms:** both (mesh). iOS sender: `BLEService`; Android/desktop
+  sender: the Rust engine.
+- **Steps:** with two phones in range, send several private messages (or
+  public channel messages) in quick succession, or while the Noise handshake
+  is still running so they queue and flush together.
+- **Expect:** every message arrives, once, in order.
+- **Guard:** `BLEServicePrivateMediaTests.backToBackSendsToOnePeerNeverShareATimestamp`
+  (20 back-to-back sends leave with distinct timestamps),
+  `mesh_engine::tests::two_broadcasts_in_one_tick_both_arrive` (two-engine:
+  both arrive; only the first without the fix), `wire_timestamps_never_repeat`.
+- **Origin:** the stability round on the MDK v0.14 bump, chasing a flake in
+  `handshakeProvesCapabilitiesAndMediaGoesEncrypted` (main's version failed by
+  its 3rd of 25 repeats). Receivers drop a repeat of
+  `<sender>-<timestamp>-<type>` (iOS, both reference clients; the Rust engine
+  keys public messages on sender + timestamp), and both Sonar senders stamped
+  packets from the clock: every packet built in the same millisecond (iOS) or
+  the same driver tick (Rust) shared a timestamp, and all but the first were
+  dropped. The test's own peer hit it with its capability proof and file;
+  the apps hit it flushing payloads queued during a handshake and sending
+  bursts. Senders now keep their timestamps strictly increasing
+  (`PacketSendClock`, `Engine::wall`; `core/bitchat-protocol/SPEC.md` §1).
+  **Not guarded:** stock bitchat clients still stamp from the clock; a burst
+  they send can still lose packets at any receiver.
+
+### QA-212 — A v1 chat that folds while it is open keeps following
+- **Platforms:** iOS (headless: `ios-drive.sh` + `mdk-upgrade.sh`), Android
+  (`android-mdk-upgrade.sh`, QA-192b)
+- **Steps:** after the in-place upgrade, open a v1 chat whose peer has not
+  updated; `upgrade-peer <peer>`; wait ~15 s; send from the open chat; the
+  peer replies; stay in the chat. Then Back, and tap the chat's row.
+- **Expect:** the reply paints in the open chat within seconds, under the v1
+  history and the app's v2 send; Back then the row tap opens the chat.
+- **Guard:** `FoldHopVisibleTranscriptTests` (iOS, drives
+  `remountFoldedNavigationPath`)
+- **Origin:** app-level upgrade walk on the MDK v0.14 bump (R-062). On iOS the
+  fold rewrote the visible `.dm(v1)` route to `.dm(live)` in place, so the
+  live transcript never followed the store (the reply only showed after a
+  reopen), and the open state stayed on the v1 id: after Back the row tap
+  logged `chat_open … path=already-open` and did nothing.
+
+## White Noise interop (#613)
+
+White Noise iOS runs MDK's own runtime (marmot-app). The pinned MDK checkout
+ships its CLI (`wn`/`wnd`) on the same runtime, so `scripts/qa/wn-interop.sh`
+drives it against `sonar-cli` headlessly: `setup`, then `run [--members N]`,
+which prints PASS/FAIL per id below. It needs a relay both clients share that
+serves kind-1059 without NIP-42 and accepts 64 KiB events (see the script
+header). Not covered: the White Noise iOS app UI and push, public-relay
+overlap, NIP-42 inbox relays.
+
+### QA-198 — White Noise starts a DM with a Sonar user
+- **Platforms:** core (both apps)
+- **Expect:** `wn groups create "" <sonar-npub>` succeeds; the Sonar user
+  auto-joins and receives the message.
+- **Guard:** `key_package_tags_match_white_noise_validation`,
+  `key_package_offers_what_white_noise_requires_of_members`,
+  `publishing_the_key_package_publishes_inbox_and_key_package_relay_lists`
+- **Origin:** W1–W3 (#613): White Noise rejected every Sonar KeyPackage
+  (`app_components` tag held `0x0001`), then required capabilities Sonar did
+  not advertise, then had no kind-10050 inbox to deliver the welcome to.
+  W6: White Noise on MDK v0.9.21+ (iOS ships v0.10.4) rejects an invitee
+  KeyPackage that lists a default MLS capability, and every MDK 0.9.14
+  package listed `0x0003` — fixed by the bump to v0.10.4
+  (`key_package_lists_no_default_mls_capabilities`). Run the matrix against a
+  `wn` built from the MDK tag White Noise iOS pins, not only Sonar's own pin.
+
+### QA-199 — The Sonar reply stays in White Noise's DM
+- **Platforms:** core
+- **Expect:** `sonar-cli send --to <wn-npub>` reuses the chat White Noise
+  created; White Noise shows the reply in it.
+
+### QA-200 — Sonar starts a DM with a White Noise user
+- **Platforms:** core
+- **Expect:** White Noise lists the invite; after `groups accept` both sides
+  exchange messages (White Noise catches up the first one on its next sync).
+
+### QA-201 — A White Noise group with Sonar members
+- **Platforms:** core
+- **Expect:** every Sonar member joins and sees every message; White Noise sees
+  the Sonar members' messages within ~10 s (its daemon ingests on its own
+  cadence).
+
+### QA-202 — A Sonar group with a White Noise member
+- **Platforms:** core
+- **Expect:** White Noise accepts and messages flow every way; `wn groups show`
+  reports the encrypted-media component `0x800b` as required.
+- **Guard:** `groups_sonar_creates_require_encrypted_media_v2`
+- **Origin:** W5 (#613): without it White Noise refuses media in the group
+  ("group does not require encrypted media").
+
+### QA-203 — Encrypted media both ways
+- **Platforms:** core
+- **Expect:** a Sonar photo downloads and decrypts in White Noise, and a White
+  Noise photo in a Sonar group decrypts in Sonar, byte-identical both ways.
+- **Guard:** `new_uploads_use_the_layout_white_noise_parses`,
+  `a_white_noise_tag_parses`, `mip04_uploads_keep_their_layout_and_open`
+- **Origin:** W4 (#613): Sonar sent MIP-04 `mip04-v2` tags White Noise could not
+  read (empty bubble) and dropped White Noise's `encrypted-media-v2` photos
+  (caption only).
+
+### QA-204 — A member's leave reaches everyone
+- **Platforms:** core (both apps)
+- **Expect:** after a Sonar member leaves, the remaining members' rosters (Sonar
+  and White Noise) drop it within seconds, with no further input.
+- **Guard:** `a_members_leave_is_committed_by_the_remaining_members`,
+  `a_leave_queued_behind_a_converging_commit_still_produces_its_proposal`
+- **Origin:** L1 (#613): MDK 0.9 commits a SelfRemove only from a convergence
+  pass Sonar never ran, so the leaver stayed in every roster.
+- **Not guarded:** White Noise's own `wn groups leave` proposals are deferred
+  by every client, White Noise included (upstream, see Known gaps).
+
+### QA-205 — 25-member groups both ways
+- **Platforms:** core
+- **Expect:** a 25-member group created by either side: every member joins,
+  receives the creator's message, and replies reach everyone.
+- **Guard:** `sonar-sim group-scale` (docs/GROUP-SCALE-SIM.md) for the ceiling.
+
+### QA-206 — A White Noise member's own leave reaches the Sonar members
+- **Platforms:** core (both apps)
+- **Steps:** a Sonar user creates a group with a White Noise user and a second
+  Sonar user; everyone joins; the White Noise user runs `wn groups leave`.
+- **Expect:** both Sonar members' rosters drop to 2 within a minute, with no
+  further input (one of them commits the SelfRemove from its convergence pass).
+- **Guard:** `wn-interop.sh run` (QA-206); core
+  `a_members_leave_is_committed_by_the_remaining_members` for the Sonar side.
+- **Origin:** #613 bump to MDK v0.10.4. With the 0.9.14 `wn` and Sonar,
+  every client deferred a White Noise leave (upstream marmot-protocol/mdk#1736,
+  fixed in v0.9.19).
+
+### QA-207 — A Sonar timezone share stays invisible in White Noise
+- **Platforms:** core (both apps)
+- **Steps:** in a White Noise group with two Sonar members, one Sonar member
+  shares its zone (`sonar-cli timezone share --group`).
+- **Expect:** the other Sonar member caches the zone; White Noise's chat keeps
+  the same unread count, last message and list position.
+- **Guard:** `wn-interop.sh run` (QA-207); core
+  `timezone_share_kind_is_not_a_marmot_protocol_kind`,
+  `a_timezone_share_needs_our_kind_and_our_d_tag`
+- **Origin:** #613 merge of #607: the share was kind 449, which the MDK 0.10
+  profile reserves for MIP-05 push-token removal, so White Noise members read
+  each share as one. Now kind 30078 with a `sonar/local-time` `d` tag.
+
+### QA-209 — One message id on Sonar and White Noise; reactions both ways
+- **Platforms:** core (both apps), headless (`wn-interop.sh run`)
+- **Steps:** in a White Noise group with a Sonar member: White Noise reacts 🔥
+  to the Sonar member's message; White Noise posts, the Sonar member reacts 👍.
+- **Expect:** the Sonar row id appears in White Noise's own list; the 🔥 tallies
+  on the Sonar row; White Noise's 👍 kind-7 `e` tag names its own id for the
+  target.
+- **Guard:** `wn-interop.sh run` (QA-209); core
+  `marmot::message_identity_tests::a_message_has_one_id_for_sender_and_receiver`
+- **Origin:** MDK v0.14 bump — the #613 port keyed sent rows by the kind-445
+  wrapper id and received rows by MDK's MLS-level `message_id`, so reactions
+  and replies never resolved across devices or with White Noise. Rows are now
+  keyed by the inner app-event id White Noise uses.
+
 ## Notifications and lifecycle
 
 ### QA-020 — Background receive
@@ -787,6 +1134,18 @@ unread. See `docs/CHAT-TYPES.md`.
   iOS had the same two gaps (the Message/Call/Pay/Verify circles and the
   placeholder-only search field); the 2026-09-27 sweep of all of the above,
   reaction chips included, is clean.
+- **Clipped rows (2026-11-07, MDK v0.14 stability round):** the chat sweep
+  failed intermittently with one NAF `View` at the list's bottom edge: the
+  transcript row (the node with the long-press menu and Reply/Copy actions)
+  had no label of its own and borrowed its bubble's, so when the list clipped
+  the bubble off-screen and a sliver of the row stayed visible, TalkBack met
+  an actionable node with nothing to read. Compose rows now carry their own
+  label (author, message or kind, time, delivery state), as iOS's
+  `SNTextBubbleCell` already did. Reproduce: a chat longer than the screen,
+  `android-ui.sh swipe 540 1100 540 1290` a step at a time, `naf` after each.
+  Guard: `MessageRowLabelUiTest` (fails without the label). The harness's
+  `find`/`boundst` now return the innermost match, since a row's label repeats
+  its bubble's text.
 - **Also:** every settings toggle is a switch that reports its state
   (uiautomator `checkable="true"` and `checked` match the switch; VoiceOver
   reads "On"/"Off"). `android-smoke.sh` QA-043 checks "Share local time" is a
@@ -802,8 +1161,10 @@ unread. See `docs/CHAT-TYPES.md`.
 
 ## Private local time (#607)
 
-Kind-449 timezone shares ride inside MLS (kind 445), never as a transcript
-row. `peers.sh share-tz` / `expect-tz` drive the peer side: a CLI peer can
+Timezone shares ride inside MLS (kind 445) as a kind-30078 app event with a
+`d` tag of `sonar/local-time`, never as a transcript row. The first version
+used kind 449, which the MDK 0.10 profile reserves for push-token removal
+(MIP-05); #613 moved it off (QA-095). `peers.sh share-tz` / `expect-tz` drive the peer side: a CLI peer can
 share a zone with the app and report the zone the app shared with it.
 
 ### QA-070 — Sharing is off by default
@@ -885,7 +1246,7 @@ share a zone with the app and report the zone the app shared with it.
   same zone sends nothing. A real zone change still arrives.
 - **Guard:** `client.rs::timezone_share_is_not_repeated_after_restart`
 - **Origin:** A1/i2 (#607 QA — every launch, and every iOS store reopen,
-  re-encrypted a kind-449 into every allowed group: 37 per launch)
+  re-encrypted a timezone share into every allowed group: 37 per launch)
 
 ### QA-093 — Turning sharing off withdraws your time
 - **Platforms:** both (Android automated; iOS manual)
@@ -966,6 +1327,14 @@ share a zone with the app and report the zone the app shared with it.
   pass; ~200–300 `relay EOSE` lines/min). A number over budget is only a
   finding when a `main` build on the same emulator/account measures lower.
 - **How:** `android-smoke.sh` QA-050
+- **Also seen (#613, 2026-09-26):** 16–21 % on the Android emulator, with
+  location off. The account had a recovered 0.8 room with a member who never
+  updated, and `reconcile_historical_resume_members` re-queried that member's
+  KeyPackage on every relay on every idle tick (logcat: `peer only publishes
+  MDK 0.8 KeyPackages` about every 10 s, ~300 `relay EOSE` lines a minute).
+  No `main` control exists: `main` cannot open an upgraded store. Fixed with a
+  5-minute per-member probe floor ·
+  `e2e.rs::recovered_08_leftover_member_is_not_reprobed_on_every_idle_tick`.
 
 ### QA-160 — A ~400-group account stays responsive and catches up
 - **Platforms:** iOS simulator (automated). **Android: not covered yet.** Its
@@ -1782,6 +2151,36 @@ real mint and need the maintainer's approval of the amounts.
   `record_backup_success`, so their next identical seal was not skipped. At
   `--test-threads 64`, 9 of 40 runs of the backup tests failed, across five
   tests. The clock was not involved: the unchanged-backup window is 7 days.
+
+## Known gaps found by passes (tracked, not fixed here)
+
+- **Compose load-older stops early (main too):** a chat opened at its unread
+  anchor never loads older rows, and a read chat stops after the second older
+  page (`firstVisibleItemIndex <= 2` never re-arms after a prepend). Seen on the
+  `main` build in the #613 pass; not caused by #613. **The re-arm is fixed by
+  R-063** (the trigger keys on the oldest row while at the top). The upgrade
+  walks open an unread 85-message chat and page it to message 1, but the
+  unread-anchor case on `main` was not re-checked on its own.
+- **Mesh realtime loop saturates the UI thread (main too):** with other BLE
+  mesh peers in range (other agents' emulators) `startMeshRealtimeLoop` ran on
+  the main dispatcher long enough to ANR the app. Turn Bluetooth off on a QA
+  emulator that shares a host with other emulators.
+- **White Noise's own leave was never committed (upstream, fixed):** with the
+  MDK 0.9.14 `wn` CLI, a `wn groups leave` SelfRemove proposal was deferred
+  (`TransportDeferred`) by every client, White Noise's own members included.
+  Upstream marmot-protocol/mdk#1736, fixed by #1746 and released in v0.9.19. Not
+  reproduced with the v0.10.4 `wn`. Sonar's own leave is committed by Sonar
+  and White Noise members alike (QA-204).
+- **Sonar sends welcomes to its own relays only:** White Noise reads welcomes
+  from its kind-10050 inbox relays. Invites reach White Noise users through the
+  usual shared relays (damus, primal, nos.lol); a White Noise user whose inbox
+  relays share none with Sonar's would miss them. Publish welcomes to the
+  invitee's kind-10050 relays too.
+- **Queued sends fail instead of waiting:** MDK queues a send made while a
+  commit is still converging (the ~1.1 s after a membership change) and
+  regenerates it later. Sonar reports that send as failed ("send produced no
+  application message") and does not publish the regenerated message. Leave
+  is handled (QA-204); sends need the same queued-intent lifecycle.
 
 ## Open questions (need a product decision, not a fix)
 

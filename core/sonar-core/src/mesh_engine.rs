@@ -312,6 +312,8 @@ pub struct Engine {
     /// wire would hand peers uptime-scale timestamps. The driver syncs this
     /// offset (wall − monotonic) at start and on every tick.
     wall_minus_mono_ms: i64,
+    /// The last wire timestamp this engine stamped; see [`Self::wall`].
+    last_stamp_ms: u64,
     /// Monotonic per-send counter mixed into fragment ids so two fragmented
     /// sends in the same millisecond cannot collide.
     fragment_seq: u64,
@@ -364,6 +366,7 @@ impl Engine {
             last_tick_ms: 0,
             last_refresh_ms: HashMap::new(),
             wall_minus_mono_ms: 0,
+            last_stamp_ms: 0,
             fragment_seq: 0,
         })
     }
@@ -379,9 +382,20 @@ impl Engine {
         self.wall_minus_mono_ms = wall_ms as i64 - now_ms as i64;
     }
 
-    /// The wall-clock time to stamp into a wire packet built "now".
-    fn wall(&self, now_ms: u64) -> u64 {
-        (now_ms as i64 + self.wall_minus_mono_ms).max(0) as u64
+    /// The wall-clock time to stamp into a wire packet built "now", strictly
+    /// increasing across every packet this engine builds.
+    ///
+    /// Receivers drop a repeat of `<sender>-<timestamp>-<type>` (iOS and both
+    /// reference clients; this engine keys public messages on sender and
+    /// timestamp alone). Every packet built in one driver tick got the same
+    /// `now_ms`, so a burst to one peer (the capability proof and the payloads
+    /// queued during a handshake) shared one timestamp and arrived as its
+    /// first packet only. A collision is bumped by 1 ms: same wire format,
+    /// within milliseconds of the clock.
+    fn wall(&mut self, now_ms: u64) -> u64 {
+        let wall = (now_ms as i64 + self.wall_minus_mono_ms).max(0) as u64;
+        self.last_stamp_ms = wall.max(self.last_stamp_ms.saturating_add(1));
+        self.last_stamp_ms
     }
 
     /// Dialer election between two node-id-advertising Sonar-Androids: the
@@ -1128,7 +1142,7 @@ impl Engine {
         }
     }
 
-    fn announce_bytes(&self, now_ms: u64) -> Option<Vec<u8>> {
+    fn announce_bytes(&mut self, now_ms: u64) -> Option<Vec<u8>> {
         if self.nickname.is_empty() {
             return None;
         }
@@ -1147,7 +1161,7 @@ impl Engine {
         packet.encode_wire()
     }
 
-    fn sonar_bytes(&self, now_ms: u64) -> Option<Vec<u8>> {
+    fn sonar_bytes(&mut self, now_ms: u64) -> Option<Vec<u8>> {
         let payload = self.sonar_payload.clone()?;
         // Signed with the same Ed25519 key as the announce — iOS rejects an
         // unsigned 0x53 as unverified.
@@ -1206,7 +1220,7 @@ impl Engine {
         out
     }
 
-    fn discovery_to_route(&self, route: &Origin, now_ms: u64) -> Output {
+    fn discovery_to_route(&mut self, route: &Origin, now_ms: u64) -> Output {
         let mut out = Output::default();
         let ann = self.announce_bytes(now_ms);
         let sonar = self.sonar_bytes(now_ms);
@@ -2338,6 +2352,45 @@ mod tests {
         (a_events, b_events)
     }
 
+    /// Two public messages sent in one driver tick reach the peer as two.
+    /// Every packet built in a tick took the same timestamp, and receivers key
+    /// public messages on sender + timestamp (this engine) or sender +
+    /// timestamp + type (iOS, the reference clients), so the second was
+    /// dropped as a duplicate. The same held for a burst of private payloads.
+    #[test]
+    fn two_broadcasts_in_one_tick_both_arrive() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(2, "iphone");
+        let now = 1_000;
+        let link = establish(&mut a, &mut b, "84:2F", 34, now);
+        let mut out = a.broadcast("first", now).expect("first broadcast");
+        out.merge(a.broadcast("second", now).expect("second broadcast"));
+        let (_, b_events) = pump(&mut a, &link, &mut b, "droid", out, now);
+        let got: Vec<&str> = b_events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::BroadcastReceived { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, ["first", "second"]);
+    }
+
+    /// Wire timestamps stay strictly increasing when the tick repeats or the
+    /// wall clock steps back (an NTP correction), and track the clock otherwise.
+    #[test]
+    fn wire_timestamps_never_repeat() {
+        let mut e = engine(3, "clock");
+        e.set_wall_clock(1_000, 1_700_000_000_000);
+        let first = e.wall(1_000);
+        assert_eq!(first, 1_700_000_000_000);
+        assert_eq!(e.wall(1_000), first + 1);
+        assert_eq!(e.wall(1_000), first + 2);
+        e.set_wall_clock(1_000, 1_699_999_999_000); // clock stepped back 1 s
+        assert_eq!(e.wall(1_000), first + 3);
+        assert_eq!(e.wall(6_000), 1_700_000_004_000, "back on the clock once it passes");
+    }
+
     /// Drive A (central) fully up against B (peripheral): dial, discover one
     /// instance, subscribe, exchange announces, complete the Noise handshake.
     fn establish(a: &mut Engine, b: &mut Engine, conn: &str, instance: i32, now: u64) -> LinkId {
@@ -2526,7 +2579,7 @@ mod tests {
     fn replayed_announce_cannot_bind_an_attacker_link_to_the_victim_route() {
         let mut a = engine(1, "pixel");
         let mut attacker = engine(7, "attacker");
-        let victim = engine(9, "victim");
+        let mut victim = engine(9, "victim");
         let victim_fp = fp_of(&victim);
         let now = 1_000;
         let (conn, instance) = ("84:2F", 34);
@@ -2581,7 +2634,7 @@ mod tests {
     fn late_replayed_announce_cannot_move_an_authenticated_link() {
         let mut attacker = engine(7, "attacker");
         let mut a = engine(1, "pixel");
-        let victim = engine(9, "victim");
+        let mut victim = engine(9, "victim");
         let (victim_fp, attacker_fp) = (fp_of(&victim), fp_of(&attacker));
         let now = 1_000;
 
@@ -2834,8 +2887,8 @@ mod tests {
     #[test]
     fn two_instances_on_one_connection_are_distinct_peers() {
         let mut a = engine(1, "pixel");
-        let sonar_mac = engine(5, "Vincenzo-Mac");
-        let bitchat_mac = engine(9, "vincent-osx");
+        let mut sonar_mac = engine(5, "Vincenzo-Mac");
+        let mut bitchat_mac = engine(9, "vincent-osx");
         let now = 1_000;
         a.on_dial_request("84:2F", now);
         a.on_client_connected("84:2F", now);
@@ -2865,8 +2918,8 @@ mod tests {
     #[test]
     fn dead_instance_culls_itself_while_sibling_lives() {
         let mut a = engine(1, "pixel");
-        let sonar_mac = engine(5, "Vincenzo-Mac");
-        let bitchat_mac = engine(9, "vincent-osx");
+        let mut sonar_mac = engine(5, "Vincenzo-Mac");
+        let mut bitchat_mac = engine(9, "vincent-osx");
         let now = 10_000;
         a.on_dial_request("84:2F", now);
         a.on_client_connected("84:2F", now);
@@ -2909,7 +2962,7 @@ mod tests {
     #[test]
     fn freeze_resume_does_not_cull() {
         let mut a = engine(1, "pixel");
-        let peer = engine(5, "mac");
+        let mut peer = engine(5, "mac");
         let now = 10_000;
         a.on_dial_request("84:2F", now);
         a.on_client_connected("84:2F", now);
@@ -3009,7 +3062,7 @@ mod tests {
     #[test]
     fn relayed_announce_lists_but_does_not_bind_or_handshake() {
         let mut a = engine(1, "pixel");
-        let far = engine(7, "far-peer");
+        let mut far = engine(7, "far-peer");
         let now = 1_000;
         a.on_dial_request("relay", now);
         a.on_client_connected("relay", now);
@@ -3084,7 +3137,7 @@ mod tests {
     fn allowlist_drops_disallowed_instance_but_keeps_sibling() {
         let mut a = engine(1, "pixel");
         let mut sonar_mac = engine(5, "Vincenzo-Mac");
-        let bitchat_mac = engine(9, "vincent-osx");
+        let mut bitchat_mac = engine(9, "vincent-osx");
         let now = 1_000;
         a.on_dial_request("84:2F", now);
         a.on_client_connected("84:2F", now);
@@ -3127,8 +3180,8 @@ mod tests {
         let mut sk = [0u8; 32];
         sk.copy_from_slice(&kp.private);
         let pk = hex::encode(&kp.public);
-        let e1 = Engine::new(sk, pk.clone(), [11u8; 32], "p".into()).unwrap();
-        let e2 = Engine::new(sk, pk, [22u8; 32], "p".into()).unwrap();
+        let mut e1 = Engine::new(sk, pk.clone(), [11u8; 32], "p".into()).unwrap();
+        let mut e2 = Engine::new(sk, pk, [22u8; 32], "p".into()).unwrap();
         let a1 = e1.announce_bytes(now).unwrap();
         let a2 = e2.announce_bytes(now).unwrap();
         assert!(!a.on_client_rx("84:2F", 7, &a1, now).events.is_empty());
@@ -3172,7 +3225,7 @@ mod tests {
         // re-subscribe and initiate — otherwise the peer is unreachable for
         // DMs until the whole connection drops.
         let mut a = engine(1, "pixel");
-        let peer = engine(9, "vincent-osx");
+        let mut peer = engine(9, "vincent-osx");
         let now = 1_000;
         a.on_dial_request("84:2F", now);
         a.on_client_connected("84:2F", now);
@@ -3180,7 +3233,7 @@ mod tests {
         a.on_subscribe_result("84:2F", 25, true, now);
         // Complete the dial with the OTHER app's announce so the connection
         // survives the announce deadline.
-        let sonar_mac = engine(5, "Vincenzo-Mac");
+        let mut sonar_mac = engine(5, "Vincenzo-Mac");
         let ann = sonar_mac.announce_bytes(now).unwrap();
         a.on_client_rx("84:2F", 25, &ann, now);
         // vincent-osx announces via the server leg (same handle on Android).
@@ -3428,7 +3481,7 @@ mod tests {
     #[test]
     fn compressed_announce_from_a_reference_encoder_is_accepted() {
         let mut a = engine(1, "pixel");
-        let b = engine(9, &"iphone-".repeat(18));
+        let mut b = engine(9, &"iphone-".repeat(18));
         let ann = b.announce_bytes(1_000).expect("announce");
         assert_ne!(ann[11] & mesh::flags::IS_COMPRESSED, 0, "fixture must be a compressed frame");
         a.on_dial_request("84:2F", 1_000);
@@ -3447,7 +3500,7 @@ mod tests {
     /// padded to a PKCS#7 bucket, everything else travels at natural length.
     #[test]
     fn only_noise_frames_are_padded_on_the_wire() {
-        let a = engine(1, "pixel");
+        let mut a = engine(1, "pixel");
         let ann = a.announce_bytes(1_000).unwrap();
         assert!(ann.len() < 256, "announce must not be padded to a bucket: {}", ann.len());
         let hs = mesh::handshake_packet([1; 8], [2; 8], DEFAULT_TTL, 1, vec![0u8; 48]);
