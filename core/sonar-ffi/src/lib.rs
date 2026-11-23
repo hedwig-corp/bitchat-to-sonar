@@ -562,6 +562,71 @@ pub struct PeerTimezoneInfo {
     pub updated_at_secs: u64,
 }
 
+/// A contact's Marmot protocol, folded over their installs' KeyPackages.
+/// `V2Only` means every live install moved to MDK v0.14 and cannot read what
+/// this build sends; `Mixed` and `Unknown` still send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MarmotProtocol {
+    Unknown,
+    V1Only,
+    Mixed,
+    V2Only,
+}
+
+impl From<sonar_core::marmot_protocol::PeerMarmotProtocol> for MarmotProtocol {
+    fn from(p: sonar_core::marmot_protocol::PeerMarmotProtocol) -> Self {
+        use sonar_core::marmot_protocol::PeerMarmotProtocol as P;
+        match p {
+            P::Unknown => Self::Unknown,
+            P::V1Only => Self::V1Only,
+            P::Mixed => Self::Mixed,
+            P::V2Only => Self::V2Only,
+        }
+    }
+}
+
+/// What a chat's composer may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MarmotChatGateState {
+    /// Send normally.
+    Open,
+    /// Every other member moved to Marmot v2: disable the composer and ask
+    /// the user to update. Core refuses the send too.
+    Blocked,
+    /// Some members moved and will not read new messages: show a note, keep
+    /// the composer.
+    PartlyUpdated,
+}
+
+/// The chat gate plus who moved (hex pubkeys), for the banner copy.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MarmotChatGateInfo {
+    pub state: MarmotChatGateState,
+    pub updated_member_hexes: Vec<String>,
+}
+
+impl From<sonar_core::marmot_protocol::ChatProtocolGate> for MarmotChatGateInfo {
+    fn from(gate: sonar_core::marmot_protocol::ChatProtocolGate) -> Self {
+        use sonar_core::marmot_protocol::ChatProtocolGate as G;
+        let (state, updated) = match gate {
+            G::Open => (MarmotChatGateState::Open, Vec::new()),
+            G::Blocked { updated } => (MarmotChatGateState::Blocked, updated),
+            G::PartlyUpdated { updated } => (MarmotChatGateState::PartlyUpdated, updated),
+        };
+        Self {
+            state,
+            updated_member_hexes: updated.iter().map(|pk| pk.to_hex()).collect(),
+        }
+    }
+}
+
+/// Substring of the send error core returns when every other member of a chat
+/// moved to Marmot v2. Hosts match failed-send messages against it.
+#[uniffi::export]
+pub fn peer_updated_sonar_marker() -> String {
+    sonar_core::error::PEER_UPDATED_SONAR_MARKER.to_owned()
+}
+
 /// FFI-friendly pending group invite summary.
 #[derive(uniffi::Record)]
 pub struct GroupInviteInfo {
@@ -1977,6 +2042,35 @@ impl SonarNode {
 
     pub fn mark_conversation_read(&self, group_id_hex: String) {
         self.client.mark_conversation_read(&group_id_hex);
+    }
+
+    /// Whether this chat (its folded MLS group ids, hex) can still be read
+    /// by its other members. Local only (cache + MLS member read), cheap
+    /// enough for chat open; never touches the relays.
+    pub fn marmot_chat_gate(&self, group_id_hexes: Vec<String>) -> MarmotChatGateInfo {
+        self.client.marmot_chat_gate(&group_id_hexes).into()
+    }
+
+    /// Recheck the open chat's members' Marmot protocol from their
+    /// KeyPackages: one bounded relay fetch, skipped while the cached answer
+    /// is fresh. Blocking; call it in the background after first paint, never
+    /// on the open/send path. A change arrives as a conversation-changed
+    /// notification for these groups, after which hosts re-read
+    /// `marmot_chat_gate`.
+    pub fn refresh_marmot_chat_protocol(&self, group_id_hexes: Vec<String>) -> FfiResult<()> {
+        self.block_on_suspendable("refresh_marmot_chat_protocol", async {
+            self.client
+                .refresh_marmot_chat_protocol(&group_id_hexes)
+                .await;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// A contact's cached Marmot protocol (npub or hex). Local only.
+    pub fn peer_marmot_protocol(&self, pubkey: String) -> FfiResult<MarmotProtocol> {
+        let pk = PublicKey::parse(&pubkey).map_err(invalid("pubkey"))?;
+        Ok(self.client.peer_marmot_protocol(&pk).into())
     }
 
     /// Stable newest-first transcript page ordered by

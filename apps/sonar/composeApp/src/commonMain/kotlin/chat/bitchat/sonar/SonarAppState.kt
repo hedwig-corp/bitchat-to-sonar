@@ -2937,6 +2937,90 @@ class SonarAppState(private val scope: CoroutineScope) {
      * Survives leaving a chat and returning within the same process; cleared on send.
      */
     private val composerDrafts = mutableStateMapOf<String, String>()
+
+    /** Marmot v1 → v2 gate per open chat id (absent = open). Filled after the
+     *  chat paints, from a local core read; a background KeyPackage refresh
+     *  updates it through the conversation-change stream. */
+    private val marmotChatGates = mutableStateMapOf<String, SonarMarmotChatGate>()
+    private val marmotChatGateJobs = mutableMapOf<String, Job>()
+
+    /** What ChatScreen shows for [chatId]: composer, update panel, or a note.
+     *  A pure read of local state — safe on the composition path. */
+    fun composerGate(chatId: String, sendsOverMesh: Boolean): SonarComposerGate =
+        composerGateFor(marmotChatGates[chatId], sendsOverMesh)
+
+    /** After first paint: read the gate locally, then let core recheck the
+     *  members' KeyPackages in the background (bounded, TTL'd, deduped in
+     *  core) and read it again. Never on the open/send path. */
+    private fun scheduleMarmotChatGate(chatId: String) {
+        marmotChatGateJobs.remove(chatId)?.cancel()
+        marmotChatGateJobs[chatId] = scope.launch {
+            val groups = transcriptGroupIds(chatId)
+            if (groups.isEmpty()) return@launch
+            reloadMarmotChatGate(chatId, groups)
+            runCatching { SonarCore.refreshMarmotChatProtocol(groups) }
+            reloadMarmotChatGate(chatId, groups)
+            marmotChatGateJobs.remove(chatId)
+        }
+    }
+
+    private suspend fun reloadMarmotChatGate(
+        chatId: String,
+        groups: List<String> = transcriptGroupIds(chatId),
+    ) {
+        if (groups.isEmpty()) return
+        val gate = runCatching { SonarCore.marmotChatGate(groups) }.getOrNull() ?: return
+        if (gate.state == SonarMarmotChatGateState.Open) {
+            marmotChatGates.remove(chatId)
+        } else {
+            marmotChatGates[chatId] = gate
+        }
+    }
+
+    /** Test seam: install a gate as [reloadMarmotChatGate] would. */
+    internal fun seedMarmotChatGateForTest(chatId: String, gate: SonarMarmotChatGate?) {
+        if (gate == null || gate.state == SonarMarmotChatGateState.Open) {
+            marmotChatGates.remove(chatId)
+        } else {
+            marmotChatGates[chatId] = gate
+        }
+    }
+
+    /** Toast for a failed Marmot send: core's "peer has updated Sonar" refusal
+     *  gets the update copy (and flips the composer), anything else the raw error. */
+    private fun marmotSendFailureToast(chatId: String, prefix: String, error: Throwable): String {
+        if (isPeerUpdatedSonarError(error.message)) {
+            scope.launch { reloadMarmotChatGate(chatId) }
+            val name = chats.firstOrNull { it.id == chatId }?.let { chatTitle(it) }
+                ?: (screen as? Screen.Chat)?.takeIf { it.id == chatId }?.name
+                ?: ""
+            return marmotUpdateRequiredText(name.ifBlank { "They" })
+        }
+        return "$prefix: ${error.message}"
+    }
+
+    /** Toast for a failed secure-chat setup (a new chat by npub, or a mesh chat
+     *  falling back to the internet). When core refused because every install
+     *  of the contact moved to Marmot v2, [chatId]'s composer becomes the
+     *  update panel, as an existing chat's gate does, and the toast says why
+     *  instead of the generic error. Anything else: the raw error. */
+    private fun secureChatSetupFailureToast(
+        chatId: String,
+        npubHex: String,
+        prefix: String,
+        error: Throwable,
+    ): String {
+        if (!isPeerUpdatedSonarError(error.message)) return "$prefix: ${error.message}"
+        marmotChatGates[chatId] = SonarMarmotChatGate(SonarMarmotChatGateState.Blocked, listOf(npubHex))
+        val name = (screen as? Screen.Chat)?.takeIf { it.id == chatId }?.name
+            ?: profilesByNpub[canonicalProfileKey(npubHex)]?.bestName
+            ?: ""
+        return marmotUpdateRequiredText(name.ifBlank { "They" })
+    }
+
+    /** Test seam: stands in for the relay wait plus [SonarCore.startChat] in
+     *  pending 1:1 setup, so a JVM test drives the real pending-chat path. */
+    internal var pendingChatSetupForTest: (suspend (npubHex: String) -> String)? = null
     private val composerReplyByChat = mutableStateMapOf<String, SonarReplyRef>()
 
     fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
@@ -7290,6 +7374,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             warmOpenTranscriptThumbs(messages)
             noteTranscriptOpen("marmot", chat.id, "push-retained")
             push(Screen.Chat(chat.id, title))
+            scheduleMarmotChatGate(chat.id)
             scope.launch {
                 val local = withSendEchoes(
                     chat.id,
@@ -7321,6 +7406,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             warmOpenTranscriptThumbs(visibleLocal)
             noteTranscriptOpen("marmot", chat.id, "push-local", visibleLocal)
             push(Screen.Chat(chat.id, title))
+            scheduleMarmotChatGate(chat.id)
             if (isCurrentTranscriptSession(chat.id, generation)) {
                 markTranscriptHydrated(chat.id)
             }
@@ -7359,6 +7445,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             warmOpenTranscriptThumbs(messages)
             noteTranscriptOpen("mesh-folded", id, "push-retained")
             push(Screen.Chat(id, name, pay))
+            scheduleMarmotChatGate(id)
             scope.launch {
                 refreshOpenDm(canonicalPeerId)
                 refreshChats()
@@ -7386,6 +7473,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             warmOpenTranscriptThumbs(visible)
             noteTranscriptOpen("mesh-folded", id, "push-local", visible)
             push(Screen.Chat(id, name, pay))
+            scheduleMarmotChatGate(id)
             if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
             // Opened blank on a conversation we know has history: re-read local
             // storage rather than leaving the chat black until the next sync.
@@ -7719,14 +7807,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupToken = nextPendingMarmotSetupToken(pendingChatId)
         val setupJob = scope.launch {
             try {
-                if (!awaitRelayConnection()) return@launch
-                val chatId = runMarmotAccountOperation { SonarCore.startChat(npubHex) }
+                val chatId = pendingChatSetupForTest?.invoke(npubHex) ?: run {
+                    if (!awaitRelayConnection()) return@launch
+                    runMarmotAccountOperation { SonarCore.startChat(npubHex) }
+                }
                 finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, chatId, setupToken = setupToken)
             } catch (error: CancellationException) {
                 throw error
             } catch (t: Throwable) {
                 if (failPendingMarmotChat(npubHex, pendingChatId, setupToken)) {
-                    toast = "couldn’t start secure chat: ${t.message}"
+                    toast = secureChatSetupFailureToast(pendingChatId, npubHex, "couldn’t start secure chat", t)
                 }
             } finally {
                 clearPendingMarmotSetup(pendingChatId, npubHex, setupToken)
@@ -7746,6 +7836,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!isActivePendingMarmotSetup(pendingChatId, peerNpub, setupToken)) return
         if (setupToken == null) cancelPendingMarmotSetup(pendingChatId, npubHex)
         pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
+        // A setup refused earlier (the contact had moved to Marmot v2) left the
+        // update panel on the pending id; the real chat reads its own gate.
+        marmotChatGates.remove(pendingChatId)
         if (refreshFirst) refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
             ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
@@ -8367,7 +8460,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 },
                 onSendFailure = { error ->
                     failSendEcho(chatId, echo.id)
-                    toast = "send failed: ${error.message}"
+                    toast = marmotSendFailureToast(chatId, "send failed", error)
                 },
                 onReconciliationFailure = { markSendEchoAccepted(chatId, echo.id) },
             )
@@ -8408,7 +8501,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             if (it.id == message.id) it.copy(state = "Couldn't send") else it
                         }
                     }
-                    toast = "retry failed: ${error.message}"
+                    toast = marmotSendFailureToast(chatId, "retry failed", error)
                 }
         }
     }
@@ -8488,7 +8581,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         mergePendingMediaUploads(chatId, messages),
                     )
                 }
-                toast = "retry failed: ${error.message}"
+                toast = marmotSendFailureToast(chatId, "retry failed", error)
             }
         }
     }
@@ -8574,7 +8667,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     refreshRetriedMarmotMessage(chatId)
                 } catch (error: Throwable) {
                     failSendEcho(chatId, echoId)
-                    toast = "retry failed: ${error.message}"
+                    toast = marmotSendFailureToast(chatId, "retry failed", error)
                 }
             }
             return
@@ -11008,7 +11101,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 throw error
             } catch (e: Throwable) {
                 failPendingMeshMarmotSends(npubHex)
-                toast = "couldn't start secure chat: ${e.message}"
+                toast = secureChatSetupFailureToast(meshChatId(peerId), npubHex, "couldn't start secure chat", e)
             } finally {
                 val owner = currentCoroutineContext()[Job]
                 if (startingMarmotChatJobs[npubHex] === owner) {
@@ -13298,6 +13391,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                         }
                     }
                 }
+                // A contact's Marmot protocol changed (or anything else in the
+                // open chat): re-read its gate. Local, cheap, and a no-op while
+                // nobody is known to be on v2.
+                (screen as? Screen.Chat)?.id
+                    ?.takeIf { groupIdHex in transcriptGroupIds(it) }
+                    ?.let { reloadMarmotChatGate(it) }
                 // Fan the rest of the maintenance work (notifications, unread
                 // counts, profile/presence/mesh upkeep) to the conflated
                 // housekeeping consumer instead of doing it inline per event.
