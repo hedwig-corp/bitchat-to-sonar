@@ -280,6 +280,26 @@ shape if the codec is at fault, and extend the scenario here.
 - **Origin:** #671. A relay that re-compressed would break every signed
   frame from a different compressor.
 
+### QA-191 — Sonar warns when stock bitchat shares the phone
+- **Platforms:** SA, on a phone with stock bitchat-android (`com.bitchat.droid`)
+  installed. iOS cannot detect it (Sonar iOS registers `bitchat://` itself)
+  and desktop has no package registry, so neither shows the warning.
+- **Steps:**
+  1. Install stock bitchat beside Sonar and open Sonar's Nearby radar.
+  2. Tap **App info** on the card, force-stop bitchat, and return to Sonar.
+  3. Uninstall bitchat and return to Sonar again.
+- **Expect:** the radar shows "bitchat is also on this phone" with the
+  force-stop advice. **App info** opens bitchat's system App info page. The
+  card stays while bitchat is installed, and disappears on the next return to
+  Sonar after it is uninstalled.
+- **How:** manual on a phone · Guard:
+  `OtherMeshAppNoticeUiTest.theNoticeNamesTheOtherAppAndOpensItsSettings`,
+  `OtherMeshAppNoticeUiTest.everyKnownMeshAppIsVisibleThroughTheManifest`
+- **Origin:** live debugging on 2026-10-29. Sonar 0.1-alpha.15.5 beside
+  `com.bitchat.droid` on a Pixel 10 Pro: the second app on one radio is
+  missed by nearby iPhones, and after a restart Sonar took about 9 minutes to
+  reach the iPhone.
+
 ### QA-186 — A file reaches a stock client
 - **Platforms:** SA and SI → BA and BI; SI ↔ SA.
 - **Steps:** send a small photo in a DM from Sonar to the other client.
