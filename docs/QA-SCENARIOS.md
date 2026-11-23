@@ -326,6 +326,29 @@ shape if the codec is at fault, and extend the scenario here.
   Compose `VideoPrivacyTest`, `VideoPrivacyFixtureTest`
 - **Origin:** #615 (iOS) and its review (Compose parity, fail-closed)
 
+### QA-190 — Every image send strips location and device metadata
+- **Platforms:** both, incl. macOS and desktop (manual on device; guards below)
+- **Steps:** with the fixtures in `core/sonar-media-privacy/tests/fixtures/`
+  (`located.{jpg,png,gif,webp,heic,tiff}`, every field marked `LEAK`; GPS in
+  the JPEG/PNG/WebP/HEIC), send each one four ways: photo picker, *Send file*,
+  drag-drop onto the chat (Mac/desktop), and the share sheet / share intent.
+  Do it once over White Noise and once over Bluetooth to a mesh peer. Fetch
+  each with `sonar-cli fetch` (or save it on the receiving phone) and run
+  `exiftool` or `grep -c LEAK` on it.
+- **Expect:** no GPS, Make/Model, serial, comment, XMP or `LEAK` text in any
+  received file. JPEG/PNG/GIF/WebP arrive in their own format with the same
+  pixels, still animated, still upright. HEIC/TIFF arrive as an upright `.jpg`.
+  A file that looks like an image but cannot be decoded (a HEIC on desktop) is
+  refused with a toast, never sent as-is. Non-image files arrive byte for byte.
+- **Guard:** crate `sonar-media-privacy` tests (`nothing_marked_survives`,
+  `every_truncation_is_safe`, pixel and frame equality); iOS
+  `ImageMetadataStripTests` (incl. the `snReadAttachments` call site); Compose
+  `ImagePrivacyTest`, `ImagePrivacyFixtureTest`
+- **Origin:** brainstorm `docs/brainstorms/2026-11-02-strip-image-metadata-every-send-path.md`.
+  Only the picker re-encode stripped metadata before this. Send file, drag-drop,
+  share and macOS picks went out byte for byte over BLE, and over White Noise
+  MDK only stripped JPEG/PNG and fell back to the original bytes on failure.
+
 ## Share sheet (#559)
 
 Sharing INTO Sonar from another app. iOS stages the share in the App Group

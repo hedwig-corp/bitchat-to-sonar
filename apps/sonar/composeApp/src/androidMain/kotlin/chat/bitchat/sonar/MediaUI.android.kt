@@ -6,6 +6,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
+import android.graphics.Matrix
 import android.graphics.drawable.AnimatedImageDrawable
 import android.net.Uri
 import android.os.Build
@@ -589,8 +590,28 @@ actual fun deleteTempMediaFile(path: String) {
 }
 
 actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
-    val bmp = BitmapFactory.decodeByteArray(data, 0, data.size) ?: return null
+    val decoded = BitmapFactory.decodeByteArray(data, 0, data.size) ?: return null
+    // BitmapFactory ignores EXIF orientation and the JPEG below carries none,
+    // so rotate the pixels or a portrait photo arrives sideways.
+    val bmp = uprightBitmap(decoded, SonarCore.imageExifOrientation(data))
     val out = ByteArrayOutputStream()
     if (!bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)) return null
     return out.toByteArray().takeIf { it.isNotEmpty() }
+}
+
+/** Apply EXIF [orientation] (1–8) to [bitmap]; the matrices are Glide's
+ *  `TransformationUtils.initializeMatrixForRotation`. */
+private fun uprightBitmap(bitmap: Bitmap, orientation: Int): Bitmap {
+    val matrix = Matrix()
+    when (orientation) {
+        2 -> matrix.setScale(-1f, 1f)
+        3 -> matrix.setRotate(180f)
+        4 -> { matrix.setRotate(180f); matrix.postScale(-1f, 1f) }
+        5 -> { matrix.setRotate(90f); matrix.postScale(-1f, 1f) }
+        6 -> matrix.setRotate(90f)
+        7 -> { matrix.setRotate(-90f); matrix.postScale(-1f, 1f) }
+        8 -> matrix.setRotate(-90f)
+        else -> return bitmap
+    }
+    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
 }

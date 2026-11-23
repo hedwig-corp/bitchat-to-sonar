@@ -28,6 +28,7 @@ calls-audio = ["sonar-core/calls-audio"]
 
 [dependencies]
 sonar-core = { path = "../sonar-core" }
+sonar-media-privacy = { path = "../sonar-media-privacy" }
 sonar-stickers = { path = "../sonar-stickers" }
 # Wallet: the Cashu (CDK) backend. Breez-rust can NEVER live here — its forked
 # libsqlite3-sys links plain sqlite3 and would collide with sonar-core's

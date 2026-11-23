@@ -181,6 +181,21 @@ actual object SonarCore {
         return uniffi.sonar_ffi.sonarMentionShortSuffix(pubkeyHex)
     }
 
+    actual fun scrubImageMetadata(data: ByteArray): SonarImageScrub {
+        SonarNativeLoader.ensureLoaded()
+        return when (val scrub = uniffi.sonar_ffi.scrubImageMetadata(data)) {
+            uniffi.sonar_ffi.ImageMetadataScrub.NotImage -> SonarImageScrub.NotImage
+            uniffi.sonar_ffi.ImageMetadataScrub.Clean -> SonarImageScrub.Clean
+            is uniffi.sonar_ffi.ImageMetadataScrub.Stripped -> SonarImageScrub.Stripped(scrub.data)
+            uniffi.sonar_ffi.ImageMetadataScrub.Reencode -> SonarImageScrub.Reencode
+        }
+    }
+
+    actual fun imageExifOrientation(data: ByteArray): Int {
+        SonarNativeLoader.ensureLoaded()
+        return uniffi.sonar_ffi.imageExifOrientation(data).toInt()
+    }
+
     private fun uniffi.sonar_ffi.SonarMentionSpanInfo.toCommon(): SonarMentionSpan =
         SonarMentionSpan(
             start = startUtf16.toInt(),

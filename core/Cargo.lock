@@ -6094,6 +6094,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde_json",
  "sonar-core",
+ "sonar-media-privacy",
  "sonar-stickers",
  "sonar-wallet",
  "sonar-wallet-cdk",
@@ -6105,6 +6106,13 @@ dependencies = [
  "tracing-oslog",
  "tracing-subscriber",
  "uniffi",
+]
+
+[[package]]
+name = "sonar-media-privacy"
+version = "0.1.0"
+dependencies = [
+ "image",
 ]
 
 [[package]]
