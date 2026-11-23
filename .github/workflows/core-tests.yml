@@ -54,8 +54,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Update Rust toolchain
-        run: rustup update stable && rustup default stable
+      # Breez SDK still transitively builds lightning 0.0.118, which breaks on Rust
+      # 1.100+ when never-type fallback stops inferring `()` (rust-lang#148922; E0277
+      # `!: Readable`). Pin the newest compiler that still builds that tree; other Core
+      # tests jobs keep tracking stable until we upgrade the Breez dependency graph.
+      - name: Install Rust toolchain (pinned)
+        run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
 
       - name: Install protoc
         # tonic-build 0.8 (via breez-sdk-liquid) needs a protobuf compiler.
