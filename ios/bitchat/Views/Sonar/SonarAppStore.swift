@@ -7472,6 +7472,12 @@ final class SonarAppStore: ObservableObject {
         return .internet
     }
 
+    /// Marmot v1 → v2 gate for this conversation's composer. A pure read of
+    /// published state (the gate is filled off the render path in `openedDM`).
+    func composerGate(_ id: String) -> SNComposerGate {
+        snComposerGate(marmot.marmotChatGates[id], sendsOverMesh: dmTransport(id) == .mesh)
+    }
+
     func sendDm(_ id: String, _ text: String) {
         // Every send route lands a local echo synchronously; repaint this
         // frame instead of waiting on the throttled service republish. One
@@ -9520,6 +9526,13 @@ final class SonarAppStore: ObservableObject {
             // P2: service cold-start catch-up for the conversation the user opened.
             if let hydratedGroupId {
                 Task { await self.marmot.preferCatchupGroup(hydratedGroupId) }
+                // After local paint: has everyone here moved to Marmot v2?
+                // Local read first, then a bounded background recheck.
+                let gateGroups = self.directMarmotGroups(matchingGroupId: hydratedGroupId).map(\.id)
+                self.marmot.scheduleMarmotChatGate(
+                    conversationId: id,
+                    groupIds: gateGroups.isEmpty ? [hydratedGroupId] : gateGroups
+                )
             }
             let needsHistoryBackfill = hydratedGroupId.map {
                 let groups = self.directMarmotGroups(matchingGroupId: $0)

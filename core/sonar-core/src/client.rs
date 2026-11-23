@@ -38,6 +38,11 @@ use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
+use crate::marmot_protocol::{
+    chat_gate, is_stale, merge_fetched, peer_key_package_summary, with_v1_activity,
+    ChatProtocolGate, PeerMarmotProtocol, PeerProtocolRecord, ProtocolRefreshState,
+    MEMBERS_PER_CHAT, OPEN_CHAT_TTL, RECENT_CHAT_LIMIT, RECENT_CHAT_TTL, RECENT_CHAT_WINDOW_SECS,
+};
 use crate::media_staging::{
     media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
     SealedMediaItem,
@@ -2275,6 +2280,20 @@ pub struct SonarClient {
     /// Atomic throttle + single-flight gate for the per-group catch-up pass;
     /// see `GroupCatchupGate`.
     group_catchup_gate: Arc<Mutex<GroupCatchupGate>>,
+    /// Each contact's Marmot protocol (v1 / v2), write-through to the
+    /// conversation index. `None` until first use: loading it costs nothing
+    /// at startup, and the first gate read pulls one small table.
+    marmot_protocol_cache: Arc<Mutex<Option<HashMap<PublicKey, PeerProtocolRecord>>>>,
+    /// Bounded refresh queue for `marmot_protocol_cache`; see
+    /// `crate::marmot_protocol` for the fan-out limits.
+    marmot_protocol_refresh: Arc<Mutex<ProtocolRefreshState>>,
+    /// The chat the host opened last (its folded group ids). The heartbeat
+    /// keeps its members fresh at the open-chat TTL.
+    marmot_protocol_open_chat: Arc<Mutex<Vec<String>>>,
+    /// Per contact, when the newest v1 message we decrypted from them was
+    /// sent. In memory only: it outranks a KeyPackage that looks abandoned
+    /// (`marmot_protocol::with_v1_activity`), one entry per contact who wrote.
+    marmot_v1_seen: Arc<Mutex<HashMap<PublicKey, u64>>>,
 }
 
 impl Drop for SonarClient {
@@ -2818,6 +2837,12 @@ impl SonarClient {
             note_to_self_lock: Arc::new(Mutex::new(())),
             marmot_db_path: None,
             group_catchup_gate: Arc::new(Mutex::new(GroupCatchupGate::default())),
+            marmot_protocol_cache: Arc::new(Mutex::new(None)),
+            marmot_protocol_refresh: Arc::new(Mutex::new(
+                ProtocolRefreshState::new(Instant::now()),
+            )),
+            marmot_protocol_open_chat: Arc::new(Mutex::new(Vec::new())),
+            marmot_v1_seen: Arc::new(Mutex::new(HashMap::new())),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -4050,6 +4075,7 @@ impl SonarClient {
         text: &str,
         reply: Option<&crate::reply::ReplyTo>,
     ) -> Result<()> {
+        self.ensure_marmot_peers_can_read(group_id)?;
         let local_started = Instant::now();
         // One MLS write guard covers encrypt + local-row write, so a
         // concurrently drained commit cannot land in between now that sends
@@ -4102,6 +4128,7 @@ impl SonarClient {
         target_pubkey: &PublicKey,
         emoji: &str,
     ) -> Result<EventId> {
+        self.ensure_marmot_peers_can_read(group_id)?;
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
@@ -4296,6 +4323,7 @@ impl SonarClient {
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
     pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
+        self.ensure_marmot_peers_can_read(group_id)?;
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
@@ -5334,6 +5362,14 @@ impl SonarClient {
         if self.relays.is_empty() {
             return Err(Error::NoRelayConnected);
         }
+        let group = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .group_for_message(message_id_hex);
+        if let Some(group_id) = group.as_deref().and_then(decode_group_id_hex) {
+            self.ensure_marmot_peers_can_read(&group_id)?;
+        }
         let (group_id_hex, event) = self
             .outbox_state
             .lock()
@@ -5467,6 +5503,9 @@ impl SonarClient {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
+        // Before staging or upload: nothing should reach Blossom for a group
+        // nobody can read any more.
+        self.ensure_marmot_peers_can_read(group_id)?;
         // Direct send is intentional — clear any prior stopPolling / wipe latch
         // so a new upload is not immediately cancelled (Android can race a
         // concurrent send between stopPolling and the next resume pass).
@@ -6979,6 +7018,10 @@ impl SonarClient {
         // (Publish failures also schedule a core-owned backoff retry; this path
         // covers Pending rows stranded while relays were briefly unavailable.)
         self.retry_outbox().await;
+        // Contacts' Marmot protocol (v1 → v2 flag day): at most one relay REQ
+        // per heartbeat, only for the open and recently active chats. Last:
+        // a relay that hangs to FETCH_TIMEOUT must not hold up the outbox.
+        self.advance_marmot_protocol_refresh().await;
         Ok(())
     }
 
@@ -7544,6 +7587,7 @@ impl SonarClient {
                     self.upsert_index_for_message(message, cached_name);
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
                     if !message.mine {
+                        self.note_marmot_v1_message(message);
                         // Same preview as conversation index (media/sticker
                         // labels). Raw `content` alone makes NSE banners show
                         // alias + "Open Sonar to read it." for Photo/Sticker.
@@ -7885,6 +7929,325 @@ impl SonarClient {
                 Err(e) => tracing::warn!(%e, "index mark_read failed"),
             }
         }
+    }
+
+    // ── Contacts' Marmot protocol (v1 → v2 flag day) ─────────────────────
+
+    /// Run `f` over the in-memory protocol cache, loading it from the index on
+    /// first use. Never call it while holding the index lock.
+    fn with_marmot_protocol_cache<R>(
+        &self,
+        f: impl FnOnce(&mut HashMap<PublicKey, PeerProtocolRecord>) -> R,
+    ) -> R {
+        let mut guard = self.marmot_protocol_cache.lock().unwrap();
+        let cache = guard.get_or_insert_with(|| {
+            let mut map = HashMap::new();
+            if let Some(ref idx) = self.conversation_index {
+                // A failed read degrades to an empty cache (every gate open),
+                // never to a burst of refetches: the TTLs still pace refresh.
+                match idx.lock().unwrap().peer_marmot_protocols() {
+                    Ok(rows) => {
+                        for (hex, record) in rows {
+                            if let Ok(pk) = PublicKey::from_hex(&hex) {
+                                map.insert(pk, record);
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!(%err, "marmot protocol cache load failed"),
+                }
+            }
+            map
+        });
+        f(cache)
+    }
+
+    /// A contact's cached Marmot protocol. Local only; `Unknown` until checked.
+    pub fn peer_marmot_protocol(&self, peer: &PublicKey) -> PeerMarmotProtocol {
+        self.with_marmot_protocol_cache(|cache| {
+            cache
+                .get(peer)
+                .map_or(PeerMarmotProtocol::Unknown, |r| r.protocol)
+        })
+    }
+
+    /// Members of these MLS groups other than us, deduped, in group order.
+    fn other_marmot_members(&self, group_id_hexes: &[String]) -> Vec<PublicKey> {
+        let me = self.identity().public_key();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for gid in group_id_hexes {
+            let Some(group_id) = decode_group_id_hex(gid.trim()) else {
+                continue;
+            };
+            let Ok(members) = self.members(&group_id) else {
+                continue;
+            };
+            for pk in members {
+                if pk != me && seen.insert(pk) {
+                    out.push(pk);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether this chat (its folded MLS group ids) can still be read by its
+    /// other members. Local only: never touches the relays. While no contact
+    /// is known to be on v2 it returns at once without reading members.
+    pub fn marmot_chat_gate(&self, group_id_hexes: &[String]) -> ChatProtocolGate {
+        let any_updated = self.with_marmot_protocol_cache(|cache| {
+            cache
+                .values()
+                .any(|r| r.protocol == PeerMarmotProtocol::V2Only)
+        });
+        if !any_updated {
+            return ChatProtocolGate::Open;
+        }
+        let others = self.other_marmot_members(group_id_hexes);
+        let protocols: Vec<(PublicKey, PeerMarmotProtocol)> =
+            self.with_marmot_protocol_cache(|cache| {
+                others
+                    .iter()
+                    .map(|pk| {
+                        (
+                            *pk,
+                            cache
+                                .get(pk)
+                                .map_or(PeerMarmotProtocol::Unknown, |r| r.protocol),
+                        )
+                    })
+                    .collect()
+            });
+        chat_gate(&protocols)
+    }
+
+    /// The send boundary: refuse a Marmot send that nobody in the group can
+    /// read any more. Covers every path the apps send from (composer, share
+    /// sheet, notification reply, forward, call signaling), not just the one
+    /// the composer gates.
+    fn ensure_marmot_peers_can_read(&self, group_id: &GroupId) -> Result<()> {
+        let gate = self.marmot_chat_gate(&[hex::encode(group_id.as_slice())]);
+        if gate.is_blocked() {
+            return Err(Error::PeerUpdatedMarmot);
+        }
+        Ok(())
+    }
+
+    /// A contact's v1 message just decrypted (this build reads v1 groups
+    /// only), so some install of theirs read v1 when it was sent. Remember
+    /// that time (a refetch weighs it against their newest v2 KeyPackage,
+    /// `with_v1_activity`). If the cache says they are V2Only and the message
+    /// was sent AFTER that check, reopen their chats at once: the record
+    /// becomes Mixed, stays due for a recheck, and the next heartbeat
+    /// refetches them first. A message older than the check (catch-up of
+    /// history from before an upgrade) proves nothing and changes nothing.
+    /// One map write per inbound message; the disk write and the requeue
+    /// happen only when a block is contradicted.
+    fn note_marmot_v1_message(&self, message: &crate::marmot::ChatMessage) {
+        let sender = message.sender;
+        let sent_at = message.created_at.as_secs();
+        {
+            let mut seen = self.marmot_v1_seen.lock().unwrap();
+            let last = seen.entry(sender).or_insert(sent_at);
+            *last = (*last).max(sent_at);
+        }
+        let reopened = self.with_marmot_protocol_cache(|cache| match cache.get(&sender) {
+            Some(record)
+                if record.protocol == PeerMarmotProtocol::V2Only
+                    && sent_at > record.checked_at_secs =>
+            {
+                let record = PeerProtocolRecord {
+                    protocol: PeerMarmotProtocol::Mixed,
+                    checked_at_secs: 0,
+                };
+                cache.insert(sender, record);
+                Some(record)
+            }
+            _ => None,
+        });
+        let Some(record) = reopened else {
+            return;
+        };
+        tracing::info!(peer = %sender, "marmot protocol: v1 message from a contact cached as v2-only; chat reopened");
+        if let Some(ref idx) = self.conversation_index {
+            if let Err(err) = idx
+                .lock()
+                .unwrap()
+                .upsert_peer_marmot_protocols(&[(sender.to_hex(), record)])
+            {
+                tracing::warn!(%err, "marmot protocol record not stored");
+            }
+        }
+        self.marmot_protocol_refresh.lock().unwrap().enqueue(
+            &[sender],
+            &hex::encode(message.group_id.as_slice()),
+            true,
+        );
+    }
+
+    /// The host opened this chat (its folded MLS group ids): recheck its
+    /// members' protocol if older than the open-chat TTL, in one bounded
+    /// batch. Hosts call it in the background after first paint; it never
+    /// gates paint or send. Changes reach the host through the conversation
+    /// change listener for these groups.
+    pub async fn refresh_marmot_chat_protocol(&self, group_id_hexes: &[String]) {
+        let groups: Vec<String> = group_id_hexes
+            .iter()
+            .map(|g| g.trim().to_ascii_lowercase())
+            .filter(|g| !g.is_empty())
+            .collect();
+        if groups.is_empty() {
+            return;
+        }
+        *self.marmot_protocol_open_chat.lock().unwrap() = groups.clone();
+        self.plan_marmot_protocol_refresh(&groups, OPEN_CHAT_TTL, true);
+        self.run_marmot_protocol_batch().await;
+    }
+
+    /// Queue the stale members of `groups` (at most `MEMBERS_PER_CHAT` each).
+    fn plan_marmot_protocol_refresh(&self, groups: &[String], ttl: Duration, urgent: bool) {
+        let now_secs = Timestamp::now().as_secs();
+        for gid in groups {
+            let mut members = self.other_marmot_members(std::slice::from_ref(gid));
+            members.truncate(MEMBERS_PER_CHAT);
+            let stale: Vec<PublicKey> = self.with_marmot_protocol_cache(|cache| {
+                members
+                    .into_iter()
+                    .filter(|pk| is_stale(cache.get(pk).copied(), ttl, now_secs))
+                    .collect()
+            });
+            if !stale.is_empty() {
+                self.marmot_protocol_refresh
+                    .lock()
+                    .unwrap()
+                    .enqueue(&stale, gid, urgent);
+            }
+        }
+    }
+
+    /// Heartbeat step: every `RECENT_SCAN_INTERVAL` (never in the first
+    /// minute after start) re-plan from the open chat and the most recently
+    /// active chats, then fetch one batch.
+    async fn advance_marmot_protocol_refresh(&self) {
+        let due = self
+            .marmot_protocol_refresh
+            .lock()
+            .unwrap()
+            .recent_scan_due(Instant::now());
+        if due {
+            let open = self.marmot_protocol_open_chat.lock().unwrap().clone();
+            self.plan_marmot_protocol_refresh(&open, OPEN_CHAT_TTL, true);
+            let since = Timestamp::now()
+                .as_secs()
+                .saturating_sub(RECENT_CHAT_WINDOW_SECS);
+            let recent = self
+                .conversation_index
+                .as_ref()
+                .and_then(|idx| {
+                    idx.lock()
+                        .unwrap()
+                        .recent_group_ids(RECENT_CHAT_LIMIT, since)
+                        .map_err(|err| tracing::debug!(%err, "recent chats read failed"))
+                        .ok()
+                })
+                .unwrap_or_default();
+            self.plan_marmot_protocol_refresh(&recent, RECENT_CHAT_TTL, false);
+        }
+        self.run_marmot_protocol_batch().await;
+    }
+
+    /// Fetch one batch of queued contacts' KeyPackages in ONE relay REQ,
+    /// classify, store the batch in one index transaction, and notify the
+    /// chats whose gate input changed. A fetch with no relay connected or an
+    /// error stores nothing and backs those contacts off.
+    async fn run_marmot_protocol_batch(&self) {
+        let batch = self
+            .marmot_protocol_refresh
+            .lock()
+            .unwrap()
+            .take_batch(Instant::now());
+        if batch.is_empty() {
+            return;
+        }
+        // The host can drop this future mid-fetch (iOS suspend interrupt).
+        // Without the guard the batch would stay "in flight" for the rest of
+        // the process and never be checked again.
+        let mut in_flight = MarmotProtocolBatchGuard {
+            state: self.marmot_protocol_refresh.clone(),
+            batch: Some(batch.clone()),
+        };
+        let fetched = if self.connected_relay_count().await == 0 {
+            Err(Error::NoRelayConnected)
+        } else {
+            let filter = Filter::new()
+                .kind(Kind::Custom(KEY_PACKAGE_KIND))
+                .authors(batch.iter().copied())
+                .limit(KEY_PACKAGE_FETCH_LIMIT * batch.len());
+            self.nostr
+                .fetch_events(filter, FETCH_TIMEOUT)
+                .await
+                .map_err(Error::from)
+        };
+        let events = match fetched {
+            Ok(events) => events,
+            Err(err) => {
+                tracing::debug!(%err, contacts = batch.len(), "marmot protocol fetch failed");
+                // Dropping the guard backs the batch off.
+                return;
+            }
+        };
+        in_flight.batch = None;
+        let mut by_author: HashMap<PublicKey, Vec<Event>> = HashMap::new();
+        for event in events {
+            by_author.entry(event.pubkey).or_default().push(event);
+        }
+        let now_secs = Timestamp::now().as_secs();
+        let mut records = Vec::with_capacity(batch.len());
+        let mut changed = Vec::new();
+        let v1_seen: HashMap<PublicKey, u64> = {
+            let seen = self.marmot_v1_seen.lock().unwrap();
+            batch
+                .iter()
+                .filter_map(|pk| seen.get(pk).map(|at| (*pk, *at)))
+                .collect()
+        };
+        self.with_marmot_protocol_cache(|cache| {
+            for pk in &batch {
+                let (fetched, newest_v2) =
+                    peer_key_package_summary(pk, by_author.get(pk).into_iter().flatten());
+                let protocol = with_v1_activity(fetched, v1_seen.get(pk).copied(), newest_v2);
+                let previous = cache.get(pk).copied();
+                let record = merge_fetched(previous, protocol, now_secs);
+                if previous.map_or(PeerMarmotProtocol::Unknown, |p| p.protocol) != record.protocol {
+                    changed.push(*pk);
+                }
+                cache.insert(*pk, record);
+                records.push((pk.to_hex(), record));
+            }
+        });
+        if let Some(ref idx) = self.conversation_index {
+            if let Err(err) = idx.lock().unwrap().upsert_peer_marmot_protocols(&records) {
+                tracing::warn!(%err, "marmot protocol records not stored");
+            }
+        }
+        let watchers =
+            self.marmot_protocol_refresh
+                .lock()
+                .unwrap()
+                .finish(&batch, true, Instant::now());
+        let mut notify = HashSet::new();
+        for pk in &changed {
+            if let Some(groups) = watchers.get(pk) {
+                notify.extend(groups.iter().cloned());
+            }
+        }
+        tracing::info!(
+            contacts = batch.len(),
+            changed = changed.len(),
+            chats = notify.len(),
+            "marmot protocol refresh"
+        );
+        self.notify_conversations_changed(&notify);
     }
 
     /// Update this device's current system IANA timezone and schedule a
@@ -9284,6 +9647,29 @@ fn tag_value(event: &Event, letter: Alphabet) -> Option<String> {
         .iter()
         .find(|t| t.single_letter_tag() == Some(SingleLetterTag::lowercase(letter)))
         .and_then(|t| t.content().map(|s| s.to_string()))
+}
+
+/// Releases a protocol-refresh batch as failed (backed off) unless the batch
+/// completed; see `SonarClient::run_marmot_protocol_batch`.
+struct MarmotProtocolBatchGuard {
+    state: Arc<Mutex<ProtocolRefreshState>>,
+    batch: Option<Vec<PublicKey>>,
+}
+
+impl Drop for MarmotProtocolBatchGuard {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.take() {
+            if let Ok(mut state) = self.state.lock() {
+                state.finish(&batch, false, Instant::now());
+            }
+        }
+    }
+}
+
+fn decode_group_id_hex(hex_id: &str) -> Option<GroupId> {
+    hex::decode(hex_id)
+        .ok()
+        .map(|bytes| GroupId::from_slice(&bytes))
 }
 
 fn sort_marmot_events(events: impl IntoIterator<Item = Event>) -> Vec<Event> {
@@ -13621,5 +14007,516 @@ mod profile_merge_tests {
         .expect("must publish");
         assert_eq!(m.name.as_deref(), Some("new-name"));
         assert_eq!(m.picture, remote.picture);
+    }
+}
+
+// ── Contacts' Marmot protocol (v1 → v2 flag day) ─────────────────────────
+
+#[cfg(test)]
+mod marmot_protocol_gate_tests {
+    use super::*;
+    use crate::marmot_protocol::tests::{v1_key_package, v2_key_package};
+    use crate::marmot_protocol::{FIRST_SCAN_DELAY, REFRESH_BATCH};
+
+    struct RecordingChangeListener {
+        changed: Mutex<Vec<String>>,
+    }
+
+    impl ConversationChangeListener for RecordingChangeListener {
+        fn on_conversation_changed(&self, group_id_hex: String) {
+            self.changed.lock().unwrap().push(group_id_hex);
+        }
+    }
+
+    struct Harness {
+        _relay: nostr_relay_builder::MockRelay,
+        alice: SonarClient,
+        relays: Vec<RelayUrl>,
+    }
+
+    async fn harness() -> Harness {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let url = relay.url().await;
+        let alice = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+            .await
+            .expect("alice connects");
+        Harness {
+            _relay: relay,
+            alice,
+            relays: vec![url],
+        }
+    }
+
+    /// A group of alice with these peers (their engines stay alive only
+    /// for the KeyPackage), returned as MLS hex.
+    fn group_with(h: &Harness, peers: &[&Identity]) -> String {
+        let kps: Vec<Event> = peers
+            .iter()
+            .map(|id| {
+                MarmotEngine::in_memory((*id).clone())
+                    .key_package_event(h.relays.clone())
+                    .expect("peer key package")
+            })
+            .collect();
+        let creation = h
+            .alice
+            .engine
+            .create_group("chat", kps, h.relays.clone())
+            .expect("group");
+        h.alice
+            .engine
+            .merge_pending_commit(&creation.group.mls_group_id)
+            .expect("merge");
+        hex::encode(creation.group.mls_group_id.as_slice())
+    }
+
+    async fn publish(h: &Harness, event: &Event) {
+        h.alice
+            .nostr
+            .send_event(event)
+            .await
+            .expect("relay accepts");
+    }
+
+    fn gid(hex_id: &str) -> GroupId {
+        decode_group_id_hex(hex_id).expect("group id")
+    }
+
+    #[tokio::test]
+    async fn a_contact_on_marmot_v2_blocks_the_chat_and_every_send_into_it() {
+        let h = harness().await;
+        let bob = Identity::generate();
+        let chat = group_with(&h, &[&bob]);
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        h.alice
+            .set_conversation_change_listener(Some(listener.clone()));
+        let now = Timestamp::now().as_secs();
+        publish(&h, &v2_key_package(bob.keys(), "bob-phone", now)).await;
+
+        assert_eq!(
+            h.alice.marmot_chat_gate(&[chat.clone()]),
+            ChatProtocolGate::Open
+        );
+        h.alice.refresh_marmot_chat_protocol(&[chat.clone()]).await;
+
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&bob.public_key()),
+            PeerMarmotProtocol::V2Only
+        );
+        assert_eq!(
+            h.alice.marmot_chat_gate(&[chat.clone()]),
+            ChatProtocolGate::Blocked {
+                updated: vec![bob.public_key()]
+            }
+        );
+        assert!(
+            listener.changed.lock().unwrap().contains(&chat),
+            "the open chat repaints from the change listener"
+        );
+        // The send boundary, not only the composer: text, sticker,
+        // reaction and media all refuse before anything is encrypted.
+        let err = h.alice.send_text(&gid(&chat), "into the void").await;
+        assert!(matches!(err, Err(Error::PeerUpdatedMarmot)), "{err:?}");
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains(crate::error::PEER_UPDATED_SONAR_MARKER));
+        let reaction = h
+            .alice
+            .send_reaction(&gid(&chat), &EventId::all_zeros(), &bob.public_key(), "👍")
+            .await;
+        assert!(matches!(reaction, Err(Error::PeerUpdatedMarmot)));
+        let media = h
+            .alice
+            .send_media_multi_with_progress(
+                &gid(&chat),
+                vec![MediaUpload {
+                    data: vec![1, 2, 3],
+                    filename: "a.png".into(),
+                    mime: "image/png".into(),
+                }],
+                "",
+                "https://blossom.example.com",
+                "pending-1",
+                None,
+            )
+            .await;
+        assert!(matches!(media, Err(Error::PeerUpdatedMarmot)), "{media:?}");
+        assert!(
+            h.alice.messages(&gid(&chat)).unwrap().is_empty(),
+            "a refused send leaves no transcript row behind"
+        );
+    }
+
+    /// Alice starts a real DM with Bob over the harness relay and both sides
+    /// hold it. Returns Bob, Alice's group id and Bob's.
+    async fn dm_with_bob(h: &Harness) -> (SonarClient, GroupId, GroupId) {
+        let bob = SonarClient::connect_in_memory(Identity::generate(), h.relays.clone())
+            .await
+            .expect("bob connects");
+        bob.publish_key_package().await.expect("bob publishes kp");
+        let group = h
+            .alice
+            .start_dm(bob.identity().public_key(), "alice & bob")
+            .await
+            .expect("alice starts dm");
+        h.alice.send_text(&group, "hello").await.expect("alice sends");
+        let mut bob_group = None;
+        for _ in 0..100 {
+            let _ = bob.sync().await;
+            bob_group = bob.groups().ok().and_then(|g| g.first().map(|g| g.mls_group_id.clone()));
+            if bob_group.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        (bob, group, bob_group.expect("bob joined the dm"))
+    }
+
+    /// Alice's transcript reaches `n` rows (her sync is the real inbound path).
+    async fn alice_receives(h: &Harness, group: &GroupId, n: usize) {
+        for _ in 0..100 {
+            let _ = h.alice.sync().await;
+            if h.alice.messages(group).map(|m| m.len()).unwrap_or(0) >= n {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert_eq!(h.alice.messages(group).expect("messages").len(), n);
+    }
+
+    /// The cache said Bob is on v2 (a v1 install of his looked abandoned to
+    /// the 14-day KeyPackage rule), then a v1 message he sent AFTER that
+    /// check arrives: proof that he still reads v1. The chat must reopen at
+    /// once: before, a reply from a notification or the share sheet stayed
+    /// refused until a refetch.
+    #[tokio::test]
+    async fn a_v1_message_from_a_contact_cached_as_v2_reopens_the_chat() {
+        let h = harness().await;
+        let (bob, group, bob_group) = dm_with_bob(&h).await;
+        let chat = hex::encode(group.as_slice());
+        let bob_pk = bob.identity().public_key();
+        h.alice.with_marmot_protocol_cache(|cache| {
+            cache.insert(
+                bob_pk,
+                PeerProtocolRecord {
+                    protocol: PeerMarmotProtocol::V2Only,
+                    checked_at_secs: Timestamp::now().as_secs() - 60,
+                },
+            );
+        });
+        assert!(h.alice.marmot_chat_gate(&[chat.clone()]).is_blocked());
+
+        bob.send_text(&bob_group, "still on v1").await.expect("bob sends");
+        alice_receives(&h, &group, 2).await;
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&bob_pk),
+            PeerMarmotProtocol::Mixed
+        );
+        assert_eq!(
+            h.alice.marmot_chat_gate(&[chat.clone()]),
+            ChatProtocolGate::Open
+        );
+        h.alice
+            .send_text(&group, "reply from a notification")
+            .await
+            .expect("the reopened chat sends");
+        // A refetch that would say V2Only again (his v1 KeyPackage still
+        // looks abandoned, his v2 one is older than his v1 message) keeps
+        // him Mixed.
+        let stale_v1_and_older_v2 = [
+            v1_key_package(bob.identity().keys(), "bob-ipad", 1_000),
+            v2_key_package(
+                bob.identity().keys(),
+                "bob-mac",
+                1_000 + crate::marmot_protocol::STALE_V1_SLOT_SECS + 1,
+            ),
+        ];
+        let (fetched, newest_v2) =
+            peer_key_package_summary(&bob_pk, stale_v1_and_older_v2.iter());
+        assert_eq!(fetched, PeerMarmotProtocol::V2Only);
+        assert_eq!(
+            with_v1_activity(
+                fetched,
+                h.alice.marmot_v1_seen.lock().unwrap().get(&bob_pk).copied(),
+                newest_v2,
+            ),
+            PeerMarmotProtocol::Mixed
+        );
+    }
+
+    /// QA-216's real shape: Bob writes in v1, then the SAME install moves to
+    /// v2 (its v2 KeyPackage replaces the v1 one in its slot). His last v1
+    /// message is seconds old, but it predates the update, so the chat must
+    /// block: keeping it open would lose Alice's next messages silently.
+    #[tokio::test]
+    async fn a_contact_who_wrote_in_v1_then_updated_is_blocked() {
+        let h = harness().await;
+        let (bob, group, bob_group) = dm_with_bob(&h).await;
+        let chat = hex::encode(group.as_slice());
+        let bob_pk = bob.identity().public_key();
+        bob.send_text(&bob_group, "last words in v1").await.expect("bob sends");
+        alice_receives(&h, &group, 2).await;
+        let last_v1 = h.alice.marmot_v1_seen.lock().unwrap().get(&bob_pk).copied();
+        let last_v1 = last_v1.expect("alice noted bob's v1 message");
+
+        // Bob's install updates: a v2 KeyPackage into his own slot.
+        let slot = h
+            .alice
+            .nostr
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(KEY_PACKAGE_KIND))
+                    .author(bob_pk),
+                FETCH_TIMEOUT,
+            )
+            .await
+            .expect("bob's key package")
+            .into_iter()
+            .find_map(|e| e.tags.identifier().map(str::to_owned))
+            .expect("bob's slot");
+        publish(&h, &v2_key_package(bob.identity().keys(), &slot, last_v1 + 2)).await;
+
+        h.alice.refresh_marmot_chat_protocol(&[chat.clone()]).await;
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&bob_pk),
+            PeerMarmotProtocol::V2Only
+        );
+        assert!(h.alice.marmot_chat_gate(&[chat.clone()]).is_blocked());
+        let err = h.alice.send_text(&group, "into the void").await;
+        assert!(matches!(err, Err(Error::PeerUpdatedMarmot)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn v1_mixed_and_unknown_contacts_keep_the_chat_open() {
+        let h = harness().await;
+        let (v1, mixed, silent) = (
+            Identity::generate(),
+            Identity::generate(),
+            Identity::generate(),
+        );
+        let (c_v1, c_mixed, c_silent) = (
+            group_with(&h, &[&v1]),
+            group_with(&h, &[&mixed]),
+            group_with(&h, &[&silent]),
+        );
+        let now = Timestamp::now().as_secs();
+        publish(&h, &v1_key_package(v1.keys(), "phone", now)).await;
+        publish(&h, &v1_key_package(mixed.keys(), "phone", now)).await;
+        publish(&h, &v2_key_package(mixed.keys(), "mac", now)).await;
+        // Something else is v2, so the gate cannot take its fast path.
+        let other = Identity::generate();
+        let c_other = group_with(&h, &[&other]);
+        publish(&h, &v2_key_package(other.keys(), "x", now)).await;
+        for chat in [&c_v1, &c_mixed, &c_silent, &c_other] {
+            h.alice.refresh_marmot_chat_protocol(&[chat.clone()]).await;
+        }
+        assert!(h.alice.marmot_chat_gate(&[c_other.clone()]).is_blocked());
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&v1.public_key()),
+            PeerMarmotProtocol::V1Only
+        );
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&mixed.public_key()),
+            PeerMarmotProtocol::Mixed
+        );
+        assert_eq!(
+            h.alice.peer_marmot_protocol(&silent.public_key()),
+            PeerMarmotProtocol::Unknown
+        );
+        for chat in [&c_v1, &c_mixed, &c_silent] {
+            assert_eq!(
+                h.alice.marmot_chat_gate(&[chat.clone()]),
+                ChatProtocolGate::Open
+            );
+            h.alice
+                .send_text(&gid(chat), "still readable")
+                .await
+                .expect("an open chat sends");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_group_blocks_only_when_every_other_member_moved() {
+        let h = harness().await;
+        let (bob, carol) = (Identity::generate(), Identity::generate());
+        let group = group_with(&h, &[&bob, &carol]);
+        let now = Timestamp::now().as_secs();
+        publish(&h, &v2_key_package(bob.keys(), "b", now)).await;
+        publish(&h, &v1_key_package(carol.keys(), "c", now)).await;
+        h.alice.refresh_marmot_chat_protocol(&[group.clone()]).await;
+        assert_eq!(
+            h.alice.marmot_chat_gate(&[group.clone()]),
+            ChatProtocolGate::PartlyUpdated {
+                updated: vec![bob.public_key()]
+            }
+        );
+        h.alice
+            .send_text(&gid(&group), "carol still reads this")
+            .await
+            .expect("a partly updated group still sends");
+
+        // Carol updates too: now nobody can read a v1 send.
+        publish(&h, &v2_key_package(carol.keys(), "c", now + 1)).await;
+        h.alice
+            .marmot_protocol_cache
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .values_mut()
+            .for_each(|r| r.checked_at_secs = 0);
+        h.alice.refresh_marmot_chat_protocol(&[group.clone()]).await;
+        assert!(h.alice.marmot_chat_gate(&[group.clone()]).is_blocked());
+    }
+
+    #[tokio::test]
+    async fn note_to_self_is_never_gated() {
+        let h = harness().await;
+        let other = Identity::generate();
+        let c_other = group_with(&h, &[&other]);
+        publish(
+            &h,
+            &v2_key_package(other.keys(), "x", Timestamp::now().as_secs()),
+        )
+        .await;
+        h.alice.refresh_marmot_chat_protocol(&[c_other]).await;
+        let note = h.alice.ensure_note_to_self().await.expect("note to self");
+        let note_hex = hex::encode(note.as_slice());
+        assert_eq!(
+            h.alice.marmot_chat_gate(&[note_hex]),
+            ChatProtocolGate::Open
+        );
+        h.alice
+            .send_text(&note, "memo")
+            .await
+            .expect("note to self sends");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_record_is_not_refetched_and_a_relay_miss_keeps_the_block() {
+        let h = harness().await;
+        let bob = Identity::generate();
+        let chat = group_with(&h, &[&bob]);
+        publish(
+            &h,
+            &v2_key_package(bob.keys(), "p", Timestamp::now().as_secs()),
+        )
+        .await;
+        h.alice.refresh_marmot_chat_protocol(&[chat.clone()]).await;
+        let checked = h
+            .alice
+            .marmot_protocol_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()[&bob.public_key()]
+            .checked_at_secs;
+        // Inside the open-chat TTL a reopen queues nothing.
+        h.alice.refresh_marmot_chat_protocol(&[chat.clone()]).await;
+        assert_eq!(
+            h.alice.marmot_protocol_refresh.lock().unwrap().queued_len(),
+            0
+        );
+        assert_eq!(
+            h.alice
+                .marmot_protocol_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()[&bob.public_key()]
+                .checked_at_secs,
+            checked
+        );
+
+        // A relay that answers nothing must not reopen the composer.
+        let fresh = harness().await;
+        let chat2 = group_with(&fresh, &[&bob]);
+        fresh.alice.with_marmot_protocol_cache(|c| {
+            c.insert(
+                bob.public_key(),
+                PeerProtocolRecord {
+                    protocol: PeerMarmotProtocol::V2Only,
+                    checked_at_secs: 0,
+                },
+            );
+        });
+        fresh
+            .alice
+            .refresh_marmot_chat_protocol(&[chat2.clone()])
+            .await;
+        assert!(fresh.alice.marmot_chat_gate(&[chat2]).is_blocked());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_dropped_mid_fetch_does_not_strand_its_batch_in_flight() {
+        let h = harness().await;
+        let bob = Identity::generate();
+        let chat = group_with(&h, &[&bob]);
+        // Dropped before the relay answers: the suspend interrupt's shape.
+        let groups = [chat];
+        let refresh = h.alice.refresh_marmot_chat_protocol(&groups);
+        let _ = tokio::time::timeout(Duration::from_micros(1), refresh).await;
+        let state = h.alice.marmot_protocol_refresh.lock().unwrap();
+        assert_eq!(state.in_flight_len(), 0, "the guard released the batch");
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_waits_out_cold_start_then_checks_one_bounded_batch_of_recent_chats() {
+        let h = harness().await;
+        let now = Timestamp::now().as_secs();
+        let mut peers = Vec::new();
+        for i in 0..20u64 {
+            let peer = Identity::generate();
+            let chat = group_with(&h, &[&peer]);
+            h.alice
+                .conversation_index
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .upsert_summary(&chat, "chat", "hi", "peer", now - i, false, true)
+                .unwrap();
+            publish(&h, &v2_key_package(peer.keys(), "p", now)).await;
+            peers.push(peer.public_key());
+        }
+        let checked = |alice: &SonarClient| -> usize {
+            alice
+                .marmot_protocol_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |c| c.len())
+        };
+
+        // Cold start: the heartbeat does nothing for the first minute.
+        h.alice.advance_marmot_protocol_refresh().await;
+        assert_eq!(checked(&h.alice), 0);
+
+        *h.alice.marmot_protocol_refresh.lock().unwrap() =
+            ProtocolRefreshState::new(Instant::now() - FIRST_SCAN_DELAY);
+        h.alice.advance_marmot_protocol_refresh().await;
+        assert_eq!(checked(&h.alice), REFRESH_BATCH, "one batch per heartbeat");
+        // Only the RECENT_CHAT_LIMIT most recent chats were planned at all.
+        h.alice.advance_marmot_protocol_refresh().await;
+        h.alice.advance_marmot_protocol_refresh().await;
+        assert_eq!(checked(&h.alice), RECENT_CHAT_LIMIT);
+        let cache = h
+            .alice
+            .marmot_protocol_cache
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(peers[..RECENT_CHAT_LIMIT]
+            .iter()
+            .all(|pk| cache.contains_key(pk)));
+        assert!(peers[RECENT_CHAT_LIMIT..]
+            .iter()
+            .all(|pk| !cache.contains_key(pk)));
     }
 }

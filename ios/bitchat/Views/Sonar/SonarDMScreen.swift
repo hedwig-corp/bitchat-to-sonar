@@ -168,6 +168,7 @@ struct SonarDMScreenContent: View {
         self._convo = ObservedObject(wrappedValue: convo)
     }
 
+    @Environment(\.openURL) private var openURL
     @State private var sheet = false
     @State private var verifySheet = false
     @State private var showKey = false
@@ -250,11 +251,27 @@ struct SonarDMScreenContent: View {
             hasher.combine(reply.preview)
         }
         hasher.combine(store.canSendMedia(peerId))
+        hasher.combine(composerGate)
         return UInt64(bitPattern: Int64(hasher.finalize()))
     }
 
+    /// Marmot v1 → v2: every other member moved to a Sonar this build cannot
+    /// write to. A live Bluetooth link keeps the composer (BLE is unaffected).
+    private var composerGate: SNComposerGate { store.composerGate(peerId) }
+
     @ViewBuilder
     private var dmComposer: some View {
+        SNMarmotComposerSlot(gate: composerGate, peerName: peer.name, onUpdate: openAppUpdate) {
+            dmComposerBody
+        }
+    }
+
+    private func openAppUpdate() {
+        openURL(SNAppUpdate.url)
+    }
+
+    @ViewBuilder
+    private var dmComposerBody: some View {
         VStack(spacing: 0) {
             if let reply = store.composerReply(for: peerId) {
                 SNComposerReplyBanner(reply: reply) {
@@ -821,6 +838,14 @@ struct SonarDMScreenContent: View {
     private var banner: some View {
         if !isMarmot && !peer.inRange {
             outOfRangeBanner
+        } else if case .partlyUpdated(let count) = composerGate {
+            SNBanner(
+                icon: .globe, tone: .net,
+                bold: SNMarmotGateCopy.partlyUpdatedBold(count),
+                rest: SNMarmotGateCopy.partlyUpdatedRest
+            ) {
+                SNBannerButton(label: "Update") { openAppUpdate() }
+            }
         } else if isNoteToSelf {
             SNBanner(
                 icon: .lock, tone: .enc,
