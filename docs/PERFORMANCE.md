@@ -64,7 +64,15 @@ cost.
 
 ## The harness (`scripts/bench/`)
 
-- `build-sim.sh` — Debug, arm64, **unsigned** build; prints the `.app` path.
+- `build-sim.sh [--derived-data DIR]` — Debug, arm64, simulator-signed build
+  (the App Group needs it), with `scripts/qa/ios-setup.sh`'s flags; fails if the
+  App Group is missing from the simulated entitlements; prints only the `.app`
+  path on stdout. DerivedData defaults to
+  `~/Library/Developer/Xcode/DerivedData/sonar-bench-<worktree>`.
+- `_bench-sim.sh` — prints the UDID of this worktree's dedicated simulator,
+  `Sonar Bench <worktree>`, creating and booting it on first use. Both bench
+  scripts use it unless `--device` is given; neither picks "a booted simulator"
+  any more.
 - `cold-start-bench.sh` — terminate→relaunch loop; parses the markers; prints a
   per-phase min/median/max table. Stands alone (freshly-generated identity →
   `woke=0`, useful for the identity-independent phase breakdown).
@@ -99,9 +107,14 @@ scripts/bench/cold-start-bench.sh --app "$APP" --runs 5
 
 # faithful: existing account re-syncing real messages (woke=1)
 scripts/bench/provision-and-bench.sh --app "$APP" --runs 5 --msgs-per-run 3
+
+# concurrent sessions: give each its own work dir (sonar-cli homes + run logs)
+SONAR_BENCH_WORK="$TMPDIR/sonar-bench-$(basename "$PWD")" \
+  scripts/bench/provision-and-bench.sh --app "$APP" --runs 5 --msgs-per-run 3
 ```
 
-Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
+Raw per-run logs land in `$SONAR_BENCH_WORK/runs/run_*.ndjson`
+(`SONAR_BENCH_WORK` defaults to `/tmp/sonar-bench`).
 
 ## Design notes / gotchas
 
@@ -114,18 +127,34 @@ Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
 - **arm64-only** — the Arti (`libarti_bitchat.a`) and `sonarffi` simulator slices
   are arm64 (Apple Silicon); `generic/platform=iOS Simulator` also tries x86_64
   and fails to link. The build pins `ARCHS=arm64`.
-- **Unsigned + Keychain-independent bench path.** CLI builds of this app sign
-  ad-hoc with empty entitlements (the `sh.hedwig.sonar` bundle id is Hedwig's
-  team; a local personal team can't provision it), so Keychain returns
-  `errSecMissingEntitlement` (-34018) and `performConnect` would early-return
-  before the relay-sync path ever starts. Re-signing breaks launch ("denied by
-  service delegate"). So the benchmark provisioning path is **Keychain-free**
-  (all `#if DEBUG` + gated on the `SONAR_BENCH_NSEC` env var):
+- **Signed build, Keychain-independent bench path.** `build-sim.sh` signs for
+  the simulator, like `scripts/qa/ios-setup.sh`. It used to build unsigned,
+  but since #362 the Marmot store lives only in the App Group container and
+  the app refuses to open it without one: an unsigned build stops at "Marmot
+  local open failed: App Group group.sh.hedwig.sonar unavailable" before
+  `t1_local_paint`, never publishes a KeyPackage, and `provision-and-bench.sh`
+  fails with "A's KeyPackage never found" (found 2026-11-07; the script now
+  names the store-open error instead). A simulator app's entitlements live in
+  the `__TEXT,__entitlements` section of its executable, not in the code
+  signature (`codesign -d` shows ad-hoc, none); `build-sim.sh` reads that
+  section and fails when `group.sh.hedwig.sonar` is missing, instead of letting
+  the provisioning DM retry 8 times. A simulator build needs no device
+  provisioning; if Xcode refuses to sign, set your own `DEVELOPMENT_TEAM` in
+  the gitignored `ios/Configs/Local.xcconfig`. The benchmark provisioning path
+  stays **Keychain-free**, so a keychain entry left by an earlier launch does
+  not change which store opens (all `#if DEBUG` + gated on the
+  `SONAR_BENCH_NSEC` env var):
   - `BitchatApp.init` force-completes onboarding so the connect path runs headless.
   - `MarmotChatModel.performConnect` adopts the env identity directly.
   - `MarmotService.databaseConfig` derives the encrypted-DB key as `SHA256(nsec)`
     — stable across runs, so the existing-account DB persists.
   These hooks are inert in normal use and impossible in Release.
+- **Dedicated simulator + own work dir.** Other sessions on the same Mac share
+  CoreSimulator and used to share `/tmp/sonar-bench`. `provision-and-bench.sh`
+  uninstalls Sonar and clears its App Group container on its device, and wipes
+  the `sonar-cli` homes in its work dir, so the scripts default to the
+  per-worktree `Sonar Bench <worktree>` simulator and read the work dir from
+  `SONAR_BENCH_WORK`. Never pass `--device booted`.
 - **Env passing** — `simctl launch` forwards `SIMCTL_CHILD_<NAME>` to the app.
 - **`log show` hides info-level** without `--info`; the harness streams with
   `log stream --level debug`.
@@ -234,6 +263,28 @@ Marmot group · live relays · `woke=1` every run:
 | **TOTAL launch → t4 (cold → synced)** | **≈ 1.55 s** |
 
 (`t1→t2` is effectively zero here — see findings.)
+
+### Harness check on `main` (2026-11-08)
+
+`provision-and-bench.sh --app "$(scripts/bench/build-sim.sh)" --runs 3
+--msgs-per-run 3`, signed `build-sim.sh` app, `main` `fd757577c` (the harness
+fix touches no app code), dedicated `Sonar Bench` simulator (iPhone 17 Pro,
+iOS 26.5), host load average ~120, all `woke=1`; ms:
+
+| phase | min | median | max |
+|---|---|---|---|
+| launch → t0 | 533 | 560 | 788 |
+| t0 → t1 (open DB + local paint) | 238 | 239 | 455 |
+| t1 → t2 | 200 | 242 | 253 |
+| t2 → t3 | 119 | 124 | 361 |
+| t3 → t4 | 6 | 7 | 11 |
+| **launch → t4** | **1151** | **1170** | **1815** |
+| t0 → t4 | 610 | 618 | 1026 |
+
+The 1815 ms maximum is run 1, the first launch after provisioning; runs 2
+and 3 were 1151 and 1170 ms. A by-hand signed build of the same commit
+measured a launch → t4 median of 1124 ms earlier that day (#684). Two more
+`cold-start-bench.sh` runs on the same account measured 1147 and 1148 ms.
 
 ## Device result (real account — the real pain point)
 
